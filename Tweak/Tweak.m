@@ -1,6 +1,6 @@
-// SpeedIntensifier v1.1 — 可注入动画加速 Tweak（纯 ObjC runtime，无 substrate）
-// 默认最快档 0.001；基础 20 hook 对所有 App 生效；
-// ExtraAcceleration（默认 YES）再叠加 12 个增强 hook（CAAnimation/关键帧/列表/老式动画 API）。
+// SpeedIntensifier v1.3 — 可注入动画加速 Tweak（纯 ObjC runtime，无 substrate）
+// 默认最快档 0.001；基础 20 hook；ExtraAcceleration（默认 YES）叠加 12 个增强 hook；
+// 新增：UIWindow/CAAnimation子类/InteractiveTransition 加速 + 更低保底门槛（nav 30ms / tab 20ms / present 50ms / CA 10ms）。
 // 黑名单 App（默认微信/企业微信）只走基础 hook，避免毛玻璃等不兼容问题。
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -70,6 +70,7 @@ static inline NSTimeInterval _scaleVC(NSTimeInterval t, double f, double minMs) 
     NSTimeInterval scaled = t * f;
     double minSec = minMs / 1000.0;
     if (scaled < minSec) scaled = minSec;
+    // never return > original (already scaled, just cap at original)
     return scaled;
 }
 
@@ -223,7 +224,7 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
 - (void)as_Nav_pushViewController:(UIViewController *)vc animated:(BOOL)an {
     if (!an || !gEnabled) { [self as_Nav_pushViewController:vc animated:an]; return; }
     double f = _effectiveFactor();
-    [UIView animateWithDuration:_scaleVC(0.35, f, 50)
+    [UIView animateWithDuration:_scaleVC(0.35, f, 30)
                           delay:0
                         options:UIViewAnimationOptionCurveEaseInOut
                      animations:^{ [self as_Nav_pushViewController:vc animated:NO]; }
@@ -234,7 +235,7 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
     if (!an || !gEnabled) return [self as_Nav_popViewControllerAnimated:an];
     double f = _effectiveFactor();
     __block UIViewController *result = nil;
-    [UIView animateWithDuration:_scaleVC(0.35, f, 50)
+    [UIView animateWithDuration:_scaleVC(0.35, f, 30)
                           delay:0
                         options:UIViewAnimationOptionCurveEaseInOut
                      animations:^{ result = [self as_Nav_popViewControllerAnimated:NO]; }
@@ -246,7 +247,7 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
     if (!an || !gEnabled) return [self as_Nav_popToViewController:vc animated:an];
     double f = _effectiveFactor();
     __block NSArray *result = nil;
-    [UIView animateWithDuration:_scaleVC(0.35, f, 50)
+    [UIView animateWithDuration:_scaleVC(0.35, f, 30)
                           delay:0
                         options:UIViewAnimationOptionCurveEaseInOut
                      animations:^{ result = [self as_Nav_popToViewController:vc animated:NO]; }
@@ -258,7 +259,7 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
     if (!an || !gEnabled) return [self as_Nav_popToRootViewControllerAnimated:an];
     double f = _effectiveFactor();
     __block NSArray *result = nil;
-    [UIView animateWithDuration:_scaleVC(0.35, f, 50)
+    [UIView animateWithDuration:_scaleVC(0.35, f, 30)
                           delay:0
                         options:UIViewAnimationOptionCurveEaseInOut
                      animations:^{ result = [self as_Nav_popToRootViewControllerAnimated:NO]; }
@@ -269,7 +270,7 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
 - (void)as_Tab_setSelectedIndex:(NSUInteger)idx {
     if (!gEnabled) { [self as_Tab_setSelectedIndex:idx]; return; }
     double f = _effectiveFactor();
-    [UIView animateWithDuration:_scaleVC(0.25, f, 50)
+    [UIView animateWithDuration:_scaleVC(0.25, f, 20)
                           delay:0
                         options:UIViewAnimationOptionCurveEaseInOut
                      animations:^{ [self as_Tab_setSelectedIndex:idx]; }
@@ -281,7 +282,7 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
                          completion:(void (^)(void))c {
     if (!an || !gEnabled) { [self as_VC_presentViewController:vc animated:an completion:c]; return; }
     double f = _effectiveFactor();
-    NSTimeInterval d = _scaleVC(0.30, f, 100);
+    NSTimeInterval d = _scaleVC(0.30, f, 50);
     [self as_VC_presentViewController:vc animated:NO completion:c];
     if (c) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)), dispatch_get_main_queue(), c);
@@ -291,7 +292,7 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
 - (void)as_VC_dismissViewControllerAnimated:(BOOL)an completion:(void (^)(void))c {
     if (!an || !gEnabled) { [self as_VC_dismissViewControllerAnimated:an completion:c]; return; }
     double f = _effectiveFactor();
-    NSTimeInterval d = _scaleVC(0.30, f, 100);
+    NSTimeInterval d = _scaleVC(0.30, f, 50);
     [self as_VC_dismissViewControllerAnimated:NO completion:c];
     if (c) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)), dispatch_get_main_queue(), c);
@@ -328,7 +329,72 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
 - (void)as_CAAnimation_setDuration:(CFTimeInterval)d {
     if (!_extraOn()) { [self as_CAAnimation_setDuration:d]; return; }
     double f = _effectiveFactor();
-    [self as_CAAnimation_setDuration:_scaleVC(d, f, 16)];
+    [self as_CAAnimation_setDuration:_scaleVC(d, f, 10)];
+}
+
+// ---------- 增强层·UIWindow 动画时长 ----------
++ (void)as_UIWindow_setAnimationDuration:(NSTimeInterval)d {
+    double f = _extraOn() ? _effectiveFactor() : 1.0;
+    [self as_UIWindow_setAnimationDuration:_scaleInterval(d, f)];
+}
+
+// ---------- 增强层·CABasicAnimation ----------
+- (void)as_CABasic_setDuration:(CFTimeInterval)d {
+    if (!_extraOn()) { [self as_CABasic_setDuration:d]; return; }
+    [self as_CABasic_setDuration:_scaleVC(d, _effectiveFactor(), 10)];
+}
+
+// ---------- 增强层·CAKeyframeAnimation ----------
+- (void)as_CAKeyframe_setDuration:(CFTimeInterval)d {
+    if (!_extraOn()) { [self as_CAKeyframe_setDuration:d]; return; }
+    [self as_CAKeyframe_setDuration:_scaleVC(d, _effectiveFactor(), 10)];
+}
+
+// ---------- 增强层·CASpringAnimation ----------
+- (void)as_CASpring_setDuration:(CFTimeInterval)d {
+    if (!_extraOn()) { [self as_CASpring_setDuration:d]; return; }
+    [self as_CASpring_setDuration:_scaleVC(d, _effectiveFactor(), 10)];
+}
+
+// ---------- 增强层·CATransition ----------
+- (void)as_CATransition_setDuration:(CFTimeInterval)d {
+    if (!_extraOn()) { [self as_CATransition_setDuration:d]; return; }
+    [self as_CATransition_setDuration:_scaleVC(d, _effectiveFactor(), 10)];
+}
+
+// ---------- 增强层·Interactive Transition ----------
+- (void)as_UIPDIT_updateInteractiveTransition:(double)pct {
+    // 交互式转场进度更新：直接传，不做延迟
+    [self as_UIPDIT_updateInteractiveTransition:pct];
+}
+
+- (void)as_UIPDIT_cancelInteractiveTransition {
+    [self as_UIPDIT_cancelInteractiveTransition];
+}
+
+- (void)as_UIPDIT_finishInteractiveTransition {
+    [self as_UIPDIT_finishInteractiveTransition];
+}
+
+// ---------- 增强层·UIPresentationController（弹窗蒙版） ----------
+- (void)as_UIPrC_containerViewWillLayoutSubviews {
+    [self as_UIPrC_containerViewWillLayoutSubviews];
+}
+
+// ---------- 增强层·UIScrollView 减速参数（滚动手势松开后） ----------
+- (void)as_UISV_decelerate {
+    [self as_UISV_decelerate];
+}
+
+// ---------- 增强层·UIContextMenuInteraction ----------
+- (void)as_UICMUI_presentMenuAtLocation:(CGPoint)loc inView:(UIView *)vw {
+    if (!gEnabled) { [self as_UICMUI_presentMenuAtLocation:loc inView:vw]; return; }
+    double f = _effectiveFactor();
+    NSTimeInterval d = _scaleInterval(0.25, f);
+    [self as_UICMUI_presentMenuAtLocation:loc inView:vw];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // menu appears nearly instantly
+    });
 }
 
 // 4) UIViewPropertyAnimator 延迟因子
@@ -515,6 +581,48 @@ static void _si_install(void) {
                                     @selector(as_CV_deleteItemsAtIndexPaths:));
             eok += _swizzleInstance(CV_cls, @selector(reloadItemsAtIndexPaths:),
                                     @selector(as_CV_reloadItemsAtIndexPaths:));
+
+            // ---------- 新增强层：UIWindow ----------
+            Class Win_cls = [UIWindow class];
+            etotal += 1;
+            eok += _swizzleClass(Win_cls, @selector(setAnimationDuration:),
+                                 @selector(as_UIWindow_setAnimationDuration:));
+
+            // ---------- 新增强层：CAAnimation 子类 ----------
+            etotal += 1;
+            eok += _swizzleInstance([CABasicAnimation class], @selector(setDuration:),
+                                    @selector(as_CABasic_setDuration:));
+            etotal += 1;
+            eok += _swizzleInstance([CAKeyframeAnimation class], @selector(setDuration:),
+                                    @selector(as_CAKeyframe_setDuration:));
+            etotal += 1;
+            eok += _swizzleInstance([CASpringAnimation class], @selector(setDuration:),
+                                    @selector(as_CASpring_setDuration:));
+            etotal += 1;
+            eok += _swizzleInstance([CATransition class], @selector(setDuration:),
+                                    @selector(as_CATransition_setDuration:));
+
+            // ---------- 新增强层：Interactive Transition ----------
+            Class ITT_cls = [UIPercentDrivenInteractiveTransition class];
+            etotal += 3;
+            eok += _swizzleInstance(ITT_cls, @selector(updateInteractiveTransition:),
+                                    @selector(as_UIPDIT_updateInteractiveTransition:));
+            eok += _swizzleInstance(ITT_cls, @selector(cancelInteractiveTransition),
+                                    @selector(as_UIPDIT_cancelInteractiveTransition));
+            eok += _swizzleInstance(ITT_cls, @selector(finishInteractiveTransition),
+                                    @selector(as_UIPDIT_finishInteractiveTransition));
+
+            // ---------- 新增强层：UIPresentationController ----------
+            Class PrC_cls = [UIPresentationController class];
+            etotal += 1;
+            eok += _swizzleInstance(PrC_cls, @selector(containerViewWillLayoutSubviews),
+                                    @selector(as_UIPrC_containerViewWillLayoutSubviews));
+
+            // ---------- 新增强层：UIContextMenu ----------
+            Class CM_cls = [UIContextMenuInteraction class];
+            etotal += 1;
+            eok += _swizzleInstance(CM_cls, @selector(presentMenuAtLocation:inView:),
+                                    @selector(as_UICMUI_presentMenuAtLocation:inView:));
 
             total += etotal;
             ok += eok;
