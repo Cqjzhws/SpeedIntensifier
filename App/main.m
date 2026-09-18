@@ -22,28 +22,50 @@ static NSString *const kPrefDir = @"/var/Managed Preferences/mobile";
 
 static void SIRespring(void) {
     posix_spawnattr_t attr;
-    posix_spawnattr_init(&attr);
-    posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
-    posix_spawnattr_set_persona_uid_np(&attr, 0);
-    posix_spawnattr_set_persona_gid_np(&attr, 0);
-    pid_t pid;
     char *args[] = { "/usr/bin/killall", "-9", "SpringBoard", NULL };
+    SIApplyAttr(&attr);
+    pid_t pid;
     int status = posix_spawn(&pid, "/usr/bin/killall", NULL, &attr, args, environ);
     posix_spawnattr_destroy(&attr);
     NSLog(@"[SIApp] respring spawn status=%d pid=%d", status, pid);
 }
 
-static void SIReboot(void) {
+static void SIApplyAttr(posix_spawnattr_t *attr) {
+    posix_spawnattr_init(attr);
+    posix_spawnattr_set_persona_np(attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+    posix_spawnattr_set_persona_uid_np(attr, 0);
+    posix_spawnattr_set_persona_gid_np(attr, 0);
+}
+
+// iOS 16.6.1 上 `/sbin/reboot` 经常被 sandbox 拦截静默失败，
+// 退而求其次：杀 launchd（内核自动 respawn，等价重启）；
+// 备份：杀 backboardd（强制重载主进程）。
+// 返回最终成功方案名（用于界面反馈），全部失败返回 "all failed"。
+static NSString *SIReboot(void) {
     posix_spawnattr_t attr;
-    posix_spawnattr_init(&attr);
-    posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
-    posix_spawnattr_set_persona_uid_np(&attr, 0);
-    posix_spawnattr_set_persona_gid_np(&attr, 0);
-    pid_t pid;
-    char *args[] = { "/sbin/reboot", NULL };
-    int status = posix_spawn(&pid, "/sbin/reboot", NULL, &attr, args, environ);
+    char *a1[] = { "/sbin/reboot", NULL };
+    SIApplyAttr(&attr);
+    pid_t p1;
+    int s1 = posix_spawn(&p1, "/sbin/reboot", NULL, &attr, a1, environ);
     posix_spawnattr_destroy(&attr);
-    NSLog(@"[SIApp] reboot spawn status=%d pid=%d errno=%d", status, pid, errno);
+    NSLog(@"[SIApp] /sbin/reboot spawn status=%d pid=%d errno=%d", s1, p1, errno);
+    if (s1 == 0) return @"/sbin/reboot";
+
+    char *a2[] = { "/usr/bin/killall", "-9", "launchd", NULL };
+    SIApplyAttr(&attr);
+    pid_t p2;
+    int s2 = posix_spawn(&p2, "/usr/bin/killall", NULL, &attr, a2, environ);
+    posix_spawnattr_destroy(&attr);
+    NSLog(@"[SIApp] killall launchd spawn status=%d pid=%d errno=%d", s2, p2, errno);
+    if (s2 == 0) return @"killall launchd";
+
+    char *a3[] = { "/usr/bin/killall", "-9", "backboardd", NULL };
+    SIApplyAttr(&attr);
+    pid_t p3;
+    int s3 = posix_spawn(&p3, "/usr/bin/killall", NULL, &attr, a3, environ);
+    posix_spawnattr_destroy(&attr);
+    NSLog(@"[SIApp] killall backboardd spawn status=%d pid=%d errno=%d", s3, p3, errno);
+    return @"all failed";
 }
 
 static void SIWriteConfig(double factor, BOOL enabled, BOOL extra) {
@@ -84,7 +106,7 @@ static void SIWriteConfig(double factor, BOOL enabled, BOOL extra) {
     title.textAlignment = NSTextAlignmentCenter;
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"动画加速 v1.1 · 默认最快 0.001 · 增强全开";
+    sub.text = @"动画加速 v1.2 · 默认最快 0.001 · 增强全开";
     sub.font = [UIFont systemFontOfSize:14];
     sub.textColor = [UIColor secondaryLabelColor];
     sub.textAlignment = NSTextAlignmentCenter;
@@ -168,16 +190,17 @@ static void SIWriteConfig(double factor, BOOL enabled, BOOL extra) {
     double factor = [_factors[_speedSeg.selectedSegmentIndex] doubleValue];
     SIWriteConfig(factor, _enableSwitch.isOn, _extraSwitch.isOn);
     _status.text = [NSString stringWithFormat:@"已保存 factor=%.3f 增强=%@，正在注销 SpringBoard…", factor, _extraSwitch.isOn ? @"开" : @"关"];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         SIRespring();
     });
 }
 
 - (void)onReboot {
     SIWriteConfig([_factors[_speedSeg.selectedSegmentIndex] doubleValue], _enableSwitch.isOn, _extraSwitch.isOn);
-    _status.text = @"正在重启设备…";
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        SIReboot();
+    _status.text = @"正在重启设备（请稍候）…";
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NSString *r = SIReboot();
+        _status.text = [NSString stringWithFormat:@"重启已触发：%@（如果几秒未重启说明 persona 被拦截，请长按电源键关机）", r];
     });
 }
 @end
