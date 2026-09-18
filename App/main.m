@@ -46,10 +46,13 @@ static void SIReboot(void) {
     NSLog(@"[SIApp] reboot spawn status=%d pid=%d errno=%d", status, pid, errno);
 }
 
-static void SIWriteConfig(double factor, BOOL enabled) {
+static void SIWriteConfig(double factor, BOOL enabled, BOOL extra) {
     mkdir("/var/Managed Preferences", 0755);
     mkdir("/var/Managed Preferences/mobile", 0755);
-    NSDictionary *d = @{ @"SpeedFactor": @(factor), @"Enabled": @(enabled) };
+    NSDictionary *d = @{ @"SpeedFactor": @(factor),
+                         @"Enabled": @(enabled),
+                         @"ExtraAcceleration": @(extra),
+                         @"Blacklist": @[ @"com.tencent.xin", @"com.tencent.wework" ] };
     BOOL ok = [d writeToFile:kPrefPath atomically:YES];
     NSLog(@"[SIApp] write pref %@ -> %d", kPrefPath, ok);
 
@@ -64,6 +67,7 @@ static void SIWriteConfig(double factor, BOOL enabled) {
 
 @implementation SIRootVC {
     UISwitch *_enableSwitch;
+    UISwitch *_extraSwitch;
     UISegmentedControl *_speedSeg;
     UILabel *_status;
     NSArray<NSNumber *> *_factors;
@@ -80,7 +84,7 @@ static void SIWriteConfig(double factor, BOOL enabled) {
     title.textAlignment = NSTextAlignmentCenter;
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"动画加速 · 默认最快 0.001";
+    sub.text = @"动画加速 v1.1 · 默认最快 0.001 · 增强全开";
     sub.font = [UIFont systemFontOfSize:14];
     sub.textColor = [UIColor secondaryLabelColor];
     sub.textAlignment = NSTextAlignmentCenter;
@@ -90,6 +94,13 @@ static void SIWriteConfig(double factor, BOOL enabled) {
     lbl1.font = [UIFont systemFontOfSize:17];
     _enableSwitch = [[UISwitch alloc] init];
     _enableSwitch.on = YES;
+
+    UILabel *lbl1b = [[UILabel alloc] init];
+    lbl1b.text = @"额外加速（关键帧/列表/弹窗）";
+    lbl1b.font = [UIFont systemFontOfSize:17];
+    lbl1b.adjustsFontSizeToFitWidth = YES;
+    _extraSwitch = [[UISwitch alloc] init];
+    _extraSwitch.on = YES;
 
     UILabel *lbl2 = [[UILabel alloc] init];
     lbl2.text = @"速度档位（越小越快）";
@@ -111,9 +122,9 @@ static void SIWriteConfig(double factor, BOOL enabled) {
     _status.numberOfLines = 0;
     _status.font = [UIFont systemFontOfSize:13];
     _status.textColor = [UIColor secondaryLabelColor];
-    _status.text = @"提示：dylib 由 TrollFools 注入目标 App 后生效；本 App 负责写入配置并注销。";
+    _status.text = @"提示：dylib 由 TrollFools 注入目标 App 后生效；本 App 负责写入配置并注销。\n微信/企业微信默认只走基础加速，避免毛玻璃异常。";
 
-    NSArray *views = @[title, sub, lbl1, _enableSwitch, lbl2, _speedSeg, btnApply, btnReboot, _status];
+    NSArray *views = @[title, sub, lbl1, _enableSwitch, lbl1b, _extraSwitch, lbl2, _speedSeg, btnApply, btnReboot, _status];
     for (UIView *v in views) { v.translatesAutoresizingMaskIntoConstraints = NO; [self.view addSubview:v]; }
 
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
@@ -129,7 +140,12 @@ static void SIWriteConfig(double factor, BOOL enabled) {
         [_enableSwitch.centerYAnchor constraintEqualToAnchor:lbl1.centerYAnchor],
         [_enableSwitch.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-24],
 
-        [lbl2.topAnchor constraintEqualToAnchor:lbl1.bottomAnchor constant:36],
+        [lbl1b.topAnchor constraintEqualToAnchor:lbl1.bottomAnchor constant:24],
+        [lbl1b.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:24],
+        [_extraSwitch.centerYAnchor constraintEqualToAnchor:lbl1b.centerYAnchor],
+        [_extraSwitch.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-24],
+
+        [lbl2.topAnchor constraintEqualToAnchor:lbl1b.bottomAnchor constant:24],
         [lbl2.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:24],
 
         [_speedSeg.topAnchor constraintEqualToAnchor:lbl2.bottomAnchor constant:12],
@@ -150,15 +166,15 @@ static void SIWriteConfig(double factor, BOOL enabled) {
 
 - (void)onApply {
     double factor = [_factors[_speedSeg.selectedSegmentIndex] doubleValue];
-    SIWriteConfig(factor, _enableSwitch.isOn);
-    _status.text = [NSString stringWithFormat:@"已保存 factor=%.3f，正在注销 SpringBoard…", factor];
+    SIWriteConfig(factor, _enableSwitch.isOn, _extraSwitch.isOn);
+    _status.text = [NSString stringWithFormat:@"已保存 factor=%.3f 增强=%@，正在注销 SpringBoard…", factor, _extraSwitch.isOn ? @"开" : @"关"];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         SIRespring();
     });
 }
 
 - (void)onReboot {
-    SIWriteConfig([_factors[_speedSeg.selectedSegmentIndex] doubleValue], _enableSwitch.isOn);
+    SIWriteConfig([_factors[_speedSeg.selectedSegmentIndex] doubleValue], _enableSwitch.isOn, _extraSwitch.isOn);
     _status.text = @"正在重启设备…";
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         SIReboot();
