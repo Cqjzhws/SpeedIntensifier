@@ -108,7 +108,7 @@ static void SIWriteConfig(double factor, BOOL enabled, BOOL extra) {
     title.textAlignment = NSTextAlignmentCenter;
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"动画加速 v1.2 · 默认最快 0.001 · 增强全开";
+    sub.text = @"动画加速 v1.4 · 火力全开 · 转轮/CABasic 极速";
     sub.font = [UIFont systemFontOfSize:14];
     sub.textColor = [UIColor secondaryLabelColor];
     sub.textAlignment = NSTextAlignmentCenter;
