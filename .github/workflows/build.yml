@@ -1,0 +1,74 @@
+name: Build SpeedIntensifier (dylib + IPA)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    name: Build dylib + IPA
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      # ==========================================================
+      # ① dylib — 纯 clang，无 substrate，可 TrollFools 注入
+      # ==========================================================
+      - name: Build dylib (pure clang)
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          mkdir -p artifacts
+          clang -arch arm64 -dynamiclib \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -undefined dynamic_lookup -fobjc-arc \
+            -framework Foundation -framework UIKit -framework QuartzCore \
+            -o artifacts/SpeedIntensifier.dylib Tweak/Tweak.m
+          lipo -info artifacts/SpeedIntensifier.dylib
+          echo "dylib size: $(du -h artifacts/SpeedIntensifier.dylib | cut -f1)"
+
+      # ==========================================================
+      # ② IPA — clang 直编 .app，codesign 加 entitlements 后打包
+      # ==========================================================
+      - name: Build app & IPA
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          APP="build/SpeedIntensifier.app"
+          rm -rf build
+          mkdir -p "$APP"
+
+          clang -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -framework Foundation -framework UIKit \
+            -o "$APP/SpeedIntensifier" App/main.m
+
+          cp App/Info.plist "$APP/Info.plist"
+          codesign --force --sign - --entitlements entitlements.plist "$APP"
+          echo "--- entitlements ---"
+          codesign -d --entitlements - "$APP" 2>&1 | head -20 || true
+
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/SpeedIntensifier.app
+          ( cd build && zip -qry ../artifacts/SpeedIntensifier.ipa Payload -x "*.DS_Store" )
+          echo "IPA size: $(du -h artifacts/SpeedIntensifier.ipa | cut -f1)"
+
+      - name: Show artifacts
+        run: ls -lh artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpeedIntensifier-artifacts
+          path: artifacts/
+          if-no-files-found: error
