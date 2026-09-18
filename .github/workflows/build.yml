@@ -54,6 +54,7 @@ jobs:
             -o "$APP/SpeedIntensifier" App/main.m
 
           cp App/Info.plist "$APP/Info.plist"
+          cp App/AppIcon.png "$APP/AppIcon.png"
           codesign --force --sign - --entitlements entitlements.plist "$APP"
           echo "--- entitlements ---"
           codesign -d --entitlements - "$APP" 2>&1 | head -20 || true
