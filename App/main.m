@@ -20,6 +20,8 @@ static NSString *const kPrefPath = @"/var/Managed Preferences/mobile/com.local.s
 static NSString *const kUIKitPath = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
 static NSString *const kPrefDir = @"/var/Managed Preferences/mobile";
 
+static void SIApplyAttr(posix_spawnattr_t *attr);
+
 static void SIRespring(void) {
     posix_spawnattr_t attr;
     char *args[] = { "/usr/bin/killall", "-9", "SpringBoard", NULL };
