@@ -1,0 +1,9 @@
+Package: com.local.speedintensifier
+Name: Speed Intensifier
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: 动画加速 Tweak，默认最快 0.001，纯 runtime 无 substrate，TrollFools 可注入
+Maintainer: local
+Author: local
+Section: Tweaks
+Depends: firmware (>= 14.0)
