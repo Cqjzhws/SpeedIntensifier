@@ -1,29 +1,46 @@
-// SpeedIntensifier — 可注入动画加速 Tweak（纯 ObjC runtime，无 substrate）
-// 默认最快档 0.001；可通过配置文件覆盖，TrollFools / 注入任意 App 生效。
+// SpeedIntensifier v1.1 — 可注入动画加速 Tweak（纯 ObjC runtime，无 substrate）
+// 默认最快档 0.001；基础 20 hook 对所有 App 生效；
+// ExtraAcceleration（默认 YES）再叠加 12 个增强 hook（CAAnimation/关键帧/列表/老式动画 API）。
+// 黑名单 App（默认微信/企业微信）只走基础 hook，避免毛玻璃等不兼容问题。
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 
 // ================================
-// 全局配置（默认最快 0.001）
+// 全局配置（默认最快 0.001 + 额外加速全开）
 // ================================
-static double gFactor = 0.001;
-static BOOL   gEnabled = YES;
-static BOOL   gInstantMode = NO;
+static double  gFactor = 0.001;
+static BOOL    gEnabled = YES;
+static BOOL    gInstantMode = NO;
+static BOOL    gExtra = YES;            // 额外加速总开关（默认开）
+static BOOL    gBlacklisted = NO;       // 当前 App 是否命中黑名单
+static NSArray *gBlacklist = nil;
 
 #define kPrefPath "/var/Managed Preferences/mobile/com.local.speedintensifier.plist"
+#define kDefaultBlacklist @[ @"com.tencent.xin", @"com.tencent.wework" ]
 
 static void _loadPref(void) {
+    NSDictionary *d = nil;
     @try {
-        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@kPrefPath];
+        d = [NSDictionary dictionaryWithContentsOfFile:@kPrefPath];
         if (d) {
             NSNumber *f = d[@"SpeedFactor"];
             NSNumber *e = d[@"Enabled"];
+            NSNumber *x = d[@"ExtraAcceleration"];
             if (f) gFactor = [f doubleValue];
             if (e) gEnabled = [e boolValue];
+            if (x) gExtra = [x boolValue];
+            gBlacklist = d[@"Blacklist"];
         }
     } @catch (__unused NSException *ex) { }
     if (gFactor <= 0.0) gFactor = 0.001;    // 保底最快
     if (gFactor > 1.0)  gFactor = 1.0;
+    if (!gBlacklist) gBlacklist = kDefaultBlacklist;
+
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    for (NSString *b in gBlacklist) {
+        if ([b isKindOfClass:[NSString class]] && b.length && [bid hasPrefix:b]) { gBlacklisted = YES; break; }
+    }
 }
 
 // ================================
@@ -33,6 +50,11 @@ static double _effectiveFactor(void) {
     if (!gEnabled) return 1.0;   // 关闭 => 原速
     if (gInstantMode) return 0.0;
     return gFactor;
+}
+
+// 额外加速是否对当前 App 生效
+static inline BOOL _extraOn(void) {
+    return gEnabled && gExtra && !gBlacklisted;
 }
 
 static inline NSTimeInterval _scaleInterval(NSTimeInterval t, double f) {
@@ -98,6 +120,7 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
 // ================================
 @implementation SpeedIntensifierTweak
 
+// ---------- 基础层 ----------
 + (void)as_UIView_animate:(NSTimeInterval)d
                animations:(void (^)(void))a {
     double f = _effectiveFactor();
@@ -280,9 +303,106 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
     [self as_CATrans_setDuration:_scaleVC(d, f, 16)];
 }
 
-+ (void)as_CAProp_setDuration:(CFTimeInterval)d {
+// ---------- 增强层（ExtraAcceleration，默认开；黑名单 App 不装） ----------
+// 1) UIView 关键帧动画
++ (void)as_UIView_animateKeyframesWithDuration:(NSTimeInterval)d
+                                         delay:(NSTimeInterval)dl
+                                       options:(UIViewKeyframeAnimationOptions)o
+                                    animations:(void (^)(void))a
+                                    completion:(void (^)(BOOL))c {
+    double f = _extraOn() ? _effectiveFactor() : 1.0;
+    [self as_UIView_animateKeyframesWithDuration:_scaleInterval(d, f)
+                                           delay:dl * f
+                                         options:o
+                                      animations:a
+                                      completion:c];
+}
+
+// 2) 老式 begin/commit 动画 API 的时长
++ (void)as_UIView_setAnimationDuration:(NSTimeInterval)d {
+    double f = _extraOn() ? _effectiveFactor() : 1.0;
+    [self as_UIView_setAnimationDuration:_scaleInterval(d, f)];
+}
+
+// 3) CAAnimation 基类时长（覆盖 CABasic/CAKeyframe/CASpring/CATransition 等全部子类）
+- (void)as_CAAnimation_setDuration:(CFTimeInterval)d {
+    if (!_extraOn()) { [self as_CAAnimation_setDuration:d]; return; }
     double f = _effectiveFactor();
-    [self as_CAProp_setDuration:_scaleVC(d, f, 16)];
+    [self as_CAAnimation_setDuration:_scaleVC(d, f, 16)];
+}
+
+// 4) UIViewPropertyAnimator 延迟因子
+- (void)as_UIPA_addAnimations:(void (^)(void))a delayFactor:(CGFloat)df {
+    double f = _extraOn() ? _effectiveFactor() : 1.0;
+    CGFloat nd = (f >= 1.0) ? df : (df * f);
+    [self as_UIPA_addAnimations:a delayFactor:nd];
+}
+
+// 5) UITableView 列表动画（用 CATransaction 收窄时长）
+- (void)as_TV_performBatchUpdates:(void (^)(void))updates completion:(void (^)(BOOL))c {
+    if (!_extraOn()) { [self as_TV_performBatchUpdates:updates completion:c]; return; }
+    double f = _effectiveFactor();
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scaleInterval(0.25, f)];
+    @try { [self as_TV_performBatchUpdates:updates completion:c]; }
+    @finally { [CATransaction commit]; }
+}
+
+- (void)as_TV_insertRowsAtIndexPaths:(NSArray<NSIndexPath *> *)ip withRowAnimation:(UITableViewRowAnimation)an {
+    if (!_extraOn()) { [self as_TV_insertRowsAtIndexPaths:ip withRowAnimation:an]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scaleInterval(0.25, _effectiveFactor())];
+    @try { [self as_TV_insertRowsAtIndexPaths:ip withRowAnimation:an]; }
+    @finally { [CATransaction commit]; }
+}
+
+- (void)as_TV_deleteRowsAtIndexPaths:(NSArray<NSIndexPath *> *)ip withRowAnimation:(UITableViewRowAnimation)an {
+    if (!_extraOn()) { [self as_TV_deleteRowsAtIndexPaths:ip withRowAnimation:an]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scaleInterval(0.25, _effectiveFactor())];
+    @try { [self as_TV_deleteRowsAtIndexPaths:ip withRowAnimation:an]; }
+    @finally { [CATransaction commit]; }
+}
+
+- (void)as_TV_reloadRowsAtIndexPaths:(NSArray<NSIndexPath *> *)ip withRowAnimation:(UITableViewRowAnimation)an {
+    if (!_extraOn()) { [self as_TV_reloadRowsAtIndexPaths:ip withRowAnimation:an]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scaleInterval(0.25, _effectiveFactor())];
+    @try { [self as_TV_reloadRowsAtIndexPaths:ip withRowAnimation:an]; }
+    @finally { [CATransaction commit]; }
+}
+
+// 6) UICollectionView 列表动画
+- (void)as_CV_performBatchUpdates:(void (^)(void))updates completion:(void (^)(BOOL))c {
+    if (!_extraOn()) { [self as_CV_performBatchUpdates:updates completion:c]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scaleInterval(0.25, _effectiveFactor())];
+    @try { [self as_CV_performBatchUpdates:updates completion:c]; }
+    @finally { [CATransaction commit]; }
+}
+
+- (void)as_CV_insertItemsAtIndexPaths:(NSArray<NSIndexPath *> *)ip {
+    if (!_extraOn()) { [self as_CV_insertItemsAtIndexPaths:ip]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scaleInterval(0.25, _effectiveFactor())];
+    @try { [self as_CV_insertItemsAtIndexPaths:ip]; }
+    @finally { [CATransaction commit]; }
+}
+
+- (void)as_CV_deleteItemsAtIndexPaths:(NSArray<NSIndexPath *> *)ip {
+    if (!_extraOn()) { [self as_CV_deleteItemsAtIndexPaths:ip]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scaleInterval(0.25, _effectiveFactor())];
+    @try { [self as_CV_deleteItemsAtIndexPaths:ip]; }
+    @finally { [CATransaction commit]; }
+}
+
+- (void)as_CV_reloadItemsAtIndexPaths:(NSArray<NSIndexPath *> *)ip {
+    if (!_extraOn()) { [self as_CV_reloadItemsAtIndexPaths:ip]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scaleInterval(0.25, _effectiveFactor())];
+    @try { [self as_CV_reloadItemsAtIndexPaths:ip]; }
+    @finally { [CATransaction commit]; }
 }
 
 @end
@@ -292,7 +412,8 @@ static void _si_install(void) {
     @autoreleasepool {
         _loadPref();
         double f = _effectiveFactor();
-        NSLog(@"[SpeedIntensifier] factor=%.4f enabled=%d instant=%d", f, gEnabled, gInstantMode);
+        NSLog(@"[SpeedIntensifier] factor=%.4f enabled=%d instant=%d extra=%d blacklisted=%d bundle=%@",
+              f, gEnabled, gInstantMode, gExtra, gBlacklisted, [[NSBundle mainBundle] bundleIdentifier]);
 
         int ok = 0, total = 0;
 
@@ -350,11 +471,57 @@ static void _si_install(void) {
         ok += _swizzleInstance(VC_cls, @selector(dismissViewControllerAnimated:completion:),
                                @selector(as_VC_dismissViewControllerAnimated:completion:));
 
-        total += 2;
+        total += 1;
         ok += _swizzleClass([CATransaction class], @selector(setAnimationDuration:),
                             @selector(as_CATrans_setDuration:));
-        ok += _swizzleClass([CAPropertyAnimation class], @selector(setDuration:),
-                            @selector(as_CAProp_setDuration:));
+
+        // ---------- 增强层（ExtraAcceleration） ----------
+        if (_extraOn()) {
+            int eok = 0, etotal = 0;
+
+            etotal += 1;
+            eok += _swizzleClass(UIView_cls, @selector(animateKeyframesWithDuration:delay:options:animations:completion:),
+                                 @selector(as_UIView_animateKeyframesWithDuration:delay:options:animations:completion:));
+            etotal += 1;
+            eok += _swizzleClass(UIView_cls, @selector(setAnimationDuration:),
+                                 @selector(as_UIView_setAnimationDuration:));
+
+            etotal += 1;
+            eok += _swizzleInstance([CAAnimation class], @selector(setDuration:),
+                                    @selector(as_CAAnimation_setDuration:));
+
+            etotal += 1;
+            eok += _swizzleInstance(UIPA_cls, @selector(addAnimations:delayFactor:),
+                                    @selector(as_UIPA_addAnimations:delayFactor:));
+
+            Class TV_cls = [UITableView class];
+            etotal += 4;
+            eok += _swizzleInstance(TV_cls, @selector(performBatchUpdates:completion:),
+                                    @selector(as_TV_performBatchUpdates:completion:));
+            eok += _swizzleInstance(TV_cls, @selector(insertRowsAtIndexPaths:withRowAnimation:),
+                                    @selector(as_TV_insertRowsAtIndexPaths:withRowAnimation:));
+            eok += _swizzleInstance(TV_cls, @selector(deleteRowsAtIndexPaths:withRowAnimation:),
+                                    @selector(as_TV_deleteRowsAtIndexPaths:withRowAnimation:));
+            eok += _swizzleInstance(TV_cls, @selector(reloadRowsAtIndexPaths:withRowAnimation:),
+                                    @selector(as_TV_reloadRowsAtIndexPaths:withRowAnimation:));
+
+            Class CV_cls = [UICollectionView class];
+            etotal += 4;
+            eok += _swizzleInstance(CV_cls, @selector(performBatchUpdates:completion:),
+                                    @selector(as_CV_performBatchUpdates:completion:));
+            eok += _swizzleInstance(CV_cls, @selector(insertItemsAtIndexPaths:),
+                                    @selector(as_CV_insertItemsAtIndexPaths:));
+            eok += _swizzleInstance(CV_cls, @selector(deleteItemsAtIndexPaths:),
+                                    @selector(as_CV_deleteItemsAtIndexPaths:));
+            eok += _swizzleInstance(CV_cls, @selector(reloadItemsAtIndexPaths:),
+                                    @selector(as_CV_reloadItemsAtIndexPaths:));
+
+            total += etotal;
+            ok += eok;
+            NSLog(@"[SpeedIntensifier] extra hooks %d/%d (ExtraAcceleration=ON)", eok, etotal);
+        } else {
+            NSLog(@"[SpeedIntensifier] extra hooks skipped (extra=%d blacklisted=%d)", gExtra, gBlacklisted);
+        }
 
         NSLog(@"[SpeedIntensifier] installed %d/%d hooks", ok, total);
     }
