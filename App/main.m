@@ -5,10 +5,15 @@
 #import <spawn.h>
 #import <sys/wait.h>
 #import <sys/stat.h>
-#import <sys/reboot.h>
 #import <string.h>
 #import <unistd.h>
 #import <errno.h>
+
+// iPhoneOS SDK 无 <sys/reboot.h>，手动声明（符号由 libsystem_c 提供）
+#ifndef RB_AUTOBOOT
+#define RB_AUTOBOOT 0x01234567
+#endif
+extern int reboot(int, char *);
 
 #ifndef POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE
 #define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE 1
