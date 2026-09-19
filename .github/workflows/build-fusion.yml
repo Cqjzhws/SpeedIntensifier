@@ -1,0 +1,91 @@
+name: Build SIFusion (dylib + IPA)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'fusion-v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build SIFusion dylib + IPA
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      # ① dylib — SIClassic × SpeedsterTS 融合增强，TrollFools 注入
+      - name: Build dylib (pure clang)
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          mkdir -p artifacts
+          clang -arch arm64 -dynamiclib -O2 \
+            -install_name @rpath/SIFusion.dylib \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -undefined dynamic_lookup -fobjc-arc \
+            -framework Foundation -framework UIKit -framework QuartzCore \
+            -o artifacts/SIFusion.dylib SIFusion/Tweak/SIFusion.m
+          codesign --force --sign - artifacts/SIFusion.dylib
+          lipo -info artifacts/SIFusion.dylib
+          file artifacts/SIFusion.dylib
+          echo "dylib size: $(du -h artifacts/SIFusion.dylib | cut -f1)"
+
+      # ② 配置 App IPA
+      - name: Build app & IPA
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          APP="build/SIFusion.app"
+          rm -rf build
+          mkdir -p "$APP"
+
+          clang -arch arm64 -O2 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -framework Foundation -framework UIKit \
+            -o "$APP/SIFusion" SIFusion/App/main.m
+
+          cp SIFusion/App/Info.plist "$APP/Info.plist"
+          cp SIFusion/App/AppIcon.png "$APP/AppIcon.png"
+          for f in SIFusion/App/Icon-*.png; do cp "$f" "$APP/$(basename $f)"; done
+          codesign --force --sign - --entitlements SIFusion/entitlements.plist "$APP"
+
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/SIFusion.app
+          ( cd build && zip -qry ../artifacts/SIFusion.ipa Payload -x "*.DS_Store" )
+          echo "IPA size: $(du -h artifacts/SIFusion.ipa | cut -f1)"
+
+      - name: Verify artifacts
+        run: |
+          set -e
+          ls -lh artifacts/
+          file artifacts/SIFusion.dylib
+          unzip -l artifacts/SIFusion.ipa
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SIFusion-artifacts
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/fusion-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: SIFusion ${{ github.ref_name }}
+          files: |
+            artifacts/SIFusion.dylib
+            artifacts/SIFusion.ipa
+          generate_release_notes: true
