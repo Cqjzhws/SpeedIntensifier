@@ -138,6 +138,9 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
 // ================================
 // 替换实现（定义在 SpeedIntensifierTweak 上，运行时桥接到目标类）
 // ================================
+@interface SpeedIntensifierTweak : NSObject
+@end
+
 @implementation SpeedIntensifierTweak
 
 // ---------- 基础层 ----------
