@@ -163,7 +163,7 @@ static NSDictionary *SIReadConfig(void) {
     _blacklist.layer.borderWidth = 0.5;
     _blacklist.layer.cornerRadius = 8;
     _blacklist.text = [(cfg[@"Blacklist"] ?: @[]) componentsJoinedByString:@"\n"];
-    _blacklist.heightAnchor.constraint(equalToConstant:90).active = YES;
+    [_blacklist.heightAnchor constraintEqualToConstant:90].active = YES;
 
     UIButton *apply = [UIButton buttonWithType:UIButtonTypeSystem];
     [apply setTitle:@"保存并注销 iPhone18pro" forState:UIControlStateNormal];
@@ -171,7 +171,7 @@ static NSDictionary *SIReadConfig(void) {
     apply.backgroundColor = [UIColor systemBlueColor];
     [apply setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     apply.layer.cornerRadius = 12;
-    apply.heightAnchor.constraint(equalToConstant:50).active = YES;
+    [apply.heightAnchor constraintEqualToConstant:50].active = YES;
     [apply addTarget:self action:@selector(onApply) forControlEvents:UIControlEventTouchUpInside];
 
     UILabel *hint = [[UILabel alloc] init];
