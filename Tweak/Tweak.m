@@ -1,7 +1,13 @@
-// SpeedIntensifier v1.5.5 — 可注入动画加速 Tweak（纯 ObjC runtime，无 substrate）
-// v1.5.5 修复：微信全量加速后点链接仍崩——彻底移除 18 个"状态机敏感 setter"类 hook（强制 animated:NO /
-//              包动画块改写 UIKit 内部行为），增强层仅保留纯时长缩放与直通型 hook（共 43）。
-// 默认最快档 0.001 + 火力全开；基础 19 hook；ExtraAcceleration（默认 YES）叠加 24 个增强 hook（共 43）；
+// SpeedIntensifier v1.5.6 — 可注入动画加速 Tweak（纯 ObjC runtime，无 substrate）
+// v1.5.6 增强：合并两个"微信实测不闪退"样本的全部精华（tongyong 分支 = 本 tweak v1.5.4 增强派生；
+//              AnimationSpeedTweak v3.5 = developlab 独立实现），62 hooks：
+//   · 恢复 17 个 hook（tongyong 在当前微信实测安全）：Nav 整栈替换 / Tab 直选 VC / PageVC 翻页 /
+//     UISV 缩放×2 / TV 编辑·重载段·选中·取消选中 / CV 布局切换×2 / 三类栏 setItems / 控件×3
+//   · 新增 CALayer actionForKey:（隐式动画瞬时化：极速/瞬切档对 position/bounds/opacity 等常用
+//     隐式 key 返回 nil，正规返回值无副作用）——AnimationSpeedTweak 核心技巧
+//   · 新增 CAPropertyAnimation setDuration: 二级链（仅当其 Method 与 CAAnimation 基类不同才安装，
+//     防重复链；同类 hook 在 AnimationSpeedTweak 长期稳定）
+// 默认最快档 0.001 + 火力全开；基础 19 hook；ExtraAcceleration（默认 YES）叠加 43 个增强 hook（共 62）；
 // v1.5.1 修复：移除 CAAnimation 子类重复 setDuration: hook——子类继承基类实现，二次交换导致
 //              无限递归栈溢出，非黑名单 App 启动即闪退；基类 hook 已覆盖全部子类。
 //              addAnimation 仅收窄默认 0.25s 时长，避免对已缩放时长二次缩放。
@@ -545,12 +551,151 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
     [self as_UIPA_startAnimationAfterDelay:(f >= 1.0 ? d : d * f)];
 }
 
-// v1.5.5：移除 UIViewController transitionFromViewController hook（状态机敏感，微信 WebView 页触发崩溃）。
+// ==================== v1.5.6 恢复 Hook（tongyong 分支在当前微信实测安全） ====================
 
-// v1.5.5：移除 18 个状态机敏感 setter hook（Nav 整栈替换 / Tab 直选 VC / 翻页 / 缩放 / Table 编辑选中
-// 刷新 / Collection 布局切换 / 三类栏 setItems / 进度·开关·滑杆）。这些 hook 会改写 UIKit 内部状态机
-// 的行为（强制 animated:NO / 包动画块），在微信打开 WebView 页等场景触发崩溃；且纯时长缩放类 hook
-// 已覆盖其视觉效果，移除不损失速度。基础层 push/pop/present/dismiss 保持不变（已验证安全）。
+// Nav 整栈替换
+- (void)as_Nav_setViewControllers:(NSArray<UIViewController *> *)vcs animated:(BOOL)an {
+    if (!an || !gEnabled || !_extraOn()) { [self as_Nav_setViewControllers:vcs animated:an]; return; }
+    double f = _effectiveFactor();
+    [UIView animateWithDuration:_scaleVC(0.35, f, _pageMinMs())
+                          delay:0
+                        options:UIViewAnimationOptionCurveEaseInOut
+                     animations:^{ [self as_Nav_setViewControllers:vcs animated:NO]; }
+                     completion:nil];
+}
+
+// Tab 直选 VC
+- (void)as_Tab_setSelectedViewController:(UIViewController *)vc {
+    if (!gEnabled || !_extraOn()) { [self as_Tab_setSelectedViewController:vc]; return; }
+    double f = _effectiveFactor();
+    [UIView animateWithDuration:_scaleVC(0.25, f, _pageMinMs())
+                          delay:0
+                        options:UIViewAnimationOptionCurveEaseInOut
+                     animations:^{ [self as_Tab_setSelectedViewController:vc]; }
+                     completion:nil];
+}
+
+// PageVC 翻页
+- (void)as_PageVC_setViewControllers:(NSArray<UIViewController *> *)vcs
+                           direction:(UIPageViewControllerNavigationDirection)dir
+                            animated:(BOOL)an
+                          completion:(void (^)(BOOL))c {
+    if (!an || !gEnabled || !_extraOn()) { [self as_PageVC_setViewControllers:vcs direction:dir animated:an completion:c]; return; }
+    [self as_PageVC_setViewControllers:vcs direction:dir animated:NO completion:c];
+}
+
+// UIScrollView 缩放
+- (void)as_UISV_setZoomScale:(CGFloat)zs animated:(BOOL)an {
+    if (!an || !gEnabled || !_extraOn()) { [self as_UISV_setZoomScale:zs animated:an]; return; }
+    double f = _effectiveFactor();
+    [UIView animateWithDuration:_scaleInterval(0.25, f)
+                          delay:0
+                        options:UIViewAnimationOptionCurveEaseInOut
+                     animations:^{ [self as_UISV_setZoomScale:zs animated:NO]; }
+                     completion:nil];
+}
+
+- (void)as_UISV_zoomToRect:(CGRect)r animated:(BOOL)an {
+    if (!an || !gEnabled || !_extraOn()) { [self as_UISV_zoomToRect:r animated:an]; return; }
+    double f = _effectiveFactor();
+    [UIView animateWithDuration:_scaleInterval(0.25, f)
+                          delay:0
+                        options:UIViewAnimationOptionCurveEaseInOut
+                     animations:^{ [self as_UISV_zoomToRect:r animated:NO]; }
+                     completion:nil];
+}
+
+// UITableView 编辑 / 重载段 / 选中 / 取消选中
+- (void)as_TV_setEditing:(BOOL)ed animated:(BOOL)an {
+    if (!an || !gEnabled || !_extraOn()) { [self as_TV_setEditing:ed animated:an]; return; }
+    [self as_TV_setEditing:ed animated:NO];
+}
+
+- (void)as_TV_reloadSections:(NSIndexSet *)sec withRowAnimation:(UITableViewRowAnimation)an {
+    if (!gEnabled || !_extraOn()) { [self as_TV_reloadSections:sec withRowAnimation:an]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scaleInterval(0.25, _effectiveFactor())];
+    @try { [self as_TV_reloadSections:sec withRowAnimation:an]; }
+    @finally { [CATransaction commit]; }
+}
+
+- (void)as_TV_selectRowAtIndexPath:(NSIndexPath *)ip animated:(BOOL)an scrollPosition:(UITableViewScrollPosition)sp {
+    if (!an || !gEnabled || !_extraOn()) { [self as_TV_selectRowAtIndexPath:ip animated:an scrollPosition:sp]; return; }
+    [self as_TV_selectRowAtIndexPath:ip animated:NO scrollPosition:sp];
+}
+
+- (void)as_TV_deselectRowAtIndexPath:(NSIndexPath *)ip animated:(BOOL)an {
+    if (!an || !gEnabled || !_extraOn()) { [self as_TV_deselectRowAtIndexPath:ip animated:an]; return; }
+    [self as_TV_deselectRowAtIndexPath:ip animated:NO];
+}
+
+// CollectionView 布局切换（两个重载）
+- (void)as_CV_setLayout:(UICollectionViewLayout *)nl animated:(BOOL)an {
+    if (!an || !gEnabled || !_extraOn()) { [self as_CV_setLayout:nl animated:an]; return; }
+    [self as_CV_setLayout:nl animated:NO];
+}
+
+- (void)as_CV_setLayout:(UICollectionViewLayout *)nl animated:(BOOL)an completion:(void (^)(BOOL))c {
+    if (!an || !gEnabled || !_extraOn()) { [self as_CV_setLayout:nl animated:an completion:c]; return; }
+    [self as_CV_setLayout:nl animated:NO completion:c];
+}
+
+// 三类栏 setItems
+- (void)as_NavBar_setItems:(NSArray<UINavigationItem *> *)items animated:(BOOL)an {
+    if (!an || !gEnabled || !_extraOn()) { [self as_NavBar_setItems:items animated:an]; return; }
+    [self as_NavBar_setItems:items animated:NO];
+}
+
+- (void)as_TabBar_setItems:(NSArray<UITabBarItem *> *)items animated:(BOOL)an {
+    if (!an || !gEnabled || !_extraOn()) { [self as_TabBar_setItems:items animated:an]; return; }
+    [self as_TabBar_setItems:items animated:NO];
+}
+
+- (void)as_Toolbar_setItems:(NSArray<UIBarButtonItem *> *)items animated:(BOOL)an {
+    if (!an || !gEnabled || !_extraOn()) { [self as_Toolbar_setItems:items animated:an]; return; }
+    [self as_Toolbar_setItems:items animated:NO];
+}
+
+// 控件：进度 / 开关 / 滑杆
+- (void)as_Progress_setProgress:(float)p animated:(BOOL)an {
+    if (!an || !gEnabled || !_extraOn()) { [self as_Progress_setProgress:p animated:an]; return; }
+    [self as_Progress_setProgress:p animated:NO];
+}
+
+- (void)as_Switch_setOn:(BOOL)on animated:(BOOL)an {
+    if (!an || !gEnabled || !_extraOn()) { [self as_Switch_setOn:on animated:an]; return; }
+    [self as_Switch_setOn:on animated:NO];
+}
+
+- (void)as_Slider_setValue:(float)v animated:(BOOL)an {
+    if (!an || !gEnabled || !_extraOn()) { [self as_Slider_setValue:v animated:an]; return; }
+    [self as_Slider_setValue:v animated:NO];
+}
+
+// ==================== v1.5.6 新技术（源自 AnimationSpeedTweak v3.5 实测样本） ====================
+
+// CALayer 隐式动画动作：极速/瞬切档对常用隐式 key 返回 nil（无 action = 瞬时到位，正规返回值）
+- (id)as_CALayer_actionForKey:(NSString *)key {
+    if (gEnabled && _extraOn() && _effectiveFactor() <= 0.01) {
+        NSString *k = key.lowercaseString ?: @"";
+        if ([k isEqualToString:@"position"] || [k isEqualToString:@"bounds"] ||
+            [k isEqualToString:@"frame"] || [k isEqualToString:@"opacity"] ||
+            [k isEqualToString:@"contents"] || [k isEqualToString:@"contentsrect"] ||
+            [k isEqualToString:@"backgroundcolor"] || [k isEqualToString:@"cornerradius"] ||
+            [k isEqualToString:@"hidden"] || [k isEqualToString:@"sublayers"]) {
+            return nil;
+        }
+    }
+    return [self as_CALayer_actionForKey:key];
+}
+
+// CAPropertyAnimation 二级链（安装时校验 Method 与基类不同，防重复链）
+- (void)as_CAProp_setDuration:(CFTimeInterval)d {
+    if (!_extraOn()) { [self as_CAProp_setDuration:d]; return; }
+    [self as_CAProp_setDuration:_scaleVC(d, _effectiveFactor(), 10)];
+}
+
+// v1.5.5 移除的 transitionFromViewController hook（deprecated API，状态机最重）不再恢复。
 
 @end
 
@@ -719,11 +864,76 @@ static void _si_install(void) {
             eok += _swizzleInstance(UIPA_cls, @selector(startAnimationAfterDelay:),
                                     @selector(as_UIPA_startAnimationAfterDelay:));
 
-            // v1.5.5：移除 18 个状态机敏感 setter hook 的注册
-            //（Nav setViewControllers / Tab setSelectedViewController / PageVC / transitionFromViewController /
-            //  UISV setZoomScale·zoomToRect / TV setEditing·select·deselect·reloadSections /
-            //  CV setCollectionViewLayout×2 / TabBar·Toolbar·NavBar setItems / Progress·Switch·Slider）
-            // 保留的增强层全部为"纯时长缩放"或"直通"型 hook，已验证安全。
+            // ==================== v1.5.6 恢复 + 新增 19 hook ====================
+            Class PageVC_cls = [UIPageViewController class];
+
+            // --- 导航/Tab/翻页 ---
+            etotal += 1;
+            eok += _swizzleInstance(Nav_cls, @selector(setViewControllers:animated:),
+                                    @selector(as_Nav_setViewControllers:animated:));
+            etotal += 1;
+            eok += _swizzleInstance(Tab_cls, @selector(setSelectedViewController:),
+                                    @selector(as_Tab_setSelectedViewController:));
+            etotal += 1;
+            eok += _swizzleInstance(PageVC_cls, @selector(setViewControllers:direction:animated:completion:),
+                                    @selector(as_PageVC_setViewControllers:direction:animated:completion:));
+
+            // --- UIScrollView 缩放 ---
+            etotal += 2;
+            eok += _swizzleInstance(UISV_cls, @selector(setZoomScale:animated:),
+                                    @selector(as_UISV_setZoomScale:animated:));
+            eok += _swizzleInstance(UISV_cls, @selector(zoomToRect:animated:),
+                                    @selector(as_UISV_zoomToRect:animated:));
+
+            // --- UITableView 编辑/选中/重载 ---
+            etotal += 4;
+            eok += _swizzleInstance(TV_cls, @selector(setEditing:animated:),
+                                    @selector(as_TV_setEditing:animated:));
+            eok += _swizzleInstance(TV_cls, @selector(reloadSections:withRowAnimation:),
+                                    @selector(as_TV_reloadSections:withRowAnimation:));
+            eok += _swizzleInstance(TV_cls, @selector(selectRowAtIndexPath:animated:scrollPosition:),
+                                    @selector(as_TV_selectRowAtIndexPath:animated:scrollPosition:));
+            eok += _swizzleInstance(TV_cls, @selector(deselectRowAtIndexPath:animated:),
+                                    @selector(as_TV_deselectRowAtIndexPath:animated:));
+
+            // --- CollectionView 布局切换 ---
+            Class CVL_cls = [UICollectionView class];
+            etotal += 2;
+            eok += _swizzleInstance(CVL_cls, @selector(setCollectionViewLayout:animated:),
+                                    @selector(as_CV_setLayout:animated:));
+            eok += _swizzleInstance(CVL_cls, @selector(setCollectionViewLayout:animated:completion:),
+                                    @selector(as_CV_setLayout:animated:completion:));
+
+            // --- 三类栏 setItems ---
+            etotal += 3;
+            eok += _swizzleInstance([UINavigationBar class], @selector(setItems:animated:),
+                                    @selector(as_NavBar_setItems:animated:));
+            eok += _swizzleInstance([UITabBar class], @selector(setItems:animated:),
+                                    @selector(as_TabBar_setItems:animated:));
+            eok += _swizzleInstance([UIToolbar class], @selector(setItems:animated:),
+                                    @selector(as_Toolbar_setItems:animated:));
+
+            // --- 控件 ---
+            etotal += 3;
+            eok += _swizzleInstance([UIProgressView class], @selector(setProgress:animated:),
+                                    @selector(as_Progress_setProgress:animated:));
+            eok += _swizzleInstance([UISwitch class], @selector(setOn:animated:),
+                                    @selector(as_Switch_setOn:animated:));
+            eok += _swizzleInstance([UISlider class], @selector(setValue:animated:),
+                                    @selector(as_Slider_setValue:animated:));
+
+            // --- AnimationSpeedTweak v3.5 同款新技术 ---
+            etotal += 1;
+            eok += _swizzleInstance([CALayer class], @selector(actionForKey:),
+                                    @selector(as_CALayer_actionForKey:));
+            // CAPropertyAnimation 二级链：仅当其 setDuration: Method 与基类不同才装（防重复链）
+            Method baseSetDurM = class_getInstanceMethod([CAAnimation class], @selector(setDuration:));
+            Method propSetDurM = class_getInstanceMethod([CAPropertyAnimation class], @selector(setDuration:));
+            if (propSetDurM && baseSetDurM != propSetDurM) {
+                etotal += 1;
+                eok += _swizzleInstance([CAPropertyAnimation class], @selector(setDuration:),
+                                        @selector(as_CAProp_setDuration:));
+            }
 
             total += etotal;
             ok += eok;

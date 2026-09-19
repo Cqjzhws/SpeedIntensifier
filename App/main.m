@@ -217,7 +217,7 @@ static NSDictionary *SIReadConfig(void) {
     title.textAlignment = NSTextAlignmentCenter;
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"动画加速 v1.5.5 · 43 Hooks · 微信兼容重构";
+    sub.text = @"动画加速 v1.5.6 · 62 Hooks · 三方实测合并增强";
     sub.font = [UIFont systemFontOfSize:14];
     sub.textColor = [UIColor secondaryLabelColor];
     sub.textAlignment = NSTextAlignmentCenter;
