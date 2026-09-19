@@ -1,8 +1,8 @@
 Package: com.local.speedintensifier
 Name: Speed Intensifier
-Version: 1.4.0
+Version: 1.5.0
 Architecture: iphoneos-arm
-Description: 动画加速 Tweak，火力全开（默认最快 0.001 + 转轮/CABasic/Keyframe/Spring/CATransition 全部极速 + UIWindow/InteractiveTransition/ContextMenu/列表/关键帧 同步加速），更低保底（黑名单 App 16/30/8ms 兼容），纯 runtime 无 substrate，TrollFools 可注入
+Description: 动画加速 Tweak v1.5（共 65 hook）：默认最快 0.001，新增导航整栈替换/翻页/缩放/Table&Collection 编辑布局/TabBar·Toolbar·Nav 栏项/进度·开关·滑杆/PropertyAnimator 贝塞尔与延迟启动等 23 hook，新增 InstantMode 瞬切模式（动画时长归零）；转轮/CABasic/Keyframe/Spring/CATransition 全部极速；黑名单 App 兼容保底；纯 runtime 无 substrate，TrollFools 可注入
 Maintainer: local
 Author: local
 Section: Tweaks

@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
 
 jobs:
   build:
@@ -26,13 +27,17 @@ jobs:
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           echo "SDK: $SDK"
           mkdir -p artifacts
-          clang -arch arm64 -dynamiclib \
+          clang -arch arm64 -dynamiclib -O2 \
+            -install_name @rpath/SpeedIntensifier.dylib \
             -isysroot "$SDK" \
             -miphoneos-version-min=14.0 \
             -undefined dynamic_lookup -fobjc-arc \
             -framework Foundation -framework UIKit -framework QuartzCore \
             -o artifacts/SpeedIntensifier.dylib Tweak/Tweak.m
+          # ad-hoc 签名，TrollFools 注入更稳
+          codesign --force --sign - artifacts/SpeedIntensifier.dylib
           lipo -info artifacts/SpeedIntensifier.dylib
+          file artifacts/SpeedIntensifier.dylib
           echo "dylib size: $(du -h artifacts/SpeedIntensifier.dylib | cut -f1)"
 
       # ==========================================================
@@ -46,7 +51,7 @@ jobs:
           rm -rf build
           mkdir -p "$APP"
 
-          clang -arch arm64 \
+          clang -arch arm64 -O2 \
             -isysroot "$SDK" \
             -miphoneos-version-min=14.0 \
             -fobjc-arc \
@@ -65,8 +70,13 @@ jobs:
           ( cd build && zip -qry ../artifacts/SpeedIntensifier.ipa Payload -x "*.DS_Store" )
           echo "IPA size: $(du -h artifacts/SpeedIntensifier.ipa | cut -f1)"
 
-      - name: Show artifacts
-        run: ls -lh artifacts/
+      - name: Verify artifacts
+        run: |
+          set -e
+          ls -lh artifacts/
+          file artifacts/SpeedIntensifier.dylib
+          codesign -dv artifacts/SpeedIntensifier.dylib 2>&1 | head -5 || true
+          unzip -l artifacts/SpeedIntensifier.ipa
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -74,3 +84,17 @@ jobs:
           name: SpeedIntensifier-artifacts
           path: artifacts/
           if-no-files-found: error
+          retention-days: 90
+
+      # ==========================================================
+      # ③ 打 v* tag 时自动发布 Release（IPA + dylib）
+      # ==========================================================
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: SpeedIntensifier ${{ github.ref_name }}
+          files: |
+            artifacts/SpeedIntensifier.dylib
+            artifacts/SpeedIntensifier.ipa
+          generate_release_notes: true

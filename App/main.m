@@ -70,20 +70,33 @@ static NSString *SIReboot(void) {
     return @"all failed";
 }
 
-static void SIWriteConfig(double factor, BOOL enabled, BOOL extra) {
+static void SIWriteConfig(double factor, BOOL enabled, BOOL extra, BOOL instant) {
     mkdir("/var/Managed Preferences", 0755);
     mkdir("/var/Managed Preferences/mobile", 0755);
     NSDictionary *d = @{ @"SpeedFactor": @(factor),
                          @"Enabled": @(enabled),
                          @"ExtraAcceleration": @(extra),
+                         @"InstantMode": @(instant),
                          @"Blacklist": @[ @"com.tencent.xin", @"com.tencent.wework" ] };
     BOOL ok = [d writeToFile:kPrefPath atomically:YES];
     NSLog(@"[SIApp] write pref %@ -> %d", kPrefPath, ok);
 
     // 全局拖动系数（未注入 dylib 时也能有基础加速）
     NSMutableDictionary *u = [NSMutableDictionary dictionaryWithContentsOfFile:kUIKitPath] ?: [NSMutableDictionary dictionary];
-    u[@"UIAnimationDragCoefficient"] = @(enabled ? (factor <= 0 ? 0.001 : factor) : 1.0);
+    u[@"UIAnimationDragCoefficient"] = @(enabled ? (instant ? 0.0001 : (factor <= 0 ? 0.001 : factor)) : 1.0);
     [u writeToFile:kUIKitPath atomically:YES];
+}
+
+// 读取当前已保存配置（文件不存在时返回默认值）
+static NSDictionary *SIReadConfig(void) {
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
+    if (!d) {
+        d = @{ @"SpeedFactor": @0.001,
+               @"Enabled": @YES,
+               @"ExtraAcceleration": @YES,
+               @"InstantMode": @NO };
+    }
+    return d;
 }
 
 @interface SIRootVC : UIViewController
@@ -92,6 +105,7 @@ static void SIWriteConfig(double factor, BOOL enabled, BOOL extra) {
 @implementation SIRootVC {
     UISwitch *_enableSwitch;
     UISwitch *_extraSwitch;
+    UISwitch *_instantSwitch;
     UISegmentedControl *_speedSeg;
     UILabel *_status;
     NSArray<NSNumber *> *_factors;
@@ -102,13 +116,20 @@ static void SIWriteConfig(double factor, BOOL enabled, BOOL extra) {
     self.view.backgroundColor = [UIColor systemBackgroundColor];
     _factors = @[@0.001, @0.01, @0.05, @0.1];
 
+    // 回读当前配置
+    NSDictionary *cfg = SIReadConfig();
+    BOOL cfgEnabled = cfg[@"Enabled"] ? [cfg[@"Enabled"] boolValue] : YES;
+    BOOL cfgExtra   = cfg[@"ExtraAcceleration"] ? [cfg[@"ExtraAcceleration"] boolValue] : YES;
+    BOOL cfgInstant = cfg[@"InstantMode"] ? [cfg[@"InstantMode"] boolValue] : NO;
+    double cfgFactor = cfg[@"SpeedFactor"] ? [cfg[@"SpeedFactor"] doubleValue] : 0.001;
+
     UILabel *title = [[UILabel alloc] init];
     title.text = @"Speed Intensifier";
     title.font = [UIFont boldSystemFontOfSize:28];
     title.textAlignment = NSTextAlignmentCenter;
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"动画加速 v1.4 · 火力全开 · 转轮/CABasic 极速";
+    sub.text = @"动画加速 v1.5 · 65 Hooks · 瞬切模式";
     sub.font = [UIFont systemFontOfSize:14];
     sub.textColor = [UIColor secondaryLabelColor];
     sub.textAlignment = NSTextAlignmentCenter;
@@ -117,21 +138,34 @@ static void SIWriteConfig(double factor, BOOL enabled, BOOL extra) {
     lbl1.text = @"启用加速";
     lbl1.font = [UIFont systemFontOfSize:17];
     _enableSwitch = [[UISwitch alloc] init];
-    _enableSwitch.on = YES;
+    _enableSwitch.on = cfgEnabled;
 
     UILabel *lbl1b = [[UILabel alloc] init];
-    lbl1b.text = @"额外加速（关键帧/列表/弹窗）";
+    lbl1b.text = @"额外加速（关键帧/列表/弹窗/翻页）";
     lbl1b.font = [UIFont systemFontOfSize:17];
     lbl1b.adjustsFontSizeToFitWidth = YES;
     _extraSwitch = [[UISwitch alloc] init];
-    _extraSwitch.on = YES;
+    _extraSwitch.on = cfgExtra;
+
+    UILabel *lbl1c = [[UILabel alloc] init];
+    lbl1c.text = @"瞬切模式（动画时长归零，最快）";
+    lbl1c.font = [UIFont systemFontOfSize:17];
+    lbl1c.adjustsFontSizeToFitWidth = YES;
+    lbl1c.numberOfLines = 2;
+    _instantSwitch = [[UISwitch alloc] init];
+    _instantSwitch.on = cfgInstant;
+    [_instantSwitch addTarget:self action:@selector(onInstantToggle) forControlEvents:UIControlEventValueChanged];
 
     UILabel *lbl2 = [[UILabel alloc] init];
     lbl2.text = @"速度档位（越小越快）";
     lbl2.font = [UIFont systemFontOfSize:17];
 
     _speedSeg = [[UISegmentedControl alloc] initWithItems:@[@"0.001", @"0.01", @"0.05", @"0.1"]];
-    _speedSeg.selectedSegmentIndex = 0;
+    NSUInteger sel = 0;
+    for (NSUInteger i = 0; i < _factors.count; i++) {
+        if (fabs([_factors[i] doubleValue] - cfgFactor) < 0.0001) { sel = i; break; }
+    }
+    _speedSeg.selectedSegmentIndex = sel;
 
     UIButton *btnApply = [UIButton buttonWithType:UIButtonTypeSystem];
     [btnApply setTitle:@"保存并注销 SpringBoard" forState:UIControlStateNormal];
@@ -146,9 +180,9 @@ static void SIWriteConfig(double factor, BOOL enabled, BOOL extra) {
     _status.numberOfLines = 0;
     _status.font = [UIFont systemFontOfSize:13];
     _status.textColor = [UIColor secondaryLabelColor];
-    _status.text = @"提示：dylib 由 TrollFools 注入目标 App 后生效；本 App 负责写入配置并注销。\n微信/企业微信默认只走基础加速，避免毛玻璃异常。";
+    _status.text = @"提示：dylib 由 TrollFools 注入目标 App 后生效；本 App 负责写入配置并注销。\n微信/企业微信默认只走基础加速。瞬切模式若出现异常请关闭。";
 
-    NSArray *views = @[title, sub, lbl1, _enableSwitch, lbl1b, _extraSwitch, lbl2, _speedSeg, btnApply, btnReboot, _status];
+    NSArray *views = @[title, sub, lbl1, _enableSwitch, lbl1b, _extraSwitch, lbl1c, _instantSwitch, lbl2, _speedSeg, btnApply, btnReboot, _status];
     for (UIView *v in views) { v.translatesAutoresizingMaskIntoConstraints = NO; [self.view addSubview:v]; }
 
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
@@ -169,7 +203,13 @@ static void SIWriteConfig(double factor, BOOL enabled, BOOL extra) {
         [_extraSwitch.centerYAnchor constraintEqualToAnchor:lbl1b.centerYAnchor],
         [_extraSwitch.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-24],
 
-        [lbl2.topAnchor constraintEqualToAnchor:lbl1b.bottomAnchor constant:24],
+        [lbl1c.topAnchor constraintEqualToAnchor:lbl1b.bottomAnchor constant:20],
+        [lbl1c.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:24],
+        [lbl1c.trailingAnchor constraintLessThanOrEqualToAnchor:_instantSwitch.leadingAnchor constant:-12],
+        [_instantSwitch.centerYAnchor constraintEqualToAnchor:lbl1c.centerYAnchor],
+        [_instantSwitch.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-24],
+
+        [lbl2.topAnchor constraintEqualToAnchor:lbl1c.bottomAnchor constant:20],
         [lbl2.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:24],
 
         [_speedSeg.topAnchor constraintEqualToAnchor:lbl2.bottomAnchor constant:12],
@@ -188,17 +228,25 @@ static void SIWriteConfig(double factor, BOOL enabled, BOOL extra) {
     ]];
 }
 
+- (void)onInstantToggle {
+    if (_instantSwitch.isOn) {
+        _status.text = @"瞬切模式：所有动画时长归零、页面瞬间切换。若目标 App 出现闪退请关闭后重新保存。";
+    }
+}
+
 - (void)onApply {
     double factor = [_factors[_speedSeg.selectedSegmentIndex] doubleValue];
-    SIWriteConfig(factor, _enableSwitch.isOn, _extraSwitch.isOn);
-    _status.text = [NSString stringWithFormat:@"已保存 factor=%.3f 增强=%@，正在注销 SpringBoard…", factor, _extraSwitch.isOn ? @"开" : @"关"];
+    SIWriteConfig(factor, _enableSwitch.isOn, _extraSwitch.isOn, _instantSwitch.isOn);
+    _status.text = [NSString stringWithFormat:@"已保存 factor=%.3f 增强=%@ 瞬切=%@，正在注销 SpringBoard…",
+                    factor, _extraSwitch.isOn ? @"开" : @"关", _instantSwitch.isOn ? @"开" : @"关"];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         SIRespring();
     });
 }
 
 - (void)onReboot {
-    SIWriteConfig([_factors[_speedSeg.selectedSegmentIndex] doubleValue], _enableSwitch.isOn, _extraSwitch.isOn);
+    SIWriteConfig([_factors[_speedSeg.selectedSegmentIndex] doubleValue],
+                  _enableSwitch.isOn, _extraSwitch.isOn, _instantSwitch.isOn);
     _status.text = @"正在重启设备（请稍候）…";
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSString *r = SIReboot();

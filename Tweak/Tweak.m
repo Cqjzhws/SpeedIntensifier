@@ -1,8 +1,18 @@
-// SpeedIntensifier v1.4 — 可注入动画加速 Tweak（纯 ObjC runtime，无 substrate）
-// 默认最快档 0.001 + 火力全开；基础 20 hook；ExtraAcceleration（默认 YES）叠加 14 个增强 hook；
-// v1.4 新增：- CALayer addAnimation:forKey: 加速（让 loading 转轮/CABasic 显式动画也极快，触发 backdrop/visualeffect/blur 跳过）；
-//           - 黑名单感知的保底门槛（黑名单 App 仍 50ms 兼容，非黑名单 nav/tab 16ms、present 30ms、CA 8ms）；
-//           - 标准命名图素（Icon-60@2x/3x、Icon-76@2x、Icon-83.5@2x + AppIcon）多档交付，图标必显示。
+// SpeedIntensifier v1.5 — 可注入动画加速 Tweak（纯 ObjC runtime，无 substrate）
+// 默认最快档 0.001 + 火力全开；基础 19 hook；ExtraAcceleration（默认 YES）叠加 46 个增强 hook（共 65）；
+// v1.4：- CALayer addAnimation:forKey: 加速（loading 转轮/CABasic 显式动画也极快，backdrop/visualeffect/blur 跳过）；
+//       - 黑名单感知的保底门槛（黑名单 App 仍 50ms 兼容，非黑名单 nav/tab 16ms、present 30ms、CA 8ms）；
+//       - 标准命名图素（Icon-60@2x/3x、Icon-76@2x、Icon-83.5@2x + AppIcon）多档交付，图标必显示。
+// v1.5 新增 23 hook：
+//       - 页面：UINavigationController setViewControllers:、UITabBarController setSelectedViewController:、
+//               UIPageViewController setViewControllers:direction:、UIViewController transitionFromViewController:
+//       - 滚动：UIScrollView setZoomScale:/zoomToRect:
+//       - 列表：UITableView setEditing:/select/deselect/reloadSections；UICollectionView setCollectionViewLayout:×2
+//       - 栏：  UITabBar / UIToolbar / UINavigationBar setItems:
+//       - 控件：UIProgressView / UISwitch / UISlider 动画化设值瞬时完成
+//       - 动画器：UIViewPropertyAnimator 贝塞尔初始化/runningPropertyAnimator/startAnimationAfterDelay:
+//       - 其它：UIView performSystemAnimation:（CATransaction 收窄）、老式 setAnimationDelay:
+//       - InstantMode 瞬切模式（plist InstantMode=YES，时长直接归零，最快）。
 // 黑名单 App（默认微信/企业微信）只走基础 hook，避免毛玻璃等不兼容问题。
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -29,9 +39,11 @@ static void _loadPref(void) {
             NSNumber *f = d[@"SpeedFactor"];
             NSNumber *e = d[@"Enabled"];
             NSNumber *x = d[@"ExtraAcceleration"];
+            NSNumber *m = d[@"InstantMode"];
             if (f) gFactor = [f doubleValue];
             if (e) gEnabled = [e boolValue];
             if (x) gExtra = [x boolValue];
+            if (m) gInstantMode = [m boolValue];
             gBlacklist = d[@"Blacklist"];
         }
     } @catch (__unused NSException *ex) { }
@@ -497,6 +509,202 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
     @finally { [CATransaction commit]; }
 }
 
+#pragma mark - v1.5 增强层（23 个新 hook）
+
+// ---------- UIView：系统动画（如行删除），用 CATransaction 收窄时长 ----------
++ (void)as_UIView_performSysAnim:(UISystemAnimation)sa
+                         onViews:(NSArray<UIView *> *)views
+                         options:(UIViewAnimationOptions)opts
+                      animations:(void (^)(void))a
+                      completion:(void (^)(BOOL))c {
+    if (!_extraOn()) {
+        [self as_UIView_performSysAnim:sa onViews:views options:opts animations:a completion:c];
+        return;
+    }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scaleInterval(0.30, _effectiveFactor())];
+    @try { [self as_UIView_performSysAnim:sa onViews:views options:opts animations:a completion:c]; }
+    @finally { [CATransaction commit]; }
+}
+
+// ---------- UIView：老式 beginAnimations 上下文的延迟 ----------
++ (void)as_UIView_setAnimationDelay:(NSTimeInterval)d {
+    double f = _extraOn() ? _effectiveFactor() : 1.0;
+    [self as_UIView_setAnimationDelay:(f >= 1.0 ? d : d * f)];
+}
+
+// ---------- UIViewPropertyAnimator：贝塞尔曲线初始化 ----------
+- (instancetype)as_UIPA_initDuration:(NSTimeInterval)d
+                        controlPoint1:(CGPoint)p1
+                        controlPoint2:(CGPoint)p2
+                           animations:(void (^)(void))a {
+    double f = _extraOn() ? _effectiveFactor() : 1.0;
+    return [self as_UIPA_initDuration:_scaleInterval(d, f) controlPoint1:p1 controlPoint2:p2 animations:a];
+}
+
+// ---------- UIViewPropertyAnimator：类方法一次性运行动画器 ----------
++ (instancetype)as_UIPA_runningAnimatorWithDuration:(NSTimeInterval)d
+                                              delay:(NSTimeInterval)dl
+                                            options:(UIViewAnimationOptions)o
+                                         animations:(void (^)(void))a
+                                         completion:(void (^)(UIViewAnimatingPosition))c {
+    double f = _extraOn() ? _effectiveFactor() : 1.0;
+    return [self as_UIPA_runningAnimatorWithDuration:_scaleInterval(d, f)
+                                               delay:(f >= 1.0 ? dl : dl * f)
+                                             options:o
+                                          animations:a
+                                          completion:c];
+}
+
+// ---------- UIViewPropertyAnimator：延迟启动 ----------
+- (void)as_UIPA_startAnimationAfterDelay:(NSTimeInterval)d {
+    double f = _extraOn() ? _effectiveFactor() : 1.0;
+    [self as_UIPA_startAnimationAfterDelay:(f >= 1.0 ? d : d * f)];
+}
+
+// ---------- UIViewController：自定义容器转场 ----------
+- (void)as_VC_transitionFromVC:(UIViewController *)fvc
+                          toVC:(UIViewController *)tvc
+                      duration:(NSTimeInterval)d
+                       options:(UIViewAnimationOptions)o
+                    animations:(void (^)(void))a
+                    completion:(void (^)(BOOL))c {
+    double fac = _extraOn() ? _effectiveFactor() : 1.0;
+    [self as_VC_transitionFromVC:fvc toVC:tvc duration:_scaleVC(d, fac, _pageMinMs())
+                         options:o animations:a completion:c];
+}
+
+// ---------- UINavigationController：整栈替换 ----------
+- (void)as_Nav_setViewControllers:(NSArray<UIViewController *> *)vcs animated:(BOOL)an {
+    if (!an || !_extraOn()) { [self as_Nav_setViewControllers:vcs animated:an]; return; }
+    double f = _effectiveFactor();
+    [UIView animateWithDuration:_scaleVC(0.35, f, _pageMinMs())
+                          delay:0
+                        options:UIViewAnimationOptionCurveEaseInOut
+                     animations:^{ [self as_Nav_setViewControllers:vcs animated:NO]; }
+                     completion:nil];
+}
+
+// ---------- UITabBarController：直接选 VC（侧边栏/编程切换走这里） ----------
+- (void)as_Tab_setSelectedViewController:(UIViewController *)vc {
+    if (!_extraOn()) { [self as_Tab_setSelectedViewController:vc]; return; }
+    double f = _effectiveFactor();
+    [UIView animateWithDuration:_scaleVC(0.25, f, _pageMinMs())
+                          delay:0
+                        options:UIViewAnimationOptionCurveEaseInOut
+                     animations:^{ [self as_Tab_setSelectedViewController:vc]; }
+                     completion:nil];
+}
+
+// ---------- UIPageViewController：翻页 ----------
+- (void)as_PageVC_setViewControllers:(NSArray<UIViewController *> *)vcs
+                           direction:(UIPageViewControllerNavigationDirection)dir
+                            animated:(BOOL)an
+                          completion:(void (^)(BOOL))c {
+    if (!an || !_extraOn()) {
+        [self as_PageVC_setViewControllers:vcs direction:dir animated:an completion:c];
+        return;
+    }
+    double f = _effectiveFactor();
+    [UIView animateWithDuration:_scaleVC(0.30, f, _pageMinMs())
+                          delay:0
+                        options:UIViewAnimationOptionCurveEaseInOut
+                     animations:^{ [self as_PageVC_setViewControllers:vcs direction:dir animated:NO completion:c]; }
+                     completion:nil];
+}
+
+// ---------- UIScrollView：缩放 ----------
+- (void)as_UISV_setZoomScale:(CGFloat)scale animated:(BOOL)an {
+    if (!an || !_extraOn()) { [self as_UISV_setZoomScale:scale animated:an]; return; }
+    double f = _effectiveFactor();
+    [UIView animateWithDuration:_scaleInterval(0.25, f)
+                          delay:0
+                        options:UIViewAnimationOptionCurveEaseInOut
+                     animations:^{ [self as_UISV_setZoomScale:scale animated:NO]; }
+                     completion:nil];
+}
+
+- (void)as_UISV_zoomToRect:(CGRect)r animated:(BOOL)an {
+    if (!an || !_extraOn()) { [self as_UISV_zoomToRect:r animated:an]; return; }
+    double f = _effectiveFactor();
+    [UIView animateWithDuration:_scaleInterval(0.25, f)
+                          delay:0
+                        options:UIViewAnimationOptionCurveEaseInOut
+                     animations:^{ [self as_UISV_zoomToRect:r animated:NO]; }
+                     completion:nil];
+}
+
+// ---------- UITableView：编辑态/选中/取消/分段刷新 ----------
+- (void)as_TV_setEditing:(BOOL)editing animated:(BOOL)an {
+    if (!an || !_extraOn()) { [self as_TV_setEditing:editing animated:an]; return; }
+    [self as_TV_setEditing:editing animated:NO];
+}
+
+- (void)as_TV_selectRowAtIndexPath:(NSIndexPath *)ip
+                          animated:(BOOL)an
+                    scrollPosition:(UITableViewScrollPosition)sp {
+    if (!an || !_extraOn()) { [self as_TV_selectRowAtIndexPath:ip animated:an scrollPosition:sp]; return; }
+    [self as_TV_selectRowAtIndexPath:ip animated:NO scrollPosition:sp];
+}
+
+- (void)as_TV_deselectRowAtIndexPath:(NSIndexPath *)ip animated:(BOOL)an {
+    if (!an || !_extraOn()) { [self as_TV_deselectRowAtIndexPath:ip animated:an]; return; }
+    [self as_TV_deselectRowAtIndexPath:ip animated:NO];
+}
+
+- (void)as_TV_reloadSections:(NSIndexSet *)sections withRowAnimation:(UITableViewRowAnimation)an {
+    if (!_extraOn()) { [self as_TV_reloadSections:sections withRowAnimation:an]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scaleInterval(0.25, _effectiveFactor())];
+    @try { [self as_TV_reloadSections:sections withRowAnimation:an]; }
+    @finally { [CATransaction commit]; }
+}
+
+// ---------- UICollectionView：布局切换 ----------
+- (void)as_CV_setLayout:(UICollectionViewLayout *)layout
+               animated:(BOOL)an
+             completion:(void (^)(BOOL))c {
+    if (!an || !_extraOn()) { [self as_CV_setLayout:layout animated:an completion:c]; return; }
+    [self as_CV_setLayout:layout animated:NO completion:c];
+}
+
+- (void)as_CV_setLayout:(UICollectionViewLayout *)layout animated:(BOOL)an {
+    if (!an || !_extraOn()) { [self as_CV_setLayout:layout animated:an]; return; }
+    [self as_CV_setLayout:layout animated:NO];
+}
+
+// ---------- 栏：TabBar / Toolbar / NavigationBar 项变更动画 ----------
+- (void)as_TabBar_setItems:(NSArray *)items animated:(BOOL)an {
+    if (!an || !_extraOn()) { [self as_TabBar_setItems:items animated:an]; return; }
+    [self as_TabBar_setItems:items animated:NO];
+}
+
+- (void)as_Toolbar_setItems:(NSArray *)items animated:(BOOL)an {
+    if (!an || !_extraOn()) { [self as_Toolbar_setItems:items animated:an]; return; }
+    [self as_Toolbar_setItems:items animated:NO];
+}
+
+- (void)as_NavBar_setItems:(NSArray *)items animated:(BOOL)an {
+    if (!an || !_extraOn()) { [self as_NavBar_setItems:items animated:an]; return; }
+    [self as_NavBar_setItems:items animated:NO];
+}
+
+// ---------- 控件：进度/开关/滑杆 动画化设值瞬时到位 ----------
+- (void)as_Progress_setProgress:(float)p animated:(BOOL)an {
+    if (!an || !_extraOn()) { [self as_Progress_setProgress:p animated:an]; return; }
+    [self as_Progress_setProgress:p animated:NO];
+}
+
+- (void)as_Switch_setOn:(BOOL)on animated:(BOOL)an {
+    if (!an || !_extraOn()) { [self as_Switch_setOn:on animated:an]; return; }
+    [self as_Switch_setOn:on animated:NO];
+}
+
+- (void)as_Slider_setValue:(float)v animated:(BOOL)an {
+    if (!an || !_extraOn()) { [self as_Slider_setValue:v animated:an]; return; }
+    [self as_Slider_setValue:v animated:NO];
+}
+
 @end
 
 __attribute__((constructor))
@@ -654,6 +862,84 @@ static void _si_install(void) {
             etotal += 1;
             eok += _swizzleInstance([CALayer class], @selector(addAnimation:forKey:),
                                     @selector(as_CALayer_addAnimation:forKey:));
+
+            // ==================== v1.5 新增 23 hook ====================
+            // --- UIView：系统动画 / 老式动画延迟 ---
+            etotal += 1;
+            eok += _swizzleClass(UIView_cls, @selector(performSystemAnimation:onViews:options:animations:completion:),
+                                 @selector(as_UIView_performSysAnim:onViews:options:animations:completion:));
+            etotal += 1;
+            eok += _swizzleClass(UIView_cls, @selector(setAnimationDelay:),
+                                 @selector(as_UIView_setAnimationDelay:));
+
+            // --- UIViewPropertyAnimator：贝塞尔初始化 / 一次性类方法 / 延迟启动 ---
+            etotal += 1;
+            eok += _swizzleInstance(UIPA_cls, @selector(initWithDuration:controlPoint1:controlPoint2:animations:),
+                                    @selector(as_UIPA_initDuration:controlPoint1:controlPoint2:animations:));
+            etotal += 1;
+            eok += _swizzleClass(UIPA_cls, @selector(runningPropertyAnimatorWithDuration:delay:options:animations:completion:),
+                                 @selector(as_UIPA_runningAnimatorWithDuration:delay:options:animations:completion:));
+            etotal += 1;
+            eok += _swizzleInstance(UIPA_cls, @selector(startAnimationAfterDelay:),
+                                    @selector(as_UIPA_startAnimationAfterDelay:));
+
+            // --- 页面：整栈替换 / 直接选 VC / 翻页 / 自定义容器转场 ---
+            etotal += 1;
+            eok += _swizzleInstance(Nav_cls, @selector(setViewControllers:animated:),
+                                    @selector(as_Nav_setViewControllers:animated:));
+            etotal += 1;
+            eok += _swizzleInstance(Tab_cls, @selector(setSelectedViewController:),
+                                    @selector(as_Tab_setSelectedViewController:));
+            Class PageVC_cls = [UIPageViewController class];
+            etotal += 1;
+            eok += _swizzleInstance(PageVC_cls, @selector(setViewControllers:direction:animated:completion:),
+                                    @selector(as_PageVC_setViewControllers:direction:animated:completion:));
+            etotal += 1;
+            eok += _swizzleInstance(VC_cls, @selector(transitionFromViewController:toViewController:duration:options:animations:completion:),
+                                    @selector(as_VC_transitionFromVC:toVC:duration:options:animations:completion:));
+
+            // --- UIScrollView：缩放 ---
+            etotal += 2;
+            eok += _swizzleInstance(UISV_cls, @selector(setZoomScale:animated:),
+                                    @selector(as_UISV_setZoomScale:animated:));
+            eok += _swizzleInstance(UISV_cls, @selector(zoomToRect:animated:),
+                                    @selector(as_UISV_zoomToRect:animated:));
+
+            // --- UITableView：编辑态 / 选中 / 取消 / 分段刷新 ---
+            etotal += 4;
+            eok += _swizzleInstance(TV_cls, @selector(setEditing:animated:),
+                                    @selector(as_TV_setEditing:animated:));
+            eok += _swizzleInstance(TV_cls, @selector(selectRowAtIndexPath:animated:scrollPosition:),
+                                    @selector(as_TV_selectRowAtIndexPath:animated:scrollPosition:));
+            eok += _swizzleInstance(TV_cls, @selector(deselectRowAtIndexPath:animated:),
+                                    @selector(as_TV_deselectRowAtIndexPath:animated:));
+            eok += _swizzleInstance(TV_cls, @selector(reloadSections:withRowAnimation:),
+                                    @selector(as_TV_reloadSections:withRowAnimation:));
+
+            // --- UICollectionView：布局切换 ---
+            etotal += 2;
+            eok += _swizzleInstance(CV_cls, @selector(setCollectionViewLayout:animated:completion:),
+                                    @selector(as_CV_setLayout:animated:completion:));
+            eok += _swizzleInstance(CV_cls, @selector(setCollectionViewLayout:animated:),
+                                    @selector(as_CV_setLayout:animated:));
+
+            // --- 栏：TabBar / Toolbar / NavigationBar ---
+            etotal += 3;
+            eok += _swizzleInstance([UITabBar class], @selector(setItems:animated:),
+                                    @selector(as_TabBar_setItems:animated:));
+            eok += _swizzleInstance([UIToolbar class], @selector(setItems:animated:),
+                                    @selector(as_Toolbar_setItems:animated:));
+            eok += _swizzleInstance([UINavigationBar class], @selector(setItems:animated:),
+                                    @selector(as_NavBar_setItems:animated:));
+
+            // --- 控件：进度条 / 开关 / 滑杆 ---
+            etotal += 3;
+            eok += _swizzleInstance([UIProgressView class], @selector(setProgress:animated:),
+                                    @selector(as_Progress_setProgress:animated:));
+            eok += _swizzleInstance([UISwitch class], @selector(setOn:animated:),
+                                    @selector(as_Switch_setOn:animated:));
+            eok += _swizzleInstance([UISlider class], @selector(setValue:animated:),
+                                    @selector(as_Slider_setValue:animated:));
 
             total += etotal;
             ok += eok;
