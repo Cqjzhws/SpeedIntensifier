@@ -158,14 +158,16 @@ static NSString *SIRespring(void) {
     return (s1 == 0 || s2 == 0) ? @"persona killall" : @"all failed";
 }
 
-static void SIWriteConfig(double factor, BOOL enabled, BOOL extra, BOOL instant) {
+static void SIWriteConfig(double factor, BOOL enabled, BOOL extra, BOOL instant, BOOL folder) {
     mkdir("/var/Managed Preferences", 0755);
     mkdir("/var/Managed Preferences/mobile", 0755);
+    // v1.5.8 修复：不再把 com.tencent.xin 写回黑名单（微信与其他 App 同等加速），仅保留企业微信
     NSDictionary *d = @{ @"SpeedFactor": @(factor),
                          @"Enabled": @(enabled),
                          @"ExtraAcceleration": @(extra),
                          @"InstantMode": @(instant),
-                         @"Blacklist": @[ @"com.tencent.xin", @"com.tencent.wework" ] };
+                         @"FolderAccel": @(folder),
+                         @"Blacklist": @[ @"com.tencent.wework" ] };
     BOOL ok = [d writeToFile:kPrefPath atomically:YES];
     NSLog(@"[SIApp] write pref %@ -> %d", kPrefPath, ok);
 
@@ -182,7 +184,8 @@ static NSDictionary *SIReadConfig(void) {
         d = @{ @"SpeedFactor": @0.001,
                @"Enabled": @YES,
                @"ExtraAcceleration": @YES,
-               @"InstantMode": @NO };
+               @"InstantMode": @NO,
+               @"FolderAccel": @YES };
     }
     return d;
 }
@@ -194,6 +197,7 @@ static NSDictionary *SIReadConfig(void) {
     UISwitch *_enableSwitch;
     UISwitch *_extraSwitch;
     UISwitch *_instantSwitch;
+    UISwitch *_folderSwitch;
     UISegmentedControl *_speedSeg;
     UILabel *_status;
     NSArray<NSNumber *> *_factors;
@@ -209,6 +213,7 @@ static NSDictionary *SIReadConfig(void) {
     BOOL cfgEnabled = cfg[@"Enabled"] ? [cfg[@"Enabled"] boolValue] : YES;
     BOOL cfgExtra   = cfg[@"ExtraAcceleration"] ? [cfg[@"ExtraAcceleration"] boolValue] : YES;
     BOOL cfgInstant = cfg[@"InstantMode"] ? [cfg[@"InstantMode"] boolValue] : NO;
+    BOOL cfgFolder  = cfg[@"FolderAccel"] ? [cfg[@"FolderAccel"] boolValue] : YES;
     double cfgFactor = cfg[@"SpeedFactor"] ? [cfg[@"SpeedFactor"] doubleValue] : 0.001;
 
     UILabel *title = [[UILabel alloc] init];
@@ -217,7 +222,7 @@ static NSDictionary *SIReadConfig(void) {
     title.textAlignment = NSTextAlignmentCenter;
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"动画加速 v1.5.6 · 62 Hooks · 三方实测合并增强";
+    sub.text = @"动画加速 v1.5.8 · 65 Hooks · 新增文件夹加速";
     sub.font = [UIFont systemFontOfSize:14];
     sub.textColor = [UIColor secondaryLabelColor];
     sub.textAlignment = NSTextAlignmentCenter;
@@ -244,6 +249,13 @@ static NSDictionary *SIReadConfig(void) {
     _instantSwitch.on = cfgInstant;
     [_instantSwitch addTarget:self action:@selector(onInstantToggle) forControlEvents:UIControlEventValueChanged];
 
+    UILabel *lbl1d = [[UILabel alloc] init];
+    lbl1d.text = @"文件夹加速（文件App/文件夹浏览）";
+    lbl1d.font = [UIFont systemFontOfSize:17];
+    lbl1d.adjustsFontSizeToFitWidth = YES;
+    _folderSwitch = [[UISwitch alloc] init];
+    _folderSwitch.on = cfgFolder;
+
     UILabel *lbl2 = [[UILabel alloc] init];
     lbl2.text = @"速度档位（越小越快）";
     lbl2.font = [UIFont systemFontOfSize:17];
@@ -268,9 +280,9 @@ static NSDictionary *SIReadConfig(void) {
     _status.numberOfLines = 0;
     _status.font = [UIFont systemFontOfSize:13];
     _status.textColor = [UIColor secondaryLabelColor];
-    _status.text = @"提示：dylib 由 TrollFools 注入目标 App 后生效；本 App 负责写入配置并注销。\n微信/企业微信默认只走基础加速。瞬切模式若出现异常请关闭。";
+    _status.text = @"提示：dylib 由 TrollFools 注入目标 App 后生效；本 App 负责写入配置并注销。\n黑名单App（默认企业微信）只走基础加速。瞬切模式若出现异常请关闭。";
 
-    NSArray *views = @[title, sub, lbl1, _enableSwitch, lbl1b, _extraSwitch, lbl1c, _instantSwitch, lbl2, _speedSeg, btnApply, btnReboot, _status];
+    NSArray *views = @[title, sub, lbl1, _enableSwitch, lbl1b, _extraSwitch, lbl1c, _instantSwitch, lbl1d, _folderSwitch, lbl2, _speedSeg, btnApply, btnReboot, _status];
     for (UIView *v in views) { v.translatesAutoresizingMaskIntoConstraints = NO; [self.view addSubview:v]; }
 
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
@@ -297,7 +309,12 @@ static NSDictionary *SIReadConfig(void) {
         [_instantSwitch.centerYAnchor constraintEqualToAnchor:lbl1c.centerYAnchor],
         [_instantSwitch.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-24],
 
-        [lbl2.topAnchor constraintEqualToAnchor:lbl1c.bottomAnchor constant:20],
+        [lbl1d.topAnchor constraintEqualToAnchor:lbl1c.bottomAnchor constant:20],
+        [lbl1d.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:24],
+        [_folderSwitch.centerYAnchor constraintEqualToAnchor:lbl1d.centerYAnchor],
+        [_folderSwitch.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-24],
+
+        [lbl2.topAnchor constraintEqualToAnchor:lbl1d.bottomAnchor constant:20],
         [lbl2.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:24],
 
         [_speedSeg.topAnchor constraintEqualToAnchor:lbl2.bottomAnchor constant:12],
@@ -324,9 +341,10 @@ static NSDictionary *SIReadConfig(void) {
 
 - (void)onApply {
     double factor = [_factors[_speedSeg.selectedSegmentIndex] doubleValue];
-    SIWriteConfig(factor, _enableSwitch.isOn, _extraSwitch.isOn, _instantSwitch.isOn);
-    _status.text = [NSString stringWithFormat:@"已保存 factor=%.3f 增强=%@ 瞬切=%@，正在注销 iPhone18…",
-                    factor, _extraSwitch.isOn ? @"开" : @"关", _instantSwitch.isOn ? @"开" : @"关"];
+    SIWriteConfig(factor, _enableSwitch.isOn, _extraSwitch.isOn, _instantSwitch.isOn, _folderSwitch.isOn);
+    _status.text = [NSString stringWithFormat:@"已保存 factor=%.3f 增强=%@ 瞬切=%@ 文件夹=%@，正在注销 iPhone18…",
+                    factor, _extraSwitch.isOn ? @"开" : @"关", _instantSwitch.isOn ? @"开" : @"关",
+                    _folderSwitch.isOn ? @"开" : @"关"];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSString *how = SIRespring();
         _status.text = [NSString stringWithFormat:@"已保存，注销已触发（%@）。若屏幕未黑，请重开本 App 再点一次。", how];
@@ -335,7 +353,7 @@ static NSDictionary *SIReadConfig(void) {
 
 - (void)onReboot {
     SIWriteConfig([_factors[_speedSeg.selectedSegmentIndex] doubleValue],
-                  _enableSwitch.isOn, _extraSwitch.isOn, _instantSwitch.isOn);
+                  _enableSwitch.isOn, _extraSwitch.isOn, _instantSwitch.isOn, _folderSwitch.isOn);
     _status.text = @"正在重启设备（请稍候）…";
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSString *r = SIReboot();

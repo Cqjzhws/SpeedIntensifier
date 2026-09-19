@@ -30,6 +30,7 @@ static double  gFactor = 0.001;
 static BOOL    gEnabled = YES;
 static BOOL    gInstantMode = NO;
 static BOOL    gExtra = YES;            // 额外加速总开关（默认开）
+static BOOL    gFolder = YES;           // v1.5.8 文件夹加速（文件 App/列表移动刷新，默认开）
 static BOOL    gBlacklisted = NO;       // 当前 App 是否命中黑名单
 static NSArray *gBlacklist = nil;
 
@@ -45,10 +46,12 @@ static void _loadPref(void) {
             NSNumber *e = d[@"Enabled"];
             NSNumber *x = d[@"ExtraAcceleration"];
             NSNumber *m = d[@"InstantMode"];
+            NSNumber *fd = d[@"FolderAccel"];
             if (f) gFactor = [f doubleValue];
             if (e) gEnabled = [e boolValue];
             if (x) gExtra = [x boolValue];
             if (m) gInstantMode = [m boolValue];
+            if (fd) gFolder = [fd boolValue];
             gBlacklist = d[@"Blacklist"];
         }
     } @catch (__unused NSException *ex) { }
@@ -74,6 +77,11 @@ static double _effectiveFactor(void) {
 // 额外加速是否对当前 App 生效
 static inline BOOL _extraOn(void) {
     return gEnabled && gExtra && !gBlacklisted;
+}
+
+// 文件夹加速（文件 App/文件夹浏览）是否生效
+static inline BOOL _folderOn(void) {
+    return gEnabled && gFolder && !gBlacklisted;
 }
 
 static inline NSTimeInterval _scaleInterval(NSTimeInterval t, double f) {
@@ -695,6 +703,35 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
     [self as_CAProp_setDuration:_scaleVC(d, _effectiveFactor(), 10)];
 }
 
+// ==================== v1.5.8 文件夹加速（文件 App/文件夹浏览，FolderAccel 开关） ====================
+
+// CollectionView 移动条目（文件排序/拖拽重排）
+- (void)as_CV_moveItemAtIndexPath:(NSIndexPath *)src toIndexPath:(NSIndexPath *)dst {
+    if (!gEnabled || !_folderOn()) { [self as_CV_moveItemAtIndexPath:src toIndexPath:dst]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scaleInterval(0.25, _effectiveFactor())];
+    @try { [self as_CV_moveItemAtIndexPath:src toIndexPath:dst]; }
+    @finally { [CATransaction commit]; }
+}
+
+// CollectionView 重载段（文件夹内容刷新）
+- (void)as_CV_reloadSections:(NSIndexSet *)sec {
+    if (!gEnabled || !_folderOn()) { [self as_CV_reloadSections:sec]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scaleInterval(0.25, _effectiveFactor())];
+    @try { [self as_CV_reloadSections:sec]; }
+    @finally { [CATransaction commit]; }
+}
+
+// TableView 移动行（文件列表排序）
+- (void)as_TV_moveRowAtIndexPath:(NSIndexPath *)src toIndexPath:(NSIndexPath *)dst {
+    if (!gEnabled || !_folderOn()) { [self as_TV_moveRowAtIndexPath:src toIndexPath:dst]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scaleInterval(0.25, _effectiveFactor())];
+    @try { [self as_TV_moveRowAtIndexPath:src toIndexPath:dst]; }
+    @finally { [CATransaction commit]; }
+}
+
 // v1.5.5 移除的 transitionFromViewController hook（deprecated API，状态机最重）不再恢复。
 
 @end
@@ -933,6 +970,23 @@ static void _si_install(void) {
                 etotal += 1;
                 eok += _swizzleInstance([CAPropertyAnimation class], @selector(setDuration:),
                                         @selector(as_CAProp_setDuration:));
+            }
+
+            // ==================== v1.5.8 文件夹加速（FolderAccel，默认开） ====================
+            if (_folderOn()) {
+                int fok = 0, ftotal = 0;
+                Class CV_cls2 = [UICollectionView class];
+                ftotal += 2;
+                fok += _swizzleInstance(CV_cls2, @selector(moveItemAtIndexPath:toIndexPath:),
+                                        @selector(as_CV_moveItemAtIndexPath:toIndexPath:));
+                fok += _swizzleInstance(CV_cls2, @selector(reloadSections:),
+                                        @selector(as_CV_reloadSections:));
+                ftotal += 1;
+                fok += _swizzleInstance(TV_cls, @selector(moveRowAtIndexPath:toIndexPath:),
+                                        @selector(as_TV_moveRowAtIndexPath:toIndexPath:));
+                total += ftotal;
+                ok += fok;
+                NSLog(@"[SpeedIntensifier] folder hooks %d/%d (FolderAccel=ON)", fok, ftotal);
             }
 
             total += etotal;

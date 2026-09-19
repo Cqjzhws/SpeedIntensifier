@@ -81,6 +81,21 @@ jobs:
           codesign -dv artifacts/SpeedIntensifier.dylib 2>&1 | head -5 || true
           unzip -l artifacts/SpeedIntensifier.ipa
 
+      # 诊断：核对 runner 端源码与产物二进制中的字符串，定位"源码有但二进制无"问题
+      - name: Debug source & binary strings
+        run: |
+          echo "=== md5 sources ==="
+          md5 App/main.m Tweak/Tweak.m
+          echo "=== markers in source ==="
+          grep -c "iPhone18" App/main.m || true
+          grep -c "FolderAccel" App/main.m Tweak/Tweak.m || true
+          echo "=== ASCII strings in app binary ==="
+          strings build/SpeedIntensifier.app/SpeedIntensifier | grep -Ei "hooks|1\.5\.|iPhone18|FolderAccel" || echo "(no marker ASCII strings found)"
+          echo "=== CFString literals (objdump) ==="
+          otool -v -s __DATA __cfstring build/SpeedIntensifier.app/SpeedIntensifier 2>/dev/null | head -30 || true
+          echo "=== Info.plist in .app ==="
+          plutil -p build/SpeedIntensifier.app/Info.plist | grep -E "Version|DisplayName" || true
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
