@@ -8,6 +8,9 @@
 #import <string.h>
 #import <unistd.h>
 #import <errno.h>
+#import <signal.h>
+#import <stdlib.h>
+#import <sys/sysctl.h>
 
 // iPhoneOS SDK 无 <sys/reboot.h>，但 unistd.h 已声明 int reboot(int)；
 // 仅补 RB_AUTOBOOT 常量（BSD 标准值）
@@ -30,21 +33,35 @@ static NSString *const kPrefDir = @"/var/Managed Preferences/mobile";
 
 static void SIApplyAttr(posix_spawnattr_t *attr);
 
-static void SIRespring(void) {
-    posix_spawnattr_t attr;
-    char *args[] = { "/usr/bin/killall", "-9", "SpringBoard", NULL };
-    SIApplyAttr(&attr);
-    pid_t pid;
-    int status = posix_spawn(&pid, "/usr/bin/killall", NULL, &attr, args, environ);
-    posix_spawnattr_destroy(&attr);
-    NSLog(@"[SIApp] respring spawn status=%d pid=%d", status, pid);
-}
-
 static void SIApplyAttr(posix_spawnattr_t *attr) {
     posix_spawnattr_init(attr);
     posix_spawnattr_set_persona_np(attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
     posix_spawnattr_set_persona_uid_np(attr, 0);
     posix_spawnattr_set_persona_gid_np(attr, 0);
+}
+
+// v1.5.2：原生直接 kill——sysctl 枚举进程表找到目标 pid 后 kill(pid, SIGKILL)。
+// 不依赖外部 killall 二进制与 root persona；App 为 mobile uid，SpringBoard 同为 mobile uid，
+// no-sandbox entitlement 下同 uid 信号必达。外部二进制被拦截/路径不符也能注销。
+static int SIKillProcessNamed(const char *name) {
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+    size_t len = 0;
+    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0) return -1;
+    len += 32 * sizeof(struct kinfo_proc);   // 留余量，避免两次枚举间进程增长
+    struct kinfo_proc *list = (struct kinfo_proc *)malloc(len);
+    if (!list) return -1;
+    if (sysctl(mib, 4, list, &len, NULL, 0) != 0) { free(list); return -1; }
+    int count = (int)(len / sizeof(struct kinfo_proc));
+    int killed = 0;
+    for (int i = 0; i < count; i++) {
+        if (strncmp(list[i].kp_proc.p_comm, name, sizeof(list[i].kp_proc.p_comm)) == 0) {
+            pid_t p = list[i].kp_proc.p_pid;
+            if (kill(p, SIGKILL) == 0) killed++;
+            NSLog(@"[SIApp] native kill %@(%d) -> %s", @(name), p, strerror(errno));
+        }
+    }
+    free(list);
+    return killed;
 }
 
 // iOS 16.6.1 上 `/sbin/reboot` 经常被 sandbox 拦截静默失败，
@@ -107,6 +124,40 @@ static NSString *SIReboot(void) {
     return @"all failed";
 }
 
+// v1.5.2 注销方案（按可靠性排序）：
+// ① 原生 sysctl 枚举 + 直接 kill SpringBoard（无需 root/persona，最可靠）；
+// ② root persona killall SpringBoard；
+// ③ 原生 kill backboardd（同 mobile uid 不可达则跳过，连带重启 SpringBoard）；
+// ④ root persona killall backboardd（强制重载主进程，等价类注销）。
+// 返回最终触发方案名（用于界面反馈）。
+static NSString *SIRespring(void) {
+    // ① 原生直接 kill SpringBoard
+    int k1 = SIKillProcessNamed("SpringBoard");
+    if (k1 > 0) return @"原生 kill SpringBoard";
+
+    // ② root persona killall
+    posix_spawnattr_t attr;
+    char *a1[] = { "/usr/bin/killall", "-9", "SpringBoard", NULL };
+    SIApplyAttr(&attr);
+    pid_t pid;
+    int s1 = posix_spawn(&pid, "/usr/bin/killall", NULL, &attr, a1, environ);
+    posix_spawnattr_destroy(&attr);
+    NSLog(@"[SIApp] killall SpringBoard spawn status=%d pid=%d errno=%d", s1, pid, errno);
+
+    // ③ 原生 kill backboardd（mobile uid 通常无权限，仅尝试）
+    int k3 = SIKillProcessNamed("backboardd");
+    if (k3 > 0) return @"原生 kill backboardd";
+
+    // ④ persona killall backboardd
+    posix_spawnattr_t attr2;
+    char *a2[] = { "/usr/bin/killall", "-9", "backboardd", NULL };
+    SIApplyAttr(&attr2);
+    int s2 = posix_spawn(&pid, "/usr/bin/killall", NULL, &attr2, a2, environ);
+    posix_spawnattr_destroy(&attr2);
+    NSLog(@"[SIApp] killall backboardd spawn status=%d pid=%d errno=%d", s2, pid, errno);
+    return (s1 == 0 || s2 == 0) ? @"persona killall" : @"all failed";
+}
+
 static void SIWriteConfig(double factor, BOOL enabled, BOOL extra, BOOL instant) {
     mkdir("/var/Managed Preferences", 0755);
     mkdir("/var/Managed Preferences/mobile", 0755);
@@ -166,7 +217,7 @@ static NSDictionary *SIReadConfig(void) {
     title.textAlignment = NSTextAlignmentCenter;
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"动画加速 v1.5.1 · 61 Hooks · 稳定性修复";
+    sub.text = @"动画加速 v1.5.2 · 61 Hooks · 注销修复";
     sub.font = [UIFont systemFontOfSize:14];
     sub.textColor = [UIColor secondaryLabelColor];
     sub.textAlignment = NSTextAlignmentCenter;
@@ -277,7 +328,8 @@ static NSDictionary *SIReadConfig(void) {
     _status.text = [NSString stringWithFormat:@"已保存 factor=%.3f 增强=%@ 瞬切=%@，正在注销 SpringBoard…",
                     factor, _extraSwitch.isOn ? @"开" : @"关", _instantSwitch.isOn ? @"开" : @"关"];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        SIRespring();
+        NSString *how = SIRespring();
+        _status.text = [NSString stringWithFormat:@"已保存，注销已触发（%@）。若屏幕未黑，请重开本 App 再点一次。", how];
     });
 }
 

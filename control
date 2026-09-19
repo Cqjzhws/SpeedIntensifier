@@ -1,8 +1,8 @@
 Package: com.local.speedintensifier
 Name: Speed Intensifier
-Version: 1.5.1
+Version: 1.5.2
 Architecture: iphoneos-arm
-Description: 动画加速 Tweak v1.5.1（共 61 hook）：修复 v1.4/v1.5 注入非黑名单 App 启动即闪退的问题（CAAnimation 子类重复 setDuration: hook 导致无限递归栈溢出，现仅 hook 基类覆盖全部子类）；新增导航整栈替换/翻页/缩放/Table&Collection 编辑布局/栏项/控件/PropertyAnimator 等 hook 与 InstantMode 瞬切模式；纯 runtime 无 substrate，TrollFools 可注入
+Description: 动画加速 Tweak v1.5.2（共 61 hook）：修复注入闪退（仅 hook CAAnimation 基类覆盖全部子类）；修复配置 App 注销无效（改为原生 sysctl 枚举进程直接 kill SpringBoard，不再依赖外部 killall 二进制与 root persona，失败自动回退）；重启改为 root 助手直调 reboot() 系统调用；纯 runtime 无 substrate，TrollFools 可注入
 Maintainer: local
 Author: local
 Section: Tweaks
