@@ -5,6 +5,9 @@
 #import <spawn.h>
 #import <sys/wait.h>
 #import <sys/stat.h>
+#import <sys/reboot.h>
+#import <string.h>
+#import <unistd.h>
 #import <errno.h>
 
 #ifndef POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE
@@ -40,33 +43,62 @@ static void SIApplyAttr(posix_spawnattr_t *attr) {
 }
 
 // iOS 16.6.1 上 `/sbin/reboot` 经常被 sandbox 拦截静默失败，
-// 退而求其次：杀 launchd（内核自动 respawn，等价重启）；
-// 备份：杀 backboardd（强制重载主进程）。
-// 返回最终成功方案名（用于界面反馈），全部失败返回 "all failed"。
+// v1.5.1 重启方案（按可靠性排序）：
+// ① 以 root persona 重新拉起自身 --si-reboot-helper 子进程，由子进程直调 reboot() 系统调用（最可靠）；
+// ② /usr/sbin/reboot（iOS 15+ 常见路径）；
+// ③ /sbin/reboot（旧路径）；
+// ④ killall launchd（pid1 受内核保护时无效）；
+// ⑤ killall backboardd（强制重载主进程）。
+// 返回最终触发方案名（用于界面反馈），全部失败返回 "all failed"。
 static NSString *SIReboot(void) {
-    posix_spawnattr_t attr;
-    char *a1[] = { "/sbin/reboot", NULL };
-    SIApplyAttr(&attr);
-    pid_t p1;
-    int s1 = posix_spawn(&p1, "/sbin/reboot", NULL, &attr, a1, environ);
-    posix_spawnattr_destroy(&attr);
-    NSLog(@"[SIApp] /sbin/reboot spawn status=%d pid=%d errno=%d", s1, p1, errno);
-    if (s1 == 0) return @"/sbin/reboot";
+    pid_t pid;
 
-    char *a2[] = { "/usr/bin/killall", "-9", "launchd", NULL };
-    SIApplyAttr(&attr);
-    pid_t p2;
-    int s2 = posix_spawn(&p2, "/usr/bin/killall", NULL, &attr, a2, environ);
-    posix_spawnattr_destroy(&attr);
-    NSLog(@"[SIApp] killall launchd spawn status=%d pid=%d errno=%d", s2, p2, errno);
-    if (s2 == 0) return @"killall launchd";
+    // ① root 助手：以 persona uid 0 拉起自身，子进程 main() 检测到参数后直调 reboot()
+    NSString *selfPath = [[NSBundle mainBundle] executablePath];
+    if (selfPath.length) {
+        posix_spawnattr_t attr0;
+        SIApplyAttr(&attr0);
+        char *a0[] = { (char *)[selfPath UTF8String], "--si-reboot-helper", NULL };
+        int s0 = posix_spawn(&pid, [selfPath UTF8String], NULL, &attr0, a0, environ);
+        posix_spawnattr_destroy(&attr0);
+        NSLog(@"[SIApp] self helper(reboot syscall) spawn status=%d pid=%d errno=%d", s0, pid, errno);
+        if (s0 == 0) return @"root 助手 reboot() 系统调用";
+    }
 
-    char *a3[] = { "/usr/bin/killall", "-9", "backboardd", NULL };
-    SIApplyAttr(&attr);
-    pid_t p3;
-    int s3 = posix_spawn(&p3, "/usr/bin/killall", NULL, &attr, a3, environ);
-    posix_spawnattr_destroy(&attr);
-    NSLog(@"[SIApp] killall backboardd spawn status=%d pid=%d errno=%d", s3, p3, errno);
+    // ② /usr/sbin/reboot
+    posix_spawnattr_t attr1;
+    char *a1[] = { "/usr/sbin/reboot", NULL };
+    SIApplyAttr(&attr1);
+    int s1 = posix_spawn(&pid, "/usr/sbin/reboot", NULL, &attr1, a1, environ);
+    posix_spawnattr_destroy(&attr1);
+    NSLog(@"[SIApp] /usr/sbin/reboot spawn status=%d pid=%d errno=%d", s1, pid, errno);
+    if (s1 == 0) return @"/usr/sbin/reboot";
+
+    // ③ /sbin/reboot
+    posix_spawnattr_t attr2;
+    char *a2[] = { "/sbin/reboot", NULL };
+    SIApplyAttr(&attr2);
+    int s2 = posix_spawn(&pid, "/sbin/reboot", NULL, &attr2, a2, environ);
+    posix_spawnattr_destroy(&attr2);
+    NSLog(@"[SIApp] /sbin/reboot spawn status=%d pid=%d errno=%d", s2, pid, errno);
+    if (s2 == 0) return @"/sbin/reboot";
+
+    // ④ killall launchd（部分系统 pid1 受保护，仅作回退）
+    posix_spawnattr_t attr3;
+    char *a3[] = { "/usr/bin/killall", "-9", "launchd", NULL };
+    SIApplyAttr(&attr3);
+    int s3 = posix_spawn(&pid, "/usr/bin/killall", NULL, &attr3, a3, environ);
+    posix_spawnattr_destroy(&attr3);
+    NSLog(@"[SIApp] killall launchd spawn status=%d pid=%d errno=%d", s3, pid, errno);
+    if (s3 == 0) return @"killall launchd";
+
+    // ⑤ killall backboardd（强制重载主进程，等价类重启）
+    posix_spawnattr_t attr4;
+    char *a4[] = { "/usr/bin/killall", "-9", "backboardd", NULL };
+    SIApplyAttr(&attr4);
+    int s4 = posix_spawn(&pid, "/usr/bin/killall", NULL, &attr4, a4, environ);
+    posix_spawnattr_destroy(&attr4);
+    NSLog(@"[SIApp] killall backboardd spawn status=%d pid=%d errno=%d", s4, pid, errno);
     return @"all failed";
 }
 
@@ -129,7 +161,7 @@ static NSDictionary *SIReadConfig(void) {
     title.textAlignment = NSTextAlignmentCenter;
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"动画加速 v1.5 · 65 Hooks · 瞬切模式";
+    sub.text = @"动画加速 v1.5.1 · 61 Hooks · 稳定性修复";
     sub.font = [UIFont systemFontOfSize:14];
     sub.textColor = [UIColor secondaryLabelColor];
     sub.textAlignment = NSTextAlignmentCenter;
@@ -271,6 +303,21 @@ static NSDictionary *SIReadConfig(void) {
 @end
 
 int main(int argc, char *argv[]) {
+    // root 助手模式：由 SIReboot() 以 persona uid 0 拉起，直调 reboot() 系统调用后立即重启
+    if (argc > 1 && strcmp(argv[1], "--si-reboot-helper") == 0) {
+        NSLog(@"[SIApp] helper mode: calling reboot(RB_AUTOBOOT) as uid=%d euid=%d", getuid(), geteuid());
+        @autoreleasepool {
+            reboot(RB_AUTOBOOT, NULL);   // 成功不会返回；失败则继续退出
+            NSLog(@"[SIApp] reboot() failed errno=%d, fallback killall launchd", errno);
+            posix_spawnattr_t attr;
+            SIApplyAttr(&attr);
+            char *args[] = { "/usr/bin/killall", "-9", "launchd", NULL };
+            pid_t pid;
+            posix_spawn(&pid, "/usr/bin/killall", NULL, &attr, args, environ);
+            posix_spawnattr_destroy(&attr);
+        }
+        return 0;
+    }
     @autoreleasepool {
         return UIApplicationMain(argc, argv, nil, NSStringFromClass([SIAppDelegate class]));
     }

@@ -1,18 +1,12 @@
-// SpeedIntensifier v1.5 — 可注入动画加速 Tweak（纯 ObjC runtime，无 substrate）
-// 默认最快档 0.001 + 火力全开；基础 19 hook；ExtraAcceleration（默认 YES）叠加 46 个增强 hook（共 65）；
+// SpeedIntensifier v1.5.1 — 可注入动画加速 Tweak（纯 ObjC runtime，无 substrate）
+// 默认最快档 0.001 + 火力全开；基础 19 hook；ExtraAcceleration（默认 YES）叠加 42 个增强 hook（共 61）；
+// v1.5.1 修复：移除 CAAnimation 子类重复 setDuration: hook——子类继承基类实现，二次交换导致
+//              无限递归栈溢出，非黑名单 App 启动即闪退；基类 hook 已覆盖全部子类。
+//              addAnimation 仅收窄默认 0.25s 时长，避免对已缩放时长二次缩放。
 // v1.4：- CALayer addAnimation:forKey: 加速（loading 转轮/CABasic 显式动画也极快，backdrop/visualeffect/blur 跳过）；
 //       - 黑名单感知的保底门槛（黑名单 App 仍 50ms 兼容，非黑名单 nav/tab 16ms、present 30ms、CA 8ms）；
-//       - 标准命名图素（Icon-60@2x/3x、Icon-76@2x、Icon-83.5@2x + AppIcon）多档交付，图标必显示。
-// v1.5 新增 23 hook：
-//       - 页面：UINavigationController setViewControllers:、UITabBarController setSelectedViewController:、
-//               UIPageViewController setViewControllers:direction:、UIViewController transitionFromViewController:
-//       - 滚动：UIScrollView setZoomScale:/zoomToRect:
-//       - 列表：UITableView setEditing:/select/deselect/reloadSections；UICollectionView setCollectionViewLayout:×2
-//       - 栏：  UITabBar / UIToolbar / UINavigationBar setItems:
-//       - 控件：UIProgressView / UISwitch / UISlider 动画化设值瞬时完成
-//       - 动画器：UIViewPropertyAnimator 贝塞尔初始化/runningPropertyAnimator/startAnimationAfterDelay:
-//       - 其它：UIView performSystemAnimation:（CATransaction 收窄）、老式 setAnimationDelay:
-//       - InstantMode 瞬切模式（plist InstantMode=YES，时长直接归零，最快）。
+// v1.5 新增 23 hook：导航整栈替换/TabBar 直选 VC/翻页/容器转场、缩放、列表编辑与布局、栏项、控件、
+//       PropertyAnimator 贝塞尔与延迟启动、performSystemAnimation、setAnimationDelay、InstantMode 瞬切模式。
 // 黑名单 App（默认微信/企业微信）只走基础 hook，避免毛玻璃等不兼容问题。
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -348,6 +342,8 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
 }
 
 // 3) CAAnimation 基类时长（覆盖 CABasic/CAKeyframe/CASpring/CATransition 等全部子类）
+// v1.5.1 修复：只 hook 基类。此前同时 hook 子类 setDuration:，但子类未重写该方法（继承基类），
+// 二次 method_exchangeImplementations 造成"原方法↔替换方法"互相指向形成无限递归 → 栈溢出闪退。
 - (void)as_CAAnimation_setDuration:(CFTimeInterval)d {
     if (!_extraOn()) { [self as_CAAnimation_setDuration:d]; return; }
     double f = _effectiveFactor();
@@ -360,29 +356,7 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
     [self as_UIWindow_setAnimationDuration:_scaleInterval(d, f)];
 }
 
-// ---------- 增强层·CABasicAnimation ----------
-- (void)as_CABasic_setDuration:(CFTimeInterval)d {
-    if (!_extraOn()) { [self as_CABasic_setDuration:d]; return; }
-    [self as_CABasic_setDuration:_scaleVC(d, _effectiveFactor(), _caMinMs())];
-}
-
-// ---------- 增强层·CAKeyframeAnimation ----------
-- (void)as_CAKeyframe_setDuration:(CFTimeInterval)d {
-    if (!_extraOn()) { [self as_CAKeyframe_setDuration:d]; return; }
-    [self as_CAKeyframe_setDuration:_scaleVC(d, _effectiveFactor(), _caMinMs())];
-}
-
-// ---------- 增强层·CASpringAnimation ----------
-- (void)as_CASpring_setDuration:(CFTimeInterval)d {
-    if (!_extraOn()) { [self as_CASpring_setDuration:d]; return; }
-    [self as_CASpring_setDuration:_scaleVC(d, _effectiveFactor(), _caMinMs())];
-}
-
-// ---------- 增强层·CATransition ----------
-- (void)as_CATransition_setDuration:(CFTimeInterval)d {
-    if (!_extraOn()) { [self as_CATransition_setDuration:d]; return; }
-    [self as_CATransition_setDuration:_scaleVC(d, _effectiveFactor(), _caMinMs())];
-}
+// v1.5.1：移除 CABasic/CAKeyframe/CASpring/CATransition 子类的 setDuration: hook（防递归闪退，基类已覆盖）。
 
 // ---------- 增强层·CALayer addAnimation:forKey: (转轮/CABasic/Keyframe/Spring 都走这里) ----------
 - (void)as_CALayer_addAnimation:(CAAnimation *)anim forKey:(NSString *)key {
@@ -395,7 +369,8 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
         [self as_CALayer_addAnimation:anim forKey:key]; return;
     }
     @try {
-        if (anim.duration > 0) {
+        // 仅收窄"未被 setDuration: hook 处理过的默认时长"(0.25s)动画，避免对已缩放时长二次缩放
+        if (anim.duration > 0.03 && anim.duration < 60.0) {
             anim.duration = _scaleVC(anim.duration, _effectiveFactor(), _caMinMs());
         }
         // 保留 repeatCount：转轮动画是 HUGE_VALF（无限循环），缩小时不变周期仍能转但超快
@@ -825,19 +800,8 @@ static void _si_install(void) {
             eok += _swizzleClass(Win_cls, @selector(setAnimationDuration:),
                                  @selector(as_UIWindow_setAnimationDuration:));
 
-            // ---------- 新增强层：CAAnimation 子类 ----------
-            etotal += 1;
-            eok += _swizzleInstance([CABasicAnimation class], @selector(setDuration:),
-                                    @selector(as_CABasic_setDuration:));
-            etotal += 1;
-            eok += _swizzleInstance([CAKeyframeAnimation class], @selector(setDuration:),
-                                    @selector(as_CAKeyframe_setDuration:));
-            etotal += 1;
-            eok += _swizzleInstance([CASpringAnimation class], @selector(setDuration:),
-                                    @selector(as_CASpring_setDuration:));
-            etotal += 1;
-            eok += _swizzleInstance([CATransition class], @selector(setDuration:),
-                                    @selector(as_CATransition_setDuration:));
+            // v1.5.1：不再 hook CABasic/CAKeyframe/CASpring/CATransition 的 setDuration:
+            //（子类继承基类实现，重复交换导致无限递归闪退；基类 hook 已覆盖全部子类）
 
             // ---------- 新增强层：Interactive Transition ----------
             Class ITT_cls = [UIPercentDrivenInteractiveTransition class];
