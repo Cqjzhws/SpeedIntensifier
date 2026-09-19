@@ -133,7 +133,7 @@ static NSString *SIReboot(void) {
 static NSString *SIRespring(void) {
     // ① 原生直接 kill SpringBoard
     int k1 = SIKillProcessNamed("SpringBoard");
-    if (k1 > 0) return @"原生 kill SpringBoard";
+    if (k1 > 0) return @"原生 kill iPhone18";
 
     // ② root persona killall
     posix_spawnattr_t attr;
@@ -212,7 +212,7 @@ static NSDictionary *SIReadConfig(void) {
     double cfgFactor = cfg[@"SpeedFactor"] ? [cfg[@"SpeedFactor"] doubleValue] : 0.001;
 
     UILabel *title = [[UILabel alloc] init];
-    title.text = @"Speed Intensifier";
+    title.text = @"隔壁老王专用";
     title.font = [UIFont boldSystemFontOfSize:28];
     title.textAlignment = NSTextAlignmentCenter;
 
@@ -256,7 +256,7 @@ static NSDictionary *SIReadConfig(void) {
     _speedSeg.selectedSegmentIndex = sel;
 
     UIButton *btnApply = [UIButton buttonWithType:UIButtonTypeSystem];
-    [btnApply setTitle:@"保存并注销 SpringBoard" forState:UIControlStateNormal];
+    [btnApply setTitle:@"保存并注销 iPhone18" forState:UIControlStateNormal];
     btnApply.titleLabel.font = [UIFont boldSystemFontOfSize:17];
     [btnApply addTarget:self action:@selector(onApply) forControlEvents:UIControlEventTouchUpInside];
 
@@ -325,7 +325,7 @@ static NSDictionary *SIReadConfig(void) {
 - (void)onApply {
     double factor = [_factors[_speedSeg.selectedSegmentIndex] doubleValue];
     SIWriteConfig(factor, _enableSwitch.isOn, _extraSwitch.isOn, _instantSwitch.isOn);
-    _status.text = [NSString stringWithFormat:@"已保存 factor=%.3f 增强=%@ 瞬切=%@，正在注销 SpringBoard…",
+    _status.text = [NSString stringWithFormat:@"已保存 factor=%.3f 增强=%@ 瞬切=%@，正在注销 iPhone18…",
                     factor, _extraSwitch.isOn ? @"开" : @"关", _instantSwitch.isOn ? @"开" : @"关"];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSString *how = SIRespring();
