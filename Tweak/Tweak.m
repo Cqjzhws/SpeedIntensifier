@@ -1,4 +1,4 @@
-// SpeedIntensifier v1.5.1 — 可注入动画加速 Tweak（纯 ObjC runtime，无 substrate）
+// SpeedIntensifier v1.5.3 — 可注入动画加速 Tweak（纯 ObjC runtime，无 substrate）
 // 默认最快档 0.001 + 火力全开；基础 19 hook；ExtraAcceleration（默认 YES）叠加 42 个增强 hook（共 61）；
 // v1.5.1 修复：移除 CAAnimation 子类重复 setDuration: hook——子类继承基类实现，二次交换导致
 //              无限递归栈溢出，非黑名单 App 启动即闪退；基类 hook 已覆盖全部子类。
@@ -7,7 +7,10 @@
 //       - 黑名单感知的保底门槛（黑名单 App 仍 50ms 兼容，非黑名单 nav/tab 16ms、present 30ms、CA 8ms）；
 // v1.5 新增 23 hook：导航整栈替换/TabBar 直选 VC/翻页/容器转场、缩放、列表编辑与布局、栏项、控件、
 //       PropertyAnimator 贝塞尔与延迟启动、performSystemAnimation、setAnimationDelay、InstantMode 瞬切模式。
-// 黑名单 App（默认微信/企业微信）只走基础 hook，避免毛玻璃等不兼容问题。
+// v1.5.3：微信（com.tencent.xin）移出默认黑名单，与其他 App 一样吃满全部 61 hook + 极速档位；
+//         黑名单仅保留企业微信（com.tencent.wework）。v1.5.1 已修复递归闪退，且 addAnimation
+//         hook 本就跳过 backdrop/visualeffect/blur/gaussian/snapshot 毛玻璃层，微信兼容性由用户实测验证。
+// 黑名单 App（现仅默认企业微信）只走基础 hook。
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
@@ -23,7 +26,7 @@ static BOOL    gBlacklisted = NO;       // 当前 App 是否命中黑名单
 static NSArray *gBlacklist = nil;
 
 #define kPrefPath "/var/Managed Preferences/mobile/com.local.speedintensifier.plist"
-#define kDefaultBlacklist @[ @"com.tencent.xin", @"com.tencent.wework" ]
+#define kDefaultBlacklist @[ @"com.tencent.wework" ]   // v1.5.3：微信移出黑名单，仅保留企业微信
 
 static void _loadPref(void) {
     NSDictionary *d = nil;

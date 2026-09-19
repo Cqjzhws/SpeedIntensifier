@@ -1,6 +1,6 @@
 # Speed Intensifier (iOS 动画加速)
 
-面向 iOS 14–17（含 iOS 16/17）的动画加速方案，默认最快档 **0.001**，适配 TrollStore / TrollFools，无需 CydiaSubstrate。v1.5.1 共 **61 个 Hook**（v1.5.1 修复了注入非黑名单 App 启动闪退：CAAnimation 子类重复 setDuration: hook 导致无限递归，现仅 hook 基类覆盖全部子类；重启改为 root 助手直调 reboot() 系统调用）。
+面向 iOS 14–17（含 iOS 16/17）的动画加速方案，默认最快档 **0.001**，适配 TrollStore / TrollFools，无需 CydiaSubstrate。v1.5.3 共 **61 个 Hook**（v1.5.1 修复注入闪退：仅 hook CAAnimation 基类；v1.5.2 修复注销无效：原生 kill SpringBoard；v1.5.3 微信移出黑名单吃满全量加速，黑名单仅保留企业微信）。
 
 ## 产物
 - `SpeedIntensifier.dylib` — 核心加速 Tweak（已 ad-hoc 签名），用 TrollFools 注入目标 App（建议注入微信、抖音、淘宝、QQ、美团等）。
@@ -18,7 +18,7 @@
 - `UIViewController`：present/dismiss（保底 30ms，避免状态机错乱）
 - `CATransaction`：setAnimationDuration
 
-**增强层 ExtraAcceleration（42 hook，默认开；黑名单 App 不装）**
+**增强层 ExtraAcceleration（42 hook，默认开；黑名单 App（仅企业微信）不装）**
 - 关键帧 / 老式 beginAnimations（setAnimationDuration / setAnimationDelay）/ performSystemAnimation
 - `CAAnimation` 全家族：CABasic / CAKeyframe / CASpring / CATransition + `CALayer addAnimation:forKey:`（loading 转轮也极速，自动跳过 backdrop/blur 层）
 - `UIViewPropertyAnimator`：addAnimations:delayFactor: / 贝塞尔初始化 / runningPropertyAnimator / startAnimationAfterDelay:
