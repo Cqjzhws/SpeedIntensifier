@@ -29,6 +29,8 @@ extern int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t * __restri
 
 static NSString *const kPrefPath = @"/var/Managed Preferences/mobile/com.local.speedintensifier.plist";
 static NSString *const kUIKitPath = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
+// v1.5.9：SpringBoard/UIKit 读偏好的标准路径（桌面文件夹动画吃这里面的拖动系数）
+static NSString *const kUIKitPathStd = @"/var/mobile/Library/Preferences/com.apple.UIKit.plist";
 static NSString *const kPrefDir = @"/var/Managed Preferences/mobile";
 
 static void SIApplyAttr(posix_spawnattr_t *attr);
@@ -171,10 +173,16 @@ static void SIWriteConfig(double factor, BOOL enabled, BOOL extra, BOOL instant,
     BOOL ok = [d writeToFile:kPrefPath atomically:YES];
     NSLog(@"[SIApp] write pref %@ -> %d", kPrefPath, ok);
 
-    // 全局拖动系数（未注入 dylib 时也能有基础加速）
-    NSMutableDictionary *u = [NSMutableDictionary dictionaryWithContentsOfFile:kUIKitPath] ?: [NSMutableDictionary dictionary];
-    u[@"UIAnimationDragCoefficient"] = @(enabled ? (instant ? 0.0001 : (factor <= 0 ? 0.001 : factor)) : 1.0);
-    [u writeToFile:kUIKitPath atomically:YES];
+    // 全局拖动系数（未注入 dylib 时也能有基础加速）。
+    // v1.5.9：双路径写入——Managed Preferences（管理偏好优先级高）+ 标准偏好路径（SpringBoard 必读）。
+    // 桌面图标文件夹的打开/收起动画由 SpringBoard 的 UIKit 拖动系数控制，保存注销后生效。
+    double coeff = enabled ? (instant ? 0.0001 : (factor <= 0 ? 0.001 : factor)) : 1.0;
+    for (NSString *p in @[ kUIKitPath, kUIKitPathStd ]) {
+        NSMutableDictionary *u = [NSMutableDictionary dictionaryWithContentsOfFile:p] ?: [NSMutableDictionary dictionary];
+        u[@"UIAnimationDragCoefficient"] = @(coeff);
+        BOOL ok2 = [u writeToFile:p atomically:YES];
+        NSLog(@"[SIApp] write UIKit coeff %@ -> %d", p, ok2);
+    }
 }
 
 // 读取当前已保存配置（文件不存在时返回默认值）
@@ -222,7 +230,7 @@ static NSDictionary *SIReadConfig(void) {
     title.textAlignment = NSTextAlignmentCenter;
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"动画加速 v1.5.8 · 65 Hooks · 新增文件夹加速";
+    sub.text = @"动画加速 v1.5.9 · 65 Hooks · 桌面文件夹加速";
     sub.font = [UIFont systemFontOfSize:14];
     sub.textColor = [UIColor secondaryLabelColor];
     sub.textAlignment = NSTextAlignmentCenter;
@@ -280,7 +288,7 @@ static NSDictionary *SIReadConfig(void) {
     _status.numberOfLines = 0;
     _status.font = [UIFont systemFontOfSize:13];
     _status.textColor = [UIColor secondaryLabelColor];
-    _status.text = @"提示：dylib 由 TrollFools 注入目标 App 后生效；本 App 负责写入配置并注销。\n黑名单App（默认企业微信）只走基础加速。瞬切模式若出现异常请关闭。";
+    _status.text = @"提示：dylib 由 TrollFools 注入目标 App 后生效；本 App 负责写入配置并注销。\n桌面图标文件夹动画走全局拖动系数：保存注销即生效，无需注入。\n黑名单App（默认企业微信）只走基础加速。瞬切模式若出现异常请关闭。";
 
     NSArray *views = @[title, sub, lbl1, _enableSwitch, lbl1b, _extraSwitch, lbl1c, _instantSwitch, lbl1d, _folderSwitch, lbl2, _speedSeg, btnApply, btnReboot, _status];
     for (UIView *v in views) { v.translatesAutoresizingMaskIntoConstraints = NO; [self.view addSubview:v]; }
