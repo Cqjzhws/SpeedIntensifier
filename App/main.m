@@ -163,13 +163,15 @@ static NSString *SIRespring(void) {
 static void SIWriteConfig(double factor, BOOL enabled, BOOL extra, BOOL instant, BOOL folder) {
     mkdir("/var/Managed Preferences", 0755);
     mkdir("/var/Managed Preferences/mobile", 0755);
-    // v1.5.8 修复：不再把 com.tencent.xin 写回黑名单（微信与其他 App 同等加速），仅保留企业微信
+    // v1.6.0 修复：不再把 com.tencent.xin 写回黑名单（微信与其他 App 同等加速），仅保留企业微信
+    // v1.6.1：加入 com.apple.springboard——注入 SpringBoard 时只走 19 个基础 hook
+    //（UIView/CA 核心，最稳），跳过 43 个列表/导航增强 hook，防桌面循环重启
     NSDictionary *d = @{ @"SpeedFactor": @(factor),
                          @"Enabled": @(enabled),
                          @"ExtraAcceleration": @(extra),
                          @"InstantMode": @(instant),
                          @"FolderAccel": @(folder),
-                         @"Blacklist": @[ @"com.tencent.wework" ] };
+                         @"Blacklist": @[ @"com.tencent.wework", @"com.apple.springboard" ] };
     BOOL ok = [d writeToFile:kPrefPath atomically:YES];
     NSLog(@"[SIApp] write pref %@ -> %d", kPrefPath, ok);
 
@@ -235,7 +237,7 @@ static NSDictionary *SIReadConfig(void) {
     title.textAlignment = NSTextAlignmentCenter;
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"动画加速 v1.6.0 · 65 Hooks · 桌面文件夹加速";
+    sub.text = @"动画加速 v1.6.1 · 65 Hooks · 支持注入桌面";
     sub.font = [UIFont systemFontOfSize:14];
     sub.textColor = [UIColor secondaryLabelColor];
     sub.textAlignment = NSTextAlignmentCenter;
