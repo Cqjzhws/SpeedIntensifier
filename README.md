@@ -1,6 +1,6 @@
 # Speed Intensifier (iOS 动画加速)
 
-面向 iOS 14–17（含 iOS 16/17）的动画加速方案，默认最快档 **0.001**，适配 TrollStore / TrollFools，无需 CydiaSubstrate。v1.5.3 共 **61 个 Hook**（v1.5.1 修复注入闪退：仅 hook CAAnimation 基类；v1.5.2 修复注销无效：原生 kill SpringBoard；v1.5.3 微信移出黑名单吃满全量加速，黑名单仅保留企业微信）。
+面向 iOS 14–17（含 iOS 16/17）的动画加速方案，默认最快档 **0.001**，适配 TrollStore / TrollFools，无需 CydiaSubstrate。v1.5.5 共 **43 个 Hook**（v1.5.5 彻底修复微信点链接闪退：移除 18 个状态机敏感 setter 类 hook，仅保留纯时长缩放与直通型；v1.5.1 修复注入闪退；v1.5.2 修复注销无效；v1.5.3 微信移出黑名单，黑名单仅保留企业微信）。
 
 ## 产物
 - `SpeedIntensifier.dylib` — 核心加速 Tweak（已 ad-hoc 签名），用 TrollFools 注入目标 App（建议注入微信、抖音、淘宝、QQ、美团等）。
@@ -18,17 +18,14 @@
 - `UIViewController`：present/dismiss（保底 30ms，避免状态机错乱）
 - `CATransaction`：setAnimationDuration
 
-**增强层 ExtraAcceleration（42 hook，默认开；黑名单 App（仅企业微信）不装）**
+**增强层 ExtraAcceleration（24 hook，默认开；黑名单 App（仅企业微信）不装）**
 - 关键帧 / 老式 beginAnimations（setAnimationDuration / setAnimationDelay）/ performSystemAnimation
-- `CAAnimation` 全家族：CABasic / CAKeyframe / CASpring / CATransition + `CALayer addAnimation:forKey:`（loading 转轮也极速，自动跳过 backdrop/blur 层）
+- `CAAnimation` 全家族时长 + `CALayer addAnimation:forKey:`（loading 转轮也极速，自动跳过 backdrop/blur 层）
 - `UIViewPropertyAnimator`：addAnimations:delayFactor: / 贝塞尔初始化 / runningPropertyAnimator / startAnimationAfterDelay:
-- 页面：`setViewControllers:`、`setSelectedViewController:`、UIPageViewController 翻页、自定义容器转场
-- 列表：UITableView / UICollectionView 批量更新、增删改、setEditing、select/deselect、reloadSections、setCollectionViewLayout:
-- 栏：UITabBar / UIToolbar / UINavigationBar 的 setItems:
-- 控件：UIProgressView / UISwitch / UISlider 动画化设值瞬时到位
-- UIWindow / InteractiveTransition / UIContextMenu 等
+- 列表：UITableView / UICollectionView 批量更新、增删改（CATransaction 收窄时长）
+- UIWindow / InteractiveTransition / UIContextMenu 等（直通型）
 
-**保底设计**：页面跳转 / present / dismiss 按 App 类型保底（黑名单 50ms，普通 App 8–30ms），避免 iOS「动画完成信号早于状态机就绪」导致的闪退。
+**保底设计**：v1.5.5 起增强层不再包含任何"强制 animated:NO / 改写 UIKit 状态机"的 setter hook（曾在微信 WebView 等场景触发崩溃）；所有视觉加速均由纯时长缩放实现，速度不受影响。
 
 ## 配置（可选）
 App 会写入 `/var/Managed Preferences/mobile/com.local.speedintensifier.plist`：
@@ -37,7 +34,7 @@ App 会写入 `/var/Managed Preferences/mobile/com.local.speedintensifier.plist`
 <key>Enabled</key><true/>
 <key>ExtraAcceleration</key><true/>
 <key>InstantMode</key><false/>
-<key>Blacklist</key><array><string>com.tencent.xin</string><string>com.tencent.wework</string></array>
+<key>Blacklist</key><array><string>com.tencent.wework</string></array>
 ```
 - `InstantMode`：瞬切模式，所有动画时长直接归零（最快；个别 App 异常时关闭即可）。
 - dylib 启动时读取；缺省即 0.001 全速 + 增强全开。

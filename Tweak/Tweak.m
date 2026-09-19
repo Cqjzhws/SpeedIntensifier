@@ -1,7 +1,7 @@
-// SpeedIntensifier v1.5.4 — 可注入动画加速 Tweak（纯 ObjC runtime，无 substrate）
-// v1.5.4 修复：5 个状态机敏感 setter（Nav setViewControllers/Tab 直选/翻页/缩放×2）不再包 UIView
-//              animate 块，改为直接 animated:NO——修复微信全量加速后点链接（重建导航栈）必崩。
-// 默认最快档 0.001 + 火力全开；基础 19 hook；ExtraAcceleration（默认 YES）叠加 42 个增强 hook（共 61）；
+// SpeedIntensifier v1.5.5 — 可注入动画加速 Tweak（纯 ObjC runtime，无 substrate）
+// v1.5.5 修复：微信全量加速后点链接仍崩——彻底移除 18 个"状态机敏感 setter"类 hook（强制 animated:NO /
+//              包动画块改写 UIKit 内部行为），增强层仅保留纯时长缩放与直通型 hook（共 43）。
+// 默认最快档 0.001 + 火力全开；基础 19 hook；ExtraAcceleration（默认 YES）叠加 24 个增强 hook（共 43）；
 // v1.5.1 修复：移除 CAAnimation 子类重复 setDuration: hook——子类继承基类实现，二次交换导致
 //              无限递归栈溢出，非黑名单 App 启动即闪退；基类 hook 已覆盖全部子类。
 //              addAnimation 仅收窄默认 0.25s 时长，避免对已缩放时长二次缩放。
@@ -545,125 +545,12 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
     [self as_UIPA_startAnimationAfterDelay:(f >= 1.0 ? d : d * f)];
 }
 
-// ---------- UIViewController：自定义容器转场 ----------
-- (void)as_VC_transitionFromVC:(UIViewController *)fvc
-                          toVC:(UIViewController *)tvc
-                      duration:(NSTimeInterval)d
-                       options:(UIViewAnimationOptions)o
-                    animations:(void (^)(void))a
-                    completion:(void (^)(BOOL))c {
-    double fac = _extraOn() ? _effectiveFactor() : 1.0;
-    [self as_VC_transitionFromVC:fvc toVC:tvc duration:_scaleVC(d, fac, _pageMinMs())
-                         options:o animations:a completion:c];
-}
+// v1.5.5：移除 UIViewController transitionFromViewController hook（状态机敏感，微信 WebView 页触发崩溃）。
 
-// ---------- UINavigationController：整栈替换 ----------
-// v1.5.4 修复：不再包 UIView animate 块。包块会嵌进 UIKit 转场状态机（微信点链接重建导航栈+弹
-// WebView 页时必崩），直接 animated:NO 与基础层 push/pop 同模式，速度不变且零状态机风险。
-- (void)as_Nav_setViewControllers:(NSArray<UIViewController *> *)vcs animated:(BOOL)an {
-    if (!an || !_extraOn()) { [self as_Nav_setViewControllers:vcs animated:an]; return; }
-    [self as_Nav_setViewControllers:vcs animated:NO];
-}
-
-// ---------- UITabBarController：直接选 VC（侧边栏/编程切换走这里） ----------
-- (void)as_Tab_setSelectedViewController:(UIViewController *)vc {
-    if (!_extraOn()) { [self as_Tab_setSelectedViewController:vc]; return; }
-    [self as_Tab_setSelectedViewController:vc];
-}
-
-// ---------- UIPageViewController：翻页 ----------
-- (void)as_PageVC_setViewControllers:(NSArray<UIViewController *> *)vcs
-                           direction:(UIPageViewControllerNavigationDirection)dir
-                            animated:(BOOL)an
-                          completion:(void (^)(BOOL))c {
-    if (!an || !_extraOn()) {
-        [self as_PageVC_setViewControllers:vcs direction:dir animated:an completion:c];
-        return;
-    }
-    [self as_PageVC_setViewControllers:vcs direction:dir animated:NO completion:c];
-}
-
-// ---------- UIScrollView：缩放 ----------
-- (void)as_UISV_setZoomScale:(CGFloat)scale animated:(BOOL)an {
-    if (!an || !_extraOn()) { [self as_UISV_setZoomScale:scale animated:an]; return; }
-    [self as_UISV_setZoomScale:scale animated:NO];
-}
-
-- (void)as_UISV_zoomToRect:(CGRect)r animated:(BOOL)an {
-    if (!an || !_extraOn()) { [self as_UISV_zoomToRect:r animated:an]; return; }
-    [self as_UISV_zoomToRect:r animated:NO];
-}
-
-// ---------- UITableView：编辑态/选中/取消/分段刷新 ----------
-- (void)as_TV_setEditing:(BOOL)editing animated:(BOOL)an {
-    if (!an || !_extraOn()) { [self as_TV_setEditing:editing animated:an]; return; }
-    [self as_TV_setEditing:editing animated:NO];
-}
-
-- (void)as_TV_selectRowAtIndexPath:(NSIndexPath *)ip
-                          animated:(BOOL)an
-                    scrollPosition:(UITableViewScrollPosition)sp {
-    if (!an || !_extraOn()) { [self as_TV_selectRowAtIndexPath:ip animated:an scrollPosition:sp]; return; }
-    [self as_TV_selectRowAtIndexPath:ip animated:NO scrollPosition:sp];
-}
-
-- (void)as_TV_deselectRowAtIndexPath:(NSIndexPath *)ip animated:(BOOL)an {
-    if (!an || !_extraOn()) { [self as_TV_deselectRowAtIndexPath:ip animated:an]; return; }
-    [self as_TV_deselectRowAtIndexPath:ip animated:NO];
-}
-
-- (void)as_TV_reloadSections:(NSIndexSet *)sections withRowAnimation:(UITableViewRowAnimation)an {
-    if (!_extraOn()) { [self as_TV_reloadSections:sections withRowAnimation:an]; return; }
-    [CATransaction begin];
-    [CATransaction setAnimationDuration:_scaleInterval(0.25, _effectiveFactor())];
-    @try { [self as_TV_reloadSections:sections withRowAnimation:an]; }
-    @finally { [CATransaction commit]; }
-}
-
-// ---------- UICollectionView：布局切换 ----------
-- (void)as_CV_setLayout:(UICollectionViewLayout *)layout
-               animated:(BOOL)an
-             completion:(void (^)(BOOL))c {
-    if (!an || !_extraOn()) { [self as_CV_setLayout:layout animated:an completion:c]; return; }
-    [self as_CV_setLayout:layout animated:NO completion:c];
-}
-
-- (void)as_CV_setLayout:(UICollectionViewLayout *)layout animated:(BOOL)an {
-    if (!an || !_extraOn()) { [self as_CV_setLayout:layout animated:an]; return; }
-    [self as_CV_setLayout:layout animated:NO];
-}
-
-// ---------- 栏：TabBar / Toolbar / NavigationBar 项变更动画 ----------
-- (void)as_TabBar_setItems:(NSArray *)items animated:(BOOL)an {
-    if (!an || !_extraOn()) { [self as_TabBar_setItems:items animated:an]; return; }
-    [self as_TabBar_setItems:items animated:NO];
-}
-
-- (void)as_Toolbar_setItems:(NSArray *)items animated:(BOOL)an {
-    if (!an || !_extraOn()) { [self as_Toolbar_setItems:items animated:an]; return; }
-    [self as_Toolbar_setItems:items animated:NO];
-}
-
-- (void)as_NavBar_setItems:(NSArray *)items animated:(BOOL)an {
-    if (!an || !_extraOn()) { [self as_NavBar_setItems:items animated:an]; return; }
-    [self as_NavBar_setItems:items animated:NO];
-}
-
-// ---------- 控件：进度/开关/滑杆 动画化设值瞬时到位 ----------
-- (void)as_Progress_setProgress:(float)p animated:(BOOL)an {
-    if (!an || !_extraOn()) { [self as_Progress_setProgress:p animated:an]; return; }
-    [self as_Progress_setProgress:p animated:NO];
-}
-
-- (void)as_Switch_setOn:(BOOL)on animated:(BOOL)an {
-    if (!an || !_extraOn()) { [self as_Switch_setOn:on animated:an]; return; }
-    [self as_Switch_setOn:on animated:NO];
-}
-
-- (void)as_Slider_setValue:(float)v animated:(BOOL)an {
-    if (!an || !_extraOn()) { [self as_Slider_setValue:v animated:an]; return; }
-    [self as_Slider_setValue:v animated:NO];
-}
+// v1.5.5：移除 18 个状态机敏感 setter hook（Nav 整栈替换 / Tab 直选 VC / 翻页 / 缩放 / Table 编辑选中
+// 刷新 / Collection 布局切换 / 三类栏 setItems / 进度·开关·滑杆）。这些 hook 会改写 UIKit 内部状态机
+// 的行为（强制 animated:NO / 包动画块），在微信打开 WebView 页等场景触发崩溃；且纯时长缩放类 hook
+// 已覆盖其视觉效果，移除不损失速度。基础层 push/pop/present/dismiss 保持不变（已验证安全）。
 
 @end
 
@@ -832,63 +719,11 @@ static void _si_install(void) {
             eok += _swizzleInstance(UIPA_cls, @selector(startAnimationAfterDelay:),
                                     @selector(as_UIPA_startAnimationAfterDelay:));
 
-            // --- 页面：整栈替换 / 直接选 VC / 翻页 / 自定义容器转场 ---
-            etotal += 1;
-            eok += _swizzleInstance(Nav_cls, @selector(setViewControllers:animated:),
-                                    @selector(as_Nav_setViewControllers:animated:));
-            etotal += 1;
-            eok += _swizzleInstance(Tab_cls, @selector(setSelectedViewController:),
-                                    @selector(as_Tab_setSelectedViewController:));
-            Class PageVC_cls = [UIPageViewController class];
-            etotal += 1;
-            eok += _swizzleInstance(PageVC_cls, @selector(setViewControllers:direction:animated:completion:),
-                                    @selector(as_PageVC_setViewControllers:direction:animated:completion:));
-            etotal += 1;
-            eok += _swizzleInstance(VC_cls, @selector(transitionFromViewController:toViewController:duration:options:animations:completion:),
-                                    @selector(as_VC_transitionFromVC:toVC:duration:options:animations:completion:));
-
-            // --- UIScrollView：缩放 ---
-            etotal += 2;
-            eok += _swizzleInstance(UISV_cls, @selector(setZoomScale:animated:),
-                                    @selector(as_UISV_setZoomScale:animated:));
-            eok += _swizzleInstance(UISV_cls, @selector(zoomToRect:animated:),
-                                    @selector(as_UISV_zoomToRect:animated:));
-
-            // --- UITableView：编辑态 / 选中 / 取消 / 分段刷新 ---
-            etotal += 4;
-            eok += _swizzleInstance(TV_cls, @selector(setEditing:animated:),
-                                    @selector(as_TV_setEditing:animated:));
-            eok += _swizzleInstance(TV_cls, @selector(selectRowAtIndexPath:animated:scrollPosition:),
-                                    @selector(as_TV_selectRowAtIndexPath:animated:scrollPosition:));
-            eok += _swizzleInstance(TV_cls, @selector(deselectRowAtIndexPath:animated:),
-                                    @selector(as_TV_deselectRowAtIndexPath:animated:));
-            eok += _swizzleInstance(TV_cls, @selector(reloadSections:withRowAnimation:),
-                                    @selector(as_TV_reloadSections:withRowAnimation:));
-
-            // --- UICollectionView：布局切换 ---
-            etotal += 2;
-            eok += _swizzleInstance(CV_cls, @selector(setCollectionViewLayout:animated:completion:),
-                                    @selector(as_CV_setLayout:animated:completion:));
-            eok += _swizzleInstance(CV_cls, @selector(setCollectionViewLayout:animated:),
-                                    @selector(as_CV_setLayout:animated:));
-
-            // --- 栏：TabBar / Toolbar / NavigationBar ---
-            etotal += 3;
-            eok += _swizzleInstance([UITabBar class], @selector(setItems:animated:),
-                                    @selector(as_TabBar_setItems:animated:));
-            eok += _swizzleInstance([UIToolbar class], @selector(setItems:animated:),
-                                    @selector(as_Toolbar_setItems:animated:));
-            eok += _swizzleInstance([UINavigationBar class], @selector(setItems:animated:),
-                                    @selector(as_NavBar_setItems:animated:));
-
-            // --- 控件：进度条 / 开关 / 滑杆 ---
-            etotal += 3;
-            eok += _swizzleInstance([UIProgressView class], @selector(setProgress:animated:),
-                                    @selector(as_Progress_setProgress:animated:));
-            eok += _swizzleInstance([UISwitch class], @selector(setOn:animated:),
-                                    @selector(as_Switch_setOn:animated:));
-            eok += _swizzleInstance([UISlider class], @selector(setValue:animated:),
-                                    @selector(as_Slider_setValue:animated:));
+            // v1.5.5：移除 18 个状态机敏感 setter hook 的注册
+            //（Nav setViewControllers / Tab setSelectedViewController / PageVC / transitionFromViewController /
+            //  UISV setZoomScale·zoomToRect / TV setEditing·select·deselect·reloadSections /
+            //  CV setCollectionViewLayout×2 / TabBar·Toolbar·NavBar setItems / Progress·Switch·Slider）
+            // 保留的增强层全部为"纯时长缩放"或"直通"型 hook，已验证安全。
 
             total += etotal;
             ok += eok;
