@@ -9,11 +9,11 @@
 #import <unistd.h>
 #import <errno.h>
 
-// iPhoneOS SDK 无 <sys/reboot.h>，手动声明（符号由 libsystem_c 提供）
+// iPhoneOS SDK 无 <sys/reboot.h>，但 unistd.h 已声明 int reboot(int)；
+// 仅补 RB_AUTOBOOT 常量（BSD 标准值）
 #ifndef RB_AUTOBOOT
 #define RB_AUTOBOOT 0x01234567
 #endif
-extern int reboot(int, char *);
 
 #ifndef POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE
 #define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE 1
@@ -312,7 +312,7 @@ int main(int argc, char *argv[]) {
     if (argc > 1 && strcmp(argv[1], "--si-reboot-helper") == 0) {
         NSLog(@"[SIApp] helper mode: calling reboot(RB_AUTOBOOT) as uid=%d euid=%d", getuid(), geteuid());
         @autoreleasepool {
-            reboot(RB_AUTOBOOT, NULL);   // 成功不会返回；失败则继续退出
+            reboot(RB_AUTOBOOT);   // 成功不会返回；失败则继续退出
             NSLog(@"[SIApp] reboot() failed errno=%d, fallback killall launchd", errno);
             posix_spawnattr_t attr;
             SIApplyAttr(&attr);
