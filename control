@@ -1,8 +1,8 @@
 Package: com.local.speedintensifier
 Name: Speed Intensifier
-Version: 1.5.3
+Version: 1.5.4
 Architecture: iphoneos-arm
-Description: 动画加速 Tweak v1.5.3（共 61 hook）：微信移出默认黑名单，与其他 App 一样吃满全部 hook 与极速档位（黑名单仅保留企业微信）；修复注入闪退（仅 hook CAAnimation 基类）；修复配置 App 注销无效（原生 kill SpringBoard）；重启走 root 助手直调 reboot()；纯 runtime 无 substrate，TrollFools 可注入
+Description: 动画加速 Tweak v1.5.4（共 61 hook）：微信黑名单移除后点链接闪退修复（5 个状态机敏感 setter 不再包 UIView animate 块，改为直接 animated:NO）；微信与其他 App 同速全量加速；修复注入闪退/注销无效/重启；纯 runtime 无 substrate，TrollFools 可注入
 Maintainer: local
 Author: local
 Section: Tweaks

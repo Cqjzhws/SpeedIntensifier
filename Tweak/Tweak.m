@@ -1,4 +1,6 @@
-// SpeedIntensifier v1.5.3 — 可注入动画加速 Tweak（纯 ObjC runtime，无 substrate）
+// SpeedIntensifier v1.5.4 — 可注入动画加速 Tweak（纯 ObjC runtime，无 substrate）
+// v1.5.4 修复：5 个状态机敏感 setter（Nav setViewControllers/Tab 直选/翻页/缩放×2）不再包 UIView
+//              animate 块，改为直接 animated:NO——修复微信全量加速后点链接（重建导航栈）必崩。
 // 默认最快档 0.001 + 火力全开；基础 19 hook；ExtraAcceleration（默认 YES）叠加 42 个增强 hook（共 61）；
 // v1.5.1 修复：移除 CAAnimation 子类重复 setDuration: hook——子类继承基类实现，二次交换导致
 //              无限递归栈溢出，非黑名单 App 启动即闪退；基类 hook 已覆盖全部子类。
@@ -556,25 +558,17 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
 }
 
 // ---------- UINavigationController：整栈替换 ----------
+// v1.5.4 修复：不再包 UIView animate 块。包块会嵌进 UIKit 转场状态机（微信点链接重建导航栈+弹
+// WebView 页时必崩），直接 animated:NO 与基础层 push/pop 同模式，速度不变且零状态机风险。
 - (void)as_Nav_setViewControllers:(NSArray<UIViewController *> *)vcs animated:(BOOL)an {
     if (!an || !_extraOn()) { [self as_Nav_setViewControllers:vcs animated:an]; return; }
-    double f = _effectiveFactor();
-    [UIView animateWithDuration:_scaleVC(0.35, f, _pageMinMs())
-                          delay:0
-                        options:UIViewAnimationOptionCurveEaseInOut
-                     animations:^{ [self as_Nav_setViewControllers:vcs animated:NO]; }
-                     completion:nil];
+    [self as_Nav_setViewControllers:vcs animated:NO];
 }
 
 // ---------- UITabBarController：直接选 VC（侧边栏/编程切换走这里） ----------
 - (void)as_Tab_setSelectedViewController:(UIViewController *)vc {
     if (!_extraOn()) { [self as_Tab_setSelectedViewController:vc]; return; }
-    double f = _effectiveFactor();
-    [UIView animateWithDuration:_scaleVC(0.25, f, _pageMinMs())
-                          delay:0
-                        options:UIViewAnimationOptionCurveEaseInOut
-                     animations:^{ [self as_Tab_setSelectedViewController:vc]; }
-                     completion:nil];
+    [self as_Tab_setSelectedViewController:vc];
 }
 
 // ---------- UIPageViewController：翻页 ----------
@@ -586,33 +580,18 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
         [self as_PageVC_setViewControllers:vcs direction:dir animated:an completion:c];
         return;
     }
-    double f = _effectiveFactor();
-    [UIView animateWithDuration:_scaleVC(0.30, f, _pageMinMs())
-                          delay:0
-                        options:UIViewAnimationOptionCurveEaseInOut
-                     animations:^{ [self as_PageVC_setViewControllers:vcs direction:dir animated:NO completion:c]; }
-                     completion:nil];
+    [self as_PageVC_setViewControllers:vcs direction:dir animated:NO completion:c];
 }
 
 // ---------- UIScrollView：缩放 ----------
 - (void)as_UISV_setZoomScale:(CGFloat)scale animated:(BOOL)an {
     if (!an || !_extraOn()) { [self as_UISV_setZoomScale:scale animated:an]; return; }
-    double f = _effectiveFactor();
-    [UIView animateWithDuration:_scaleInterval(0.25, f)
-                          delay:0
-                        options:UIViewAnimationOptionCurveEaseInOut
-                     animations:^{ [self as_UISV_setZoomScale:scale animated:NO]; }
-                     completion:nil];
+    [self as_UISV_setZoomScale:scale animated:NO];
 }
 
 - (void)as_UISV_zoomToRect:(CGRect)r animated:(BOOL)an {
     if (!an || !_extraOn()) { [self as_UISV_zoomToRect:r animated:an]; return; }
-    double f = _effectiveFactor();
-    [UIView animateWithDuration:_scaleInterval(0.25, f)
-                          delay:0
-                        options:UIViewAnimationOptionCurveEaseInOut
-                     animations:^{ [self as_UISV_zoomToRect:r animated:NO]; }
-                     completion:nil];
+    [self as_UISV_zoomToRect:r animated:NO];
 }
 
 // ---------- UITableView：编辑态/选中/取消/分段刷新 ----------
