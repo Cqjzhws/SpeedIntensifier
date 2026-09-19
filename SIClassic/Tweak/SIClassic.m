@@ -164,6 +164,13 @@ static BOOL _swizzleClass(Class cls, SEL orig, SEL repl) {
 
 @end
 
+static void _sic_notify_cb(CFNotificationCenterRef center, void *observer,
+                           CFStringRef name, const void *object,
+                           CFDictionaryRef info) {
+    _loadPref();
+    NSLog(@"[SIClassic] pref reloaded via darwin notify");
+}
+
 static void _install(void) {
     int total = 0, ok = 0;
     Class ca = objc_getClass("CAAnimation");
@@ -190,9 +197,6 @@ static void _sic_entry(void) {
     CFNotificationCenterAddObserver(
         CFNotificationCenterGetDarwinNotifyCenter(),
         NULL,
-        (CFNotificationCallback)^(CFNotificationCenterRef c, void *observer, CFStringName name, const void *object, CFDictionaryRef info) {
-            _loadPref();
-            NSLog(@"[SIClassic] pref reloaded via darwin notify");
-        },
+        _sic_notify_cb,
         (__bridge CFStringRef)kSICNotify, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 }
