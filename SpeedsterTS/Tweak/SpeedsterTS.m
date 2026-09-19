@@ -68,8 +68,10 @@ static double _reverseBounceSlider(double v)       { return 1.1 - v; }
 static double _reverseTurnOff(double v)            { return 0.91 - v; }
 static double _reverseFolderSlider(double v)       { return 1.0 - v; }
 
-static void _loadPrefs(__unused CFNotificationCenterRef c, __unused void *o,
-                       __unused CFNotificationName n, __unused void *ui, __unused void *ud) {
+static void _loadPrefs(CFNotificationCenterRef center, void *observer,
+                       CFNotificationName name, const void *object,
+                       CFDictionaryRef userInfo) {
+    (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
     NSDictionary *p = [NSDictionary dictionaryWithContentsOfFile:
         @"/var/mobile/Library/Preferences/com.hoangdus.speedsterprefs.plist"];
     if (!p) p = [NSDictionary dictionaryWithContentsOfFile:
