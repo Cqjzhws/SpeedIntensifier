@@ -135,7 +135,7 @@ static NSString *SIReboot(void) {
 static NSString *SIRespring(void) {
     // ① 原生直接 kill SpringBoard
     int k1 = SIKillProcessNamed("SpringBoard");
-    if (k1 > 0) return @"原生 kill iPhone18";
+    if (k1 > 0) return @"原生 kill iPhone18pro";
 
     // ② root persona killall
     posix_spawnattr_t attr;
@@ -174,14 +174,19 @@ static void SIWriteConfig(double factor, BOOL enabled, BOOL extra, BOOL instant,
     NSLog(@"[SIApp] write pref %@ -> %d", kPrefPath, ok);
 
     // 全局拖动系数（未注入 dylib 时也能有基础加速）。
-    // v1.5.9：双路径写入——Managed Preferences（管理偏好优先级高）+ 标准偏好路径（SpringBoard 必读）。
-    // 桌面图标文件夹的打开/收起动画由 SpringBoard 的 UIKit 拖动系数控制，保存注销后生效。
+    // v1.6.0 关键修复：必须走 CFPreferences API（cfprefsd 守护进程）。
+    // 直接写 plist 文件会被 cfprefsd 的内存旧缓存覆盖——注销不重启 cfprefsd，
+    // SpringBoard 重启后问 cfprefsd 拿到的还是旧值，这就是桌面文件夹没效果的原因。
     double coeff = enabled ? (instant ? 0.0001 : (factor <= 0 ? 0.001 : factor)) : 1.0;
+    CFPreferencesSetAppValue(CFSTR("UIAnimationDragCoefficient"),
+                             (__bridge CFNumberRef)@(coeff), CFSTR("com.apple.UIKit"));
+    CFPreferencesAppSynchronize(CFSTR("com.apple.UIKit"));
+    NSLog(@"[SIApp] CFPreferences UIKit drag coeff -> %.4f", coeff);
+    // 文件兜底（值相同，避免 cfprefsd 回写后出现旧值残留）
     for (NSString *p in @[ kUIKitPath, kUIKitPathStd ]) {
         NSMutableDictionary *u = [NSMutableDictionary dictionaryWithContentsOfFile:p] ?: [NSMutableDictionary dictionary];
         u[@"UIAnimationDragCoefficient"] = @(coeff);
-        BOOL ok2 = [u writeToFile:p atomically:YES];
-        NSLog(@"[SIApp] write UIKit coeff %@ -> %d", p, ok2);
+        [u writeToFile:p atomically:YES];
     }
 }
 
@@ -230,7 +235,7 @@ static NSDictionary *SIReadConfig(void) {
     title.textAlignment = NSTextAlignmentCenter;
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"动画加速 v1.5.9 · 65 Hooks · 桌面文件夹加速";
+    sub.text = @"动画加速 v1.6.0 · 65 Hooks · 桌面文件夹加速";
     sub.font = [UIFont systemFontOfSize:14];
     sub.textColor = [UIColor secondaryLabelColor];
     sub.textAlignment = NSTextAlignmentCenter;
@@ -276,7 +281,7 @@ static NSDictionary *SIReadConfig(void) {
     _speedSeg.selectedSegmentIndex = sel;
 
     UIButton *btnApply = [UIButton buttonWithType:UIButtonTypeSystem];
-    [btnApply setTitle:@"保存并注销 iPhone18" forState:UIControlStateNormal];
+    [btnApply setTitle:@"保存并注销 iPhone18pro" forState:UIControlStateNormal];
     btnApply.titleLabel.font = [UIFont boldSystemFontOfSize:17];
     [btnApply addTarget:self action:@selector(onApply) forControlEvents:UIControlEventTouchUpInside];
 
@@ -350,7 +355,7 @@ static NSDictionary *SIReadConfig(void) {
 - (void)onApply {
     double factor = [_factors[_speedSeg.selectedSegmentIndex] doubleValue];
     SIWriteConfig(factor, _enableSwitch.isOn, _extraSwitch.isOn, _instantSwitch.isOn, _folderSwitch.isOn);
-    _status.text = [NSString stringWithFormat:@"已保存 factor=%.3f 增强=%@ 瞬切=%@ 文件夹=%@，正在注销 iPhone18…",
+    _status.text = [NSString stringWithFormat:@"已保存 factor=%.3f 增强=%@ 瞬切=%@ 文件夹=%@，正在注销 iPhone18pro…",
                     factor, _extraSwitch.isOn ? @"开" : @"关", _instantSwitch.isOn ? @"开" : @"关",
                     _folderSwitch.isOn ? @"开" : @"关"];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
