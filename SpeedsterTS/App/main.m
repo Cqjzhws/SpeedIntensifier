@@ -104,7 +104,7 @@ static const double kDampVals[5]  = { 0.10, 0.25, 0.40, 0.60, 0.80 };
 
     UILabel *title = [self makeLabel:@"Speedster TS" font:[UIFont boldSystemFontOfSize:28] color:[UIColor labelColor]];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self makeLabel:@"TrollStore 版 v1.0.0 · iOS16\n基于 GPL Speedster (Hoangdus) 移植"
+    UILabel *sub = [self makeLabel:@"TrollStore 版 v1.1.0 · iOS16 全套加速\n基于 GPL Speedster (Hoangdus) 移植"
                               font:[UIFont systemFontOfSize:13] color:[UIColor secondaryLabelColor]];
     sub.textAlignment = NSTextAlignmentCenter;
 
@@ -129,7 +129,7 @@ static const double kDampVals[5]  = { 0.10, 0.25, 0.40, 0.60, 0.80 };
     _bounceSeg.selectedSegmentIndex = bi;
 
     UILabel *notice = [self makeLabel:
-        @"以下功能需越狱（需注入 SpringBoard），TrollStore 不可用：\n桌面文件夹开合 · App 开合 · 开/关机动画 · 后台切换器 · 锁屏图标飞入 · 图标抖动"
+        @"v1.1.0：侧滑返回/push·pop/弹窗/转场/显式动画全套收窄（独立模式 15 hooks）。\n若同时注入 SpeedIntensifier，自动切换为只补弹簧动画的互补模式，不双重加速。\n以下需越狱（注入 SpringBoard）巨魔不可用：桌面文件夹 · App 开合 · 开关机 · 切换器 · 锁屏飞入 · 图标抖动"
                                 font:[UIFont systemFontOfSize:12] color:[UIColor tertiaryLabelColor]];
     notice.textAlignment = NSTextAlignmentCenter;
 
@@ -177,8 +177,10 @@ static const double kDampVals[5]  = { 0.10, 0.25, 0.40, 0.60, 0.80 };
     // 完整键集：App 内按 UI 写入；SpringBoard 项全部显式关闭，行为确定
     NSDictionary *d = @{
         @"InAppAnimationEnabled": @(_inAppSwitch.on),
+        @"STSSpeedPreset": @(_speedSeg.selectedSegmentIndex),
         @"DurationMassValue": @(mass),
         @"isInAppBounceEnabled": @(_bounceSwitch.on),
+        @"STSBouncePreset": @(_bounceSeg.selectedSegmentIndex),
         @"DampingValue": @(damp),
         @"isSpeedEnable": @NO, @"Speedvalue": @3,
         @"isBounceEnable": @NO, @"Bouncevalue": @3,
