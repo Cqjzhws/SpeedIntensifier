@@ -1,6 +1,6 @@
 // SIFusion — 配置 App（TrollStore 安装用）
 // SIClassic × SpeedsterTS 融合增强版配套配置器。
-// 写 plist + 发 Darwin 通知（dylib 热重载），并提供注销按钮。
+// 写 plist + 发 Darwin 通知（dylib 热重载），提供注销 / 硬重启按钮。
 #import <UIKit/UIKit.h>
 #import <spawn.h>
 #import <sys/wait.h>
@@ -12,6 +12,10 @@
 #import <stdlib.h>
 #import <sys/sysctl.h>
 
+// iPhoneOS SDK 无 <sys/reboot.h>，unistd.h 已声明 int reboot(int)；补 RB_AUTOBOOT
+#ifndef RB_AUTOBOOT
+#define RB_AUTOBOOT 0x01234567
+#endif
 #ifndef POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE
 #define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE 1
 #endif
@@ -24,7 +28,6 @@ static NSString *const kPrefPath = @"/var/Managed Preferences/mobile/com.local.s
 static NSString *const kNotify   = @"com.local.sifusion.settingschanged";
 
 static dispatch_time_t fu_dwell(double sec);
-
 static void FUApplyAttr(posix_spawnattr_t *attr) {
     posix_spawnattr_init(attr);
     posix_spawnattr_set_persona_np(attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
@@ -32,6 +35,7 @@ static void FUApplyAttr(posix_spawnattr_t *attr) {
     posix_spawnattr_set_persona_gid_np(attr, 0);
 }
 
+#pragma mark ==================== 注销 ====================
 static int FUKillProcessNamed(const char *name) {
     int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
     size_t len = 0;
@@ -63,6 +67,58 @@ static void FURespring(void) {
     posix_spawnattr_destroy(&attr);
 }
 
+#pragma mark ==================== 硬重启（多级回退，SpeedIntensifier 已验证方案） ====================
+// ① root persona 拉起自身 --fu-reboot-helper，子进程直调 reboot() 系统调用（最可靠）
+// ② /usr/sbin/reboot（iOS 15+ 常见路径）
+// ③ /sbin/reboot（旧路径）
+// ④ killall launchd（pid1 受内核保护时无效，仅回退）
+// ⑤ killall backboardd（强制重载主进程，等价类重启）
+static NSString *FUReboot(void) {
+    pid_t pid;
+
+    NSString *selfPath = [[NSBundle mainBundle] executablePath];
+    if (selfPath.length) {
+        posix_spawnattr_t attr0;
+        FUApplyAttr(&attr0);
+        char *a0[] = { (char *)[selfPath UTF8String], "--fu-reboot-helper", NULL };
+        int s0 = posix_spawn(&pid, [selfPath UTF8String], NULL, &attr0, a0, environ);
+        posix_spawnattr_destroy(&attr0);
+        NSLog(@"[SIFApp] self helper reboot() spawn status=%d pid=%d errno=%d", s0, pid, errno);
+        if (s0 == 0) return @"root 助手 reboot() 系统调用";
+    }
+
+    posix_spawnattr_t attr1;
+    char *a1[] = { "/usr/sbin/reboot", NULL };
+    FUApplyAttr(&attr1);
+    int s1 = posix_spawn(&pid, "/usr/sbin/reboot", NULL, &attr1, a1, environ);
+    posix_spawnattr_destroy(&attr1);
+    NSLog(@"[SIFApp] /usr/sbin/reboot status=%d errno=%d", s1, errno);
+    if (s1 == 0) return @"/usr/sbin/reboot";
+
+    posix_spawnattr_t attr2;
+    char *a2[] = { "/sbin/reboot", NULL };
+    FUApplyAttr(&attr2);
+    int s2 = posix_spawn(&pid, "/sbin/reboot", NULL, &attr2, a2, environ);
+    posix_spawnattr_destroy(&attr2);
+    NSLog(@"[SIFApp] /sbin/reboot status=%d errno=%d", s2, errno);
+    if (s2 == 0) return @"/sbin/reboot";
+
+    posix_spawnattr_t attr3;
+    char *a3[] = { "/usr/bin/killall", "-9", "launchd", NULL };
+    FUApplyAttr(&attr3);
+    int s3 = posix_spawn(&pid, "/usr/bin/killall", NULL, &attr3, a3, environ);
+    posix_spawnattr_destroy(&attr3);
+    if (s3 == 0) return @"killall launchd";
+
+    posix_spawnattr_t attr4;
+    char *a4[] = { "/usr/bin/killall", "-9", "backboardd", NULL };
+    FUApplyAttr(&attr4);
+    int s4 = posix_spawn(&pid, "/usr/bin/killall", NULL, &attr4, a4, environ);
+    posix_spawnattr_destroy(&attr4);
+    return (s4 == 0) ? @"killall backboardd" : @"all failed";
+}
+
+#pragma mark ==================== 配置读写 ====================
 static void FUWriteConfig(BOOL enabled, int preset, BOOL spring, NSArray *blacklist) {
     mkdir("/var/Managed Preferences", 0755);
     mkdir("/var/Managed Preferences/mobile", 0755);
@@ -107,12 +163,12 @@ static NSDictionary *FUReadConfig(void) {
     if (cfgPreset < 0 || cfgPreset > 4) cfgPreset = 2;
 
     UILabel *title = [[UILabel alloc] init];
-    title.text = @"SI Fusion";
-    title.font = [UIFont boldSystemFontOfSize:26];
+    title.text = @"隔壁老王专用";
+    title.font = [UIFont boldSystemFontOfSize:28];
     title.textAlignment = NSTextAlignmentCenter;
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"v1.0.0 · 16 Hooks · SIClassic × SpeedsterTS 融合增强";
+    sub.text = @"v1.0.1 · 16 Hooks · 融合增强";
     sub.font = [UIFont systemFontOfSize:13];
     sub.textColor = [UIColor secondaryLabelColor];
     sub.textAlignment = NSTextAlignmentCenter;
@@ -159,6 +215,16 @@ static NSDictionary *FUReadConfig(void) {
     [apply.heightAnchor constraintEqualToConstant:50].active = YES;
     [apply addTarget:self action:@selector(onApply) forControlEvents:UIControlEventTouchUpInside];
 
+    // 硬重启：红色危险按钮，先保存配置再重启
+    UIButton *reboot = [UIButton buttonWithType:UIButtonTypeSystem];
+    [reboot setTitle:@"硬重启手机" forState:UIControlStateNormal];
+    reboot.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+    reboot.backgroundColor = [UIColor systemRedColor];
+    [reboot setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    reboot.layer.cornerRadius = 12;
+    [reboot.heightAnchor constraintEqualToConstant:50].active = YES;
+    [reboot addTarget:self action:@selector(onReboot) forControlEvents:UIControlEventTouchUpInside];
+
     UILabel *hint = [[UILabel alloc] init];
     hint.text = @"说明：dylib 用 TrollFools 注入目标 App。改档位保存后杀掉 App 重开即生效，无需重新注入。与其他加速器同时注入时自动只启用独家弹簧 stiffness hook，不双重缩放。不含列表选择类 hook，微信可用。";
     hint.font = [UIFont systemFontOfSize:12];
@@ -177,7 +243,9 @@ static NSDictionary *FUReadConfig(void) {
         [self _rowWith:lbl1 ctrl:_enableSwitch],
         lbl2, _speedSeg,
         [self _rowWith:lbl3 ctrl:_springSwitch],
-        lbl4, _blacklist, apply, hint, _status
+        lbl4, _blacklist,
+        apply, reboot,
+        hint, _status
     ]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 14;
@@ -209,25 +277,36 @@ static NSDictionary *FUReadConfig(void) {
     ]];
 }
 
+// 行布局修复 v1.0.1：开关设最高抗压/拥抱优先级，长 label 被迫换行而不是把开关挤出屏幕
 - (UIView *)_rowWith:(UIView *)left ctrl:(UIView *)ctrl {
     UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[ left, ctrl ]];
     row.axis = UILayoutConstraintAxisHorizontal;
     row.alignment = UIStackViewAlignmentCenter;
-    [left setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+    row.spacing = 12;
+    [ctrl setContentHuggingPriority:UILayoutPriorityRequired
+                             forAxis:UILayoutConstraintAxisHorizontal];
+    [ctrl setContentCompressionResistancePriority:UILayoutPriorityRequired
+                                           forAxis:UILayoutConstraintAxisHorizontal];
+    [left setContentHuggingPriority:UILayoutPriorityDefaultLow
+                             forAxis:UILayoutConstraintAxisHorizontal];
+    [left setContentCompressionResistancePriority:UILayoutPriorityDefaultLow
+                                           forAxis:UILayoutConstraintAxisHorizontal];
     return row;
 }
 
-- (void)onApply {
-    int preset = _speedSeg.selectedSegmentIndex < 0 ? 2 : (int)_speedSeg.selectedSegmentIndex;
-    NSArray *names = @[ @"微快", @"快", @"很快", @"极快", @"瞬切" ];
-
+- (NSArray *)_collectBlacklist {
     NSMutableArray *bl = [NSMutableArray array];
     for (NSString *line in [_blacklist.text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
         NSString *t = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         if (t.length) [bl addObject:t];
     }
+    return bl;
+}
 
-    FUWriteConfig(_enableSwitch.on, preset, _springSwitch.on, bl);
+- (void)onApply {
+    int preset = _speedSeg.selectedSegmentIndex < 0 ? 2 : (int)_speedSeg.selectedSegmentIndex;
+    NSArray *names = @[ @"微快", @"快", @"很快", @"极快", @"瞬切" ];
+    FUWriteConfig(_enableSwitch.on, preset, _springSwitch.on, [self _collectBlacklist]);
     _status.text = [NSString stringWithFormat:@"已保存：%@ · %@ · 弹簧%@。正在注销…",
                     _enableSwitch.on ? @"开" : @"关",
                     names[preset],
@@ -235,6 +314,27 @@ static NSDictionary *FUReadConfig(void) {
     dispatch_after(fu_dwell(0.6), dispatch_get_main_queue(), ^{
         FURespring();
     });
+}
+
+- (void)onReboot {
+    // 二次确认，防误触（硬重启会中断一切）
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"硬重启手机"
+                                                                message:@"将先保存当前配置，然后立即重启设备。确定继续？"
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"硬重启" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        [weakSelf _doReboot];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)_doReboot {
+    int preset = _speedSeg.selectedSegmentIndex < 0 ? 2 : (int)_speedSeg.selectedSegmentIndex;
+    FUWriteConfig(_enableSwitch.on, preset, _springSwitch.on, [self _collectBlacklist]);
+    NSString *way = FUReboot();
+    _status.text = [NSString stringWithFormat:@"已保存，重启触发方式：%@", way];
+    NSLog(@"[SIFApp] reboot via: %@", way);
 }
 
 static dispatch_time_t fu_dwell(double sec) {
@@ -258,6 +358,19 @@ static dispatch_time_t fu_dwell(double sec) {
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
+        // 硬重启助手：以 root persona 被拉起，在进 UIKit 前直调 reboot()（最可靠路径）
+        if ([[NSProcessInfo processInfo].arguments containsObject:@"--fu-reboot-helper"]) {
+            NSLog(@"[SIFApp] reboot helper: reboot(RB_AUTOBOOT)");
+            reboot(RB_AUTOBOOT);
+            // 不返回；万一返回，killall launchd 兜底
+            pid_t pid;
+            posix_spawnattr_t attr;
+            FUApplyAttr(&attr);
+            char *a[] = { "/usr/bin/killall", "-9", "launchd", NULL };
+            posix_spawn(&pid, "/usr/bin/killall", NULL, &attr, a, environ);
+            posix_spawnattr_destroy(&attr);
+            return 0;
+        }
         return UIApplicationMain(argc, argv, nil, NSStringFromClass([FUAppDelegate class]));
     }
 }
