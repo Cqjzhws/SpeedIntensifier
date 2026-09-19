@@ -1,0 +1,90 @@
+name: Build SpeedsterTS (dylib + IPA)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'speedster-v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build SpeedsterTS dylib + IPA
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      # ① dylib — Speedster 的纯 runtime TrollStore 移植，TrollFools 注入
+      - name: Build dylib (pure clang)
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          mkdir -p artifacts
+          clang -arch arm64 -dynamiclib -O2 \
+            -install_name @rpath/SpeedsterTS.dylib \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -undefined dynamic_lookup -fobjc-arc \
+            -framework Foundation -framework UIKit -framework QuartzCore \
+            -o artifacts/SpeedsterTS.dylib SpeedsterTS/Tweak/SpeedsterTS.m
+          codesign --force --sign - artifacts/SpeedsterTS.dylib
+          lipo -info artifacts/SpeedsterTS.dylib
+          file artifacts/SpeedsterTS.dylib
+
+      # ② 配置 App IPA
+      - name: Build app & IPA
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          APP="build/SpeedsterTS.app"
+          rm -rf build
+          mkdir -p "$APP"
+
+          clang -arch arm64 -O2 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -framework Foundation -framework UIKit \
+            -o "$APP/SpeedsterTS" SpeedsterTS/App/main.m
+
+          cp SpeedsterTS/App/Info.plist "$APP/Info.plist"
+          cp SpeedsterTS/App/AppIcon.png "$APP/AppIcon.png"
+          for f in SpeedsterTS/App/Icon-*.png; do cp "$f" "$APP/$(basename $f)"; done
+          codesign --force --sign - --entitlements SpeedsterTS/entitlements.plist "$APP"
+
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/SpeedsterTS.app
+          ( cd build && zip -qry ../artifacts/SpeedsterTS.ipa Payload -x "*.DS_Store" )
+          echo "IPA size: $(du -h artifacts/SpeedsterTS.ipa | cut -f1)"
+
+      - name: Verify artifacts
+        run: |
+          set -e
+          ls -lh artifacts/
+          file artifacts/SpeedsterTS.dylib
+          unzip -l artifacts/SpeedsterTS.ipa
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpeedsterTS-artifacts
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/speedster-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: SpeedsterTS ${{ github.ref_name }}
+          files: |
+            artifacts/SpeedsterTS.dylib
+            artifacts/SpeedsterTS.ipa
+          generate_release_notes: true
