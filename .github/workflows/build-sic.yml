@@ -1,0 +1,91 @@
+name: Build SIClassic (dylib + IPA)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'sic-v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build SIClassic dylib + IPA
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      # ① dylib — Speed Intensifier (pw5a29) 的纯 runtime iOS16 移植，TrollFools 注入
+      - name: Build dylib (pure clang)
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          mkdir -p artifacts
+          clang -arch arm64 -dynamiclib -O2 \
+            -install_name @rpath/SIClassic.dylib \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -undefined dynamic_lookup -fobjc-arc \
+            -framework Foundation -framework UIKit -framework QuartzCore \
+            -o artifacts/SIClassic.dylib SIClassic/Tweak/SIClassic.m
+          codesign --force --sign - artifacts/SIClassic.dylib
+          lipo -info artifacts/SIClassic.dylib
+          file artifacts/SIClassic.dylib
+          echo "dylib size: $(du -h artifacts/SIClassic.dylib | cut -f1)"
+
+      # ② 配置 App IPA
+      - name: Build app & IPA
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          APP="build/SIClassic.app"
+          rm -rf build
+          mkdir -p "$APP"
+
+          clang -arch arm64 -O2 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -framework Foundation -framework UIKit \
+            -o "$APP/SIClassic" SIClassic/App/main.m
+
+          cp SIClassic/App/Info.plist "$APP/Info.plist"
+          cp SIClassic/App/AppIcon.png "$APP/AppIcon.png"
+          for f in SIClassic/App/Icon-*.png; do cp "$f" "$APP/$(basename $f)"; done
+          codesign --force --sign - --entitlements SIClassic/entitlements.plist "$APP"
+
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/SIClassic.app
+          ( cd build && zip -qry ../artifacts/SIClassic.ipa Payload -x "*.DS_Store" )
+          echo "IPA size: $(du -h artifacts/SIClassic.ipa | cut -f1)"
+
+      - name: Verify artifacts
+        run: |
+          set -e
+          ls -lh artifacts/
+          file artifacts/SIClassic.dylib
+          unzip -l artifacts/SIClassic.ipa
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SIClassic-artifacts
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/sic-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: SIClassic ${{ github.ref_name }}
+          files: |
+            artifacts/SIClassic.dylib
+            artifacts/SIClassic.ipa
+          generate_release_notes: true
