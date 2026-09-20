@@ -119,13 +119,20 @@ static NSString *FUReboot(void) {
 }
 
 #pragma mark ==================== 配置读写 ====================
-static void FUWriteConfig(BOOL enabled, int preset, BOOL spring, NSArray *blacklist) {
+static void FUWriteConfig(BOOL enabled, int preset, BOOL spring, NSArray *blacklist,
+                          BOOL adv, double dur, double vel, double stiff, double damp, double mass) {
     mkdir("/var/Managed Preferences", 0755);
     mkdir("/var/Managed Preferences/mobile", 0755);
     NSDictionary *d = @{ @"Enabled": @(enabled),
                          @"Preset": @(preset),
                          @"Spring": @(spring),
-                         @"Blacklist": blacklist ?: @[ @"com.tencent.wework" ] };
+                         @"Blacklist": blacklist ?: @[ @"com.tencent.wework" ],
+                         @"Advanced": @(adv),
+                         @"DurMult": @(dur),
+                         @"VelMult": @(vel),
+                         @"StiffMult": @(stiff),
+                         @"DampMult": @(damp),
+                         @"MassMult": @(mass) };
     BOOL ok = [d writeToFile:kPrefPath atomically:YES];
     NSLog(@"[SIFApp] write pref -> %d", ok);
     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
@@ -137,7 +144,13 @@ static NSDictionary *FUReadConfig(void) {
     if (!d) d = @{ @"Enabled": @YES,
                    @"Preset": @2,
                    @"Spring": @YES,
-                   @"Blacklist": @[ @"com.tencent.wework" ] };
+                   @"Blacklist": @[ @"com.tencent.wework" ],
+                   @"Advanced": @NO,
+                   @"DurMult": @0.15,
+                   @"VelMult": @1.0,
+                   @"StiffMult": @1.0,
+                   @"DampMult": @1.0,
+                   @"MassMult": @1.0 };
     return d;
 }
 
@@ -150,6 +163,9 @@ static NSDictionary *FUReadConfig(void) {
     UISegmentedControl *_speedSeg;
     UITextView *_blacklist;
     UILabel *_status;
+    UISwitch *_advSwitch;
+    UISlider *_durSlider, *_velSlider, *_stiffSlider, *_dampSlider, *_massSlider;
+    UILabel *_durLbl, *_velLbl, *_stiffLbl, *_dampLbl, *_massLbl;
 }
 
 - (void)viewDidLoad {
@@ -161,6 +177,17 @@ static NSDictionary *FUReadConfig(void) {
     BOOL cfgSpring  = cfg[@"Spring"] ? [cfg[@"Spring"] boolValue] : YES;
     int cfgPreset   = cfg[@"Preset"] ? [cfg[@"Preset"] intValue] : 2;
     if (cfgPreset < 0 || cfgPreset > 4) cfgPreset = 2;
+    BOOL cfgAdv     = cfg[@"Advanced"] ? [cfg[@"Advanced"] boolValue] : NO;
+    double cfgDur   = cfg[@"DurMult"]   ? [cfg[@"DurMult"] doubleValue]   : 0.15;
+    double cfgVel   = cfg[@"VelMult"]   ? [cfg[@"VelMult"] doubleValue]   : 1.0;
+    double cfgStiff = cfg[@"StiffMult"] ? [cfg[@"StiffMult"] doubleValue] : 1.0;
+    double cfgDamp  = cfg[@"DampMult"]  ? [cfg[@"DampMult"] doubleValue]  : 1.0;
+    double cfgMass  = cfg[@"MassMult"]  ? [cfg[@"MassMult"] doubleValue]  : 1.0;
+    if (cfgDur <= 0) cfgDur = 0.15;
+    if (cfgVel <= 0) cfgVel = 1.0;
+    if (cfgStiff <= 0) cfgStiff = 1.0;
+    if (cfgDamp <= 0) cfgDamp = 1.0;
+    if (cfgMass <= 0) cfgMass = 1.0;
 
     UILabel *title = [[UILabel alloc] init];
     title.text = @"隔壁老王专用";
@@ -168,7 +195,7 @@ static NSDictionary *FUReadConfig(void) {
     title.textAlignment = NSTextAlignmentCenter;
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"v1.0.1 · 16 Hooks · 融合增强";
+    sub.text = @"v1.1.0 · 17 Hooks · 融合增强";
     sub.font = [UIFont systemFontOfSize:13];
     sub.textColor = [UIColor secondaryLabelColor];
     sub.textAlignment = NSTextAlignmentCenter;
@@ -192,6 +219,25 @@ static NSDictionary *FUReadConfig(void) {
     lbl3.numberOfLines = 0;
     _springSwitch = [[UISwitch alloc] init];
     _springSwitch.on = cfgSpring;
+
+    // 高级设置：Speedy 式独立倍率（对标 Speedy「程序动画」页）
+    UILabel *lblAdv = [[UILabel alloc] init];
+    lblAdv.text = @"高级设置（独立倍率）";
+    lblAdv.font = [UIFont systemFontOfSize:17];
+    _advSwitch = [[UISwitch alloc] init];
+    _advSwitch.on = cfgAdv;
+
+    UILabel *advHint = [[UILabel alloc] init];
+    advHint.text = @"开启后：持续时间倍数直接覆盖速度档位；刚性/阻尼/质量/初始速率按倍数缩放弹簧参数（1.00 = 不变）。保存后杀掉 App 重开生效。";
+    advHint.font = [UIFont systemFontOfSize:12];
+    advHint.textColor = [UIColor tertiaryLabelColor];
+    advHint.numberOfLines = 0;
+
+    UIView *durRow   = [self _sliderRow:@"持续时间倍数" value:cfgDur   min:0.01 max:1.0 tag:0];
+    UIView *velRow   = [self _sliderRow:@"初始速率倍数" value:cfgVel   min:0.05 max:3.0 tag:1];
+    UIView *stiffRow = [self _sliderRow:@"刚性倍数"     value:cfgStiff min:0.05 max:3.0 tag:2];
+    UIView *dampRow  = [self _sliderRow:@"阻尼倍数"     value:cfgDamp  min:0.05 max:3.0 tag:3];
+    UIView *massRow  = [self _sliderRow:@"质量倍数"     value:cfgMass  min:0.05 max:3.0 tag:4];
 
     UILabel *lbl4 = [[UILabel alloc] init];
     lbl4.text = @"黑名单（每行一个 Bundle ID，命中则不加速）";
@@ -243,6 +289,9 @@ static NSDictionary *FUReadConfig(void) {
         [self _rowWith:lbl1 ctrl:_enableSwitch],
         lbl2, _speedSeg,
         [self _rowWith:lbl3 ctrl:_springSwitch],
+        [self _rowWith:lblAdv ctrl:_advSwitch],
+        advHint,
+        durRow, velRow, stiffRow, dampRow, massRow,
         lbl4, _blacklist,
         apply, reboot,
         hint, _status
@@ -294,6 +343,38 @@ static NSDictionary *FUReadConfig(void) {
     return row;
 }
 
+// 高级设置滑杆行：label（含实时数值）+ slider 纵排；按 tag 存进对应 ivar
+- (UIView *)_sliderRow:(NSString *)title value:(double)v min:(double)mn max:(double)mx tag:(int)tag {
+    UILabel *lbl = [[UILabel alloc] init];
+    lbl.text = [NSString stringWithFormat:@"%@（%.2f）", title, v];
+    lbl.font = [UIFont systemFontOfSize:15];
+    lbl.numberOfLines = 0;
+    UISlider *s = [[UISlider alloc] init];
+    s.minimumValue = (float)mn;
+    s.maximumValue = (float)mx;
+    s.value = (float)v;
+    s.tag = tag;
+    [s addTarget:self action:@selector(onSlider:) forControlEvents:UIControlEventValueChanged];
+    switch (tag) {
+        case 0: _durLbl = lbl;   _durSlider = s;   break;
+        case 1: _velLbl = lbl;   _velSlider = s;   break;
+        case 2: _stiffLbl = lbl; _stiffSlider = s; break;
+        case 3: _dampLbl = lbl;  _dampSlider = s;  break;
+        case 4: _massLbl = lbl;  _massSlider = s;  break;
+    }
+    UIStackView *col = [[UIStackView alloc] initWithArrangedSubviews:@[ lbl, s ]];
+    col.axis = UILayoutConstraintAxisVertical;
+    col.spacing = 4;
+    return col;
+}
+
+- (void)onSlider:(UISlider *)s {
+    static NSString *names[5] = { @"持续时间倍数", @"初始速率倍数", @"刚性倍数", @"阻尼倍数", @"质量倍数" };
+    UILabel *labels[5] = { _durLbl, _velLbl, _stiffLbl, _dampLbl, _massLbl };
+    if (s.tag < 0 || s.tag > 4 || !labels[s.tag]) return;
+    labels[s.tag].text = [NSString stringWithFormat:@"%@（%.2f）", names[s.tag], s.value];
+}
+
 - (NSArray *)_collectBlacklist {
     NSMutableArray *bl = [NSMutableArray array];
     for (NSString *line in [_blacklist.text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
@@ -306,11 +387,14 @@ static NSDictionary *FUReadConfig(void) {
 - (void)onApply {
     int preset = _speedSeg.selectedSegmentIndex < 0 ? 2 : (int)_speedSeg.selectedSegmentIndex;
     NSArray *names = @[ @"微快", @"快", @"很快", @"极快", @"瞬切" ];
-    FUWriteConfig(_enableSwitch.on, preset, _springSwitch.on, [self _collectBlacklist]);
-    _status.text = [NSString stringWithFormat:@"已保存：%@ · %@ · 弹簧%@。正在注销…",
+    FUWriteConfig(_enableSwitch.on, preset, _springSwitch.on, [self _collectBlacklist],
+                  _advSwitch.on, _durSlider.value, _velSlider.value,
+                  _stiffSlider.value, _dampSlider.value, _massSlider.value);
+    _status.text = [NSString stringWithFormat:@"已保存：%@ · %@ · 弹簧%@ · 高级%@。正在注销…",
                     _enableSwitch.on ? @"开" : @"关",
                     names[preset],
-                    _springSwitch.on ? @"开" : @"关"];
+                    _springSwitch.on ? @"开" : @"关",
+                    _advSwitch.on ? @"开" : @"关"];
     dispatch_after(fu_dwell(0.6), dispatch_get_main_queue(), ^{
         FURespring();
     });
@@ -331,7 +415,9 @@ static NSDictionary *FUReadConfig(void) {
 
 - (void)_doReboot {
     int preset = _speedSeg.selectedSegmentIndex < 0 ? 2 : (int)_speedSeg.selectedSegmentIndex;
-    FUWriteConfig(_enableSwitch.on, preset, _springSwitch.on, [self _collectBlacklist]);
+    FUWriteConfig(_enableSwitch.on, preset, _springSwitch.on, [self _collectBlacklist],
+                  _advSwitch.on, _durSlider.value, _velSlider.value,
+                  _stiffSlider.value, _dampSlider.value, _massSlider.value);
     NSString *way = FUReboot();
     _status.text = [NSString stringWithFormat:@"已保存，重启触发方式：%@", way];
     NSLog(@"[SIFApp] reboot via: %@", way);

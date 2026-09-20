@@ -1,4 +1,4 @@
-// SIFusion v1.0.0 — SIClassic × SpeedsterTS 融合增强版（纯 ObjC runtime，无 substrate）
+// SIFusion v1.1.0 — SIClassic × SpeedsterTS 融合增强版（纯 ObjC runtime，无 substrate）
 //
 // 由两个实测可用版本的 hook 并集融合而成：
 //   · SpeedsterTS v1.1.1 独立模式 15 hooks（UIView block×4 / CAAnimation /
@@ -19,13 +19,16 @@
 //      标记防二次缩放；Nav/present 用 CATransaction 收窄 + gFSTxInternal 自调
 //      标记，不包动画块、不碰 setViewControllers: 状态机敏感接口。
 //   4. 共存检测：进程内已加载 SpeedIntensifier / SpeedsterTS / SIClassic 时，
-//      只安装本版独有的 CASpringAnimation -setStiffness:（互补，绝不双重缩放）；
-//      独立模式装全部 16 hooks。
+//      只安装弹簧物理层 hooks（互补，绝不双重缩放）；独立模式装全部 17 hooks。
 //   5. 刻意不 hook 任何 UITableView/UICollectionView 选择/刷新/移动方法
 //      （已证实是微信点链接闪退的根因类）。
+//   6. v1.1.0 新增高级模式（对标 Speedy 的程序动画独立倍率）：
+//      Advanced 开启后，持续时间倍数覆盖 5 档档位表，刚性/阻尼/质量/初始速率
+//      按用户倍率直接缩放（1.0 = 不变）；关闭时保持 v1.0.1 物理公式行为。
 //
 // 配置：/var/Managed Preferences/mobile/com.local.sifusion.plist
 //   Enabled / Preset(0-4) / Spring / Blacklist
+//   Advanced / DurMult / VelMult / StiffMult / DampMult / MassMult（高级模式倍率）
 // Darwin 通知 com.local.sifusion.settingschanged 热重载（改档杀 App 重开即生效）。
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -44,10 +47,24 @@ static NSArray *gBlacklist = nil;
 static BOOL    gCompanion = NO;        // 检测到其他加速器，互补模式
 static BOOL    gFSTxInternal = NO;     // 自家 CATransaction 调用标记
 
+// 高级模式（Speedy 式独立倍率）：开启后覆盖档位表与弹簧物理公式
+static BOOL    gAdvanced = NO;
+static double  gDurMult   = 0.15;      // 持续时间倍数
+static double  gVelMult   = 1.0;       // 初始速率倍数（setVelocity:）
+static double  gStiffMult = 1.0;       // 刚性倍数
+static double  gDampMult  = 1.0;       // 阻尼倍数
+static double  gMassMult  = 1.0;       // 质量倍数
+
 // 档位 → 时长乘数（SpeedsterTS 实测数值）
 static const double kDurFactors[5] = { 0.50, 0.30, 0.15, 0.05, 0.001 };
 
-static inline double _factor(void) { return kDurFactors[MAX(0, MIN(4, gPreset))]; }
+static inline double _factor(void) {
+    if (gAdvanced) {
+        double f = gDurMult;
+        return (f < 0.001) ? 0.001 : (f > 1.0 ? 1.0 : f);
+    }
+    return kDurFactors[MAX(0, MIN(4, gPreset))];
+}
 static inline double _mult(void) {
     double f = _factor();
     return f > 0.0 ? 1.0 / f : 10000.0;
@@ -84,6 +101,13 @@ static void _loadPref(void) {
             if (d[@"Enabled"])  gEnabled = [d[@"Enabled"] boolValue];
             if (d[@"Preset"])   gPreset = MAX(0, MIN(4, [d[@"Preset"] intValue]));
             if (d[@"Spring"])   gSpring = [d[@"Spring"] boolValue];
+            if (d[@"Advanced"]) gAdvanced = [d[@"Advanced"] boolValue];
+            double dv;
+            if ((dv = [d[@"DurMult"] doubleValue])   > 0) gDurMult   = dv;
+            if ((dv = [d[@"VelMult"] doubleValue])   > 0) gVelMult   = dv;
+            if ((dv = [d[@"StiffMult"] doubleValue]) > 0) gStiffMult = dv;
+            if ((dv = [d[@"DampMult"] doubleValue])  > 0) gDampMult  = dv;
+            if ((dv = [d[@"MassMult"] doubleValue])  > 0) gMassMult  = dv;
             gBlacklist = d[@"Blacklist"];
         }
     } @catch (__unused NSException *e) {}
@@ -275,34 +299,61 @@ static inline BOOL _springPhysicsOn(void) {
     return gEnabled && !gBlacklisted && gSpring && !gCompanion;
 }
 
-// stiffness × m²：ω=√(k/m)，k 乘 m² → ω 乘 m → settle 缩到 1/m，ζ 不变
+// stiffness：高级模式按用户倍率直接缩放；普通模式用物理推导 × m²：
+// ω=√(k/m)，k 乘 m² → ω 乘 m → settle 缩到 1/m，ζ 不变
 - (void)fu_setStiffness:(CGFloat)v {
     if (_stiffnessOn() && v > 0.0f) {
-        double m = _mult();
-        CGFloat k = v * (CGFloat)(m * m);
+        CGFloat k;
+        if (gAdvanced) {
+            k = v * (CGFloat)gStiffMult;
+        } else {
+            double m = _mult();
+            k = v * (CGFloat)(m * m);
+        }
         if (k > 1.0e5f) k = 1.0e5f;
         [self fu_setStiffness:k];
     } else {
         [self fu_setStiffness:v];
     }
 }
-// damping × m：与 stiffness 配套保持阻尼比 ζ = c/(2√(km)) 不变
+// damping：高级模式按用户倍率；普通模式 × m 与 stiffness 配套保持阻尼比
+// ζ = c/(2√(km)) 不变
 - (void)fu_setDamping:(CGFloat)v {
     if (_springPhysicsOn() && v > 0.0f) {
-        double m = _mult();
-        CGFloat c = v * (CGFloat)m;
+        CGFloat c;
+        if (gAdvanced) {
+            c = v * (CGFloat)gDampMult;
+        } else {
+            double m = _mult();
+            c = v * (CGFloat)m;
+        }
         if (c > 1.0e5f) c = 1.0e5f;
         [self fu_setDamping:c];
     } else {
         [self fu_setDamping:v];
     }
 }
-// 瞬切档：mass 压到极小，弹簧 settle 趋近 0（仅瞬切，非瞬切不动 mass）
+// mass：高级模式按用户倍率；普通模式仅瞬切档压到极小（settle 趋近 0）
 - (void)fu_setMass:(CGFloat)v {
-    if (gEnabled && !gBlacklisted && gSpring && gPreset == 4 && v > 0.0f) {
+    if (gAdvanced && _springPhysicsOn() && v > 0.0f) {
+        CGFloat mv = v * (CGFloat)gMassMult;
+        if (mv > 1.0e5f) mv = 1.0e5f;
+        [self fu_setMass:mv];
+    } else if (gEnabled && !gBlacklisted && gSpring && gPreset == 4 && v > 0.0f) {
         [self fu_setMass:0.0001f];
     } else {
         [self fu_setMass:v];
+    }
+}
+// 初始速率：仅高级模式生效（Speedy 对标项）；velocity 可为负（方向），保号缩放
+- (void)fu_setVelocity:(CGFloat)v {
+    if (gAdvanced && _springPhysicsOn() && v != 0.0f) {
+        CGFloat nv = v * (CGFloat)gVelMult;
+        if (nv > 1.0e5f) nv = 1.0e5f;
+        if (nv < -1.0e5f) nv = -1.0e5f;
+        [self fu_setVelocity:nv];
+    } else {
+        [self fu_setVelocity:v];
     }
 }
 
@@ -344,15 +395,16 @@ static void _fu_entry(void) {
         int ok = 0, total = 0;
         Class spring = [CASpringAnimation class];
 
-        // 弹簧物理层 3 个 hook 始终安装（mass/damping 与 SpeedsterTS 行为不同时
-        // 仅在独立模式做物理缩放——见 _springPhysicsOn 内的 companion 守卫；
-        // stiffness 互补模式也生效，是本版独有的增强）。
+        // 弹簧物理层 4 个 hook 始终安装（stiffness/damping/mass/velocity；
+        // mass/damping/velocity 与 SpeedsterTS 行为不同时仅在独立模式做物理缩放
+        // ——见 _springPhysicsOn 内的 companion 守卫；stiffness 互补模式也生效）。
         // 注意：与 SpeedsterTS 同时注入时，SpeedsterTS 的 mass/damping hook 也在，
         // 但互补模式下本版 damping 走原速分支，不叠加；stiffness 独家。
-        total += 3;
+        total += 4;
         ok += _swiz(spring, @selector(setStiffness:), @selector(fu_setStiffness:));
         ok += _swiz(spring, @selector(setDamping:),   @selector(fu_setDamping:));
         ok += _swiz(spring, @selector(setMass:),      @selector(fu_setMass:));
+        ok += _swiz(spring, @selector(setVelocity:),  @selector(fu_setVelocity:));
 
         if (!gCompanion) {
             total += 4;
@@ -387,9 +439,9 @@ static void _fu_entry(void) {
                         @selector(fu_dismissViewControllerAnimated:completion:));
         }
 
-        NSLog(@"[SIFusion] v1.0.0 loaded in %@: %@ mode, hooks %d/%d (preset=%d spring=%d blacklisted=%d)",
+        NSLog(@"[SIFusion] v1.1.0 loaded in %@: %@ mode, hooks %d/%d (preset=%d spring=%d adv=%d dur=%.3f blacklisted=%d)",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
-              gCompanion ? @"COMPANION (stiffness-only)" : @"STANDALONE (full 16)",
-              ok, total, gPreset, gSpring, gBlacklisted);
+              gCompanion ? @"COMPANION (stiffness-only)" : @"STANDALONE (full 17)",
+              ok, total, gPreset, gSpring, gAdvanced, gDurMult, gBlacklisted);
     }
 }
