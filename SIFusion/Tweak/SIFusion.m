@@ -212,7 +212,7 @@ static char kFUInternalDurKey;
         if (gLayerSpeed) {
             CGFloat sp = (CGFloat)(1.0 / _factor());
             if (sp > 20.0f) sp = 20.0f;
-            if (sp > 1.0f) self.speed = sp;
+            if (sp > 1.0f) ((CALayer *)self).speed = sp;
         }
         NSTimeInterval d = anim.duration;
         if (d > 0 && d <= 0.26) {
