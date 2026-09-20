@@ -1,4 +1,4 @@
-// SIFusion v1.1.0 — SIClassic × SpeedsterTS 融合增强版（纯 ObjC runtime，无 substrate）
+// SIFusion v1.2.0 — SIClassic × SpeedsterTS 融合增强版（纯 ObjC runtime，无 substrate）
 //
 // 由两个实测可用版本的 hook 并集融合而成：
 //   · SpeedsterTS v1.1.1 独立模式 15 hooks（UIView block×4 / CAAnimation /
@@ -19,16 +19,22 @@
 //      标记防二次缩放；Nav/present 用 CATransaction 收窄 + gFSTxInternal 自调
 //      标记，不包动画块、不碰 setViewControllers: 状态机敏感接口。
 //   4. 共存检测：进程内已加载 SpeedIntensifier / SpeedsterTS / SIClassic 时，
-//      只安装弹簧物理层 hooks（互补，绝不双重缩放）；独立模式装全部 17 hooks。
+//      只安装弹簧物理层 hooks（互补，绝不双重缩放）；独立模式装全部 20 hooks。
 //   5. 刻意不 hook 任何 UITableView/UICollectionView 选择/刷新/移动方法
 //      （已证实是微信点链接闪退的根因类）。
-//   6. v1.1.0 新增高级模式（对标 Speedy 的程序动画独立倍率）：
+//   6. v1.1.0 高级模式（对标 Speedy 的程序动画独立倍率）：
 //      Advanced 开启后，持续时间倍数覆盖 5 档档位表，刚性/阻尼/质量/初始速率
 //      按用户倍率直接缩放（1.0 = 不变）；关闭时保持 v1.0.1 物理公式行为。
+//   7. v1.2.0 新增：UIView transitionWithView/FromView 容器转场 ×2、
+//      UINavigationController _setTransitionDuration:（侧滑返回松手完成段，
+//      私有 selector 缺失时安全跳过）、层时钟叠加 LayerSpeed（实验：在
+//      addAnimation 里按档位倍数设置 CALayer.speed，兜底加速未被时长 hook
+//      覆盖的私有动画路径；默认关，与档位叠乘）。
 //
 // 配置：/var/Managed Preferences/mobile/com.local.sifusion.plist
 //   Enabled / Preset(0-4) / Spring / Blacklist
 //   Advanced / DurMult / VelMult / StiffMult / DampMult / MassMult（高级模式倍率）
+//   LayerSpeed（层时钟叠加，实验）
 // Darwin 通知 com.local.sifusion.settingschanged 热重载（改档杀 App 重开即生效）。
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -54,6 +60,7 @@ static double  gVelMult   = 1.0;       // 初始速率倍数（setVelocity:）
 static double  gStiffMult = 1.0;       // 刚性倍数
 static double  gDampMult  = 1.0;       // 阻尼倍数
 static double  gMassMult  = 1.0;       // 质量倍数
+static BOOL    gLayerSpeed = NO;       // 层时钟叠加（实验，默认关）
 
 // 档位 → 时长乘数（SpeedsterTS 实测数值）
 static const double kDurFactors[5] = { 0.50, 0.30, 0.15, 0.05, 0.001 };
@@ -108,6 +115,7 @@ static void _loadPref(void) {
             if ((dv = [d[@"StiffMult"] doubleValue]) > 0) gStiffMult = dv;
             if ((dv = [d[@"DampMult"] doubleValue])  > 0) gDampMult  = dv;
             if ((dv = [d[@"MassMult"] doubleValue])  > 0) gMassMult  = dv;
+            if (d[@"LayerSpeed"]) gLayerSpeed = [d[@"LayerSpeed"] boolValue];
             gBlacklist = d[@"Blacklist"];
         }
     } @catch (__unused NSException *e) {}
@@ -199,6 +207,13 @@ static char kFUInternalDurKey;
 }
 - (void)fu_addAnimation:(CAAnimation *)anim forKey:(NSString *)key {
     if (_on() && anim && !_isBlurKey(key ?: @"")) {
+        // 层时钟叠加（实验）：按档位倍数加速本层的动画时钟，兜底覆盖
+        // 未被时长 hook 触达的私有动画路径；与档位叠乘，上限 20 倍
+        if (gLayerSpeed) {
+            CGFloat sp = (CGFloat)(1.0 / _factor());
+            if (sp > 20.0f) sp = 20.0f;
+            if (sp > 1.0f) self.speed = sp;
+        }
         NSTimeInterval d = anim.duration;
         if (d > 0 && d <= 0.26) {
             objc_setAssociatedObject(anim, &kFUInternalDurKey, @YES,
@@ -214,6 +229,18 @@ static char kFUInternalDurKey;
     } else {
         [self fu_setAnimationDuration:_scale(t)];
     }
+}
+
+#pragma mark ---------- 容器转场（v1.2.0：transitionWithView/FromView） ----------
++ (void)fu_transitionWithView:(UIView *)view duration:(NSTimeInterval)d options:(UIViewAnimationOptions)o
+        animations:(void (^)(void))a completion:(void (^)(BOOL))c {
+    [self fu_transitionWithView:view duration:_on() ? _scale(d) : d
+                        options:o animations:a completion:c];
+}
++ (void)fu_transitionFromView:(UIView *)from toView:(UIView *)to duration:(NSTimeInterval)d
+                      options:(UIViewAnimationOptions)o completion:(void (^)(BOOL))c {
+    [self fu_transitionFromView:from toView:to duration:_on() ? _scale(d) : d
+                        options:o completion:c];
 }
 
 #pragma mark ---------- 导航转场（侧滑返回松手完成段） ----------
@@ -262,6 +289,15 @@ static char kFUInternalDurKey;
         [CATransaction commit];
     } @finally { gFSTxInternal = NO; }
     return r;
+}
+// v1.2.0：侧滑返回松手后的完成段走这里（私有时长 setter）；selector 缺失时
+// _swiz 安全跳过。交互转场不走 push/pop hook，这是该段的唯一收窄点。
+- (void)fu_setTransitionDuration:(NSTimeInterval)t {
+    if (_on() && t > 0) {
+        [self fu_setTransitionDuration:_scaleMin(t, 16.0)];
+    } else {
+        [self fu_setTransitionDuration:t];
+    }
 }
 
 #pragma mark ---------- present / dismiss ----------
@@ -424,12 +460,21 @@ static void _fu_entry(void) {
             ok += _swizClass([CATransaction class], @selector(setAnimationDuration:),
                              @selector(fu_setAnimationDuration:));
 
+            // v1.2.0：容器转场 ×2
+            total += 2;
+            ok += _swizClass([UIView class], @selector(transitionWithView:duration:options:animations:completion:),
+                             @selector(fu_transitionWithView:duration:options:animations:completion:));
+            ok += _swizClass([UIView class], @selector(transitionFromView:toView:duration:options:completion:),
+                             @selector(fu_transitionFromView:toView:duration:options:completion:));
+
             Class nav = [UINavigationController class];
-            total += 4;
+            total += 5;
             ok += _swiz(nav, @selector(pushViewController:animated:),     @selector(fu_pushViewController:animated:));
             ok += _swiz(nav, @selector(popViewControllerAnimated:),       @selector(fu_popViewControllerAnimated:));
             ok += _swiz(nav, @selector(popToViewController:animated:),    @selector(fu_popToViewController:animated:));
             ok += _swiz(nav, @selector(popToRootViewControllerAnimated:), @selector(fu_popToRootViewControllerAnimated:));
+            // 私有时长（侧滑完成段）；缺失时安全跳过
+            ok += _swiz(nav, @selector(_setTransitionDuration:), @selector(fu_setTransitionDuration:));
 
             Class vc = [UIViewController class];
             total += 2;
@@ -439,9 +484,9 @@ static void _fu_entry(void) {
                         @selector(fu_dismissViewControllerAnimated:completion:));
         }
 
-        NSLog(@"[SIFusion] v1.1.0 loaded in %@: %@ mode, hooks %d/%d (preset=%d spring=%d adv=%d dur=%.3f blacklisted=%d)",
+        NSLog(@"[SIFusion] v1.2.0 loaded in %@: %@ mode, hooks %d/%d (preset=%d spring=%d adv=%d dur=%.3f lspeed=%d blacklisted=%d)",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
-              gCompanion ? @"COMPANION (stiffness-only)" : @"STANDALONE (full 17)",
-              ok, total, gPreset, gSpring, gAdvanced, gDurMult, gBlacklisted);
+              gCompanion ? @"COMPANION (stiffness-only)" : @"STANDALONE (full 20)",
+              ok, total, gPreset, gSpring, gAdvanced, gDurMult, gLayerSpeed, gBlacklisted);
     }
 }
