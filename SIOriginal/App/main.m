@@ -148,6 +148,7 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"HighFPSEnabled"])    d[@"HighFPSEnabled"]    = @YES;
     if (!d[@"HighFPSRate"])       d[@"HighFPSRate"]       = @120;
     if (!d[@"HighFPSMetalTriple"])d[@"HighFPSMetalTriple"]= @YES;
+    if (!d[@"HighFPSLock"])       d[@"HighFPSLock"]       = @NO;
     // 真后台保活：默认全开
     if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
@@ -165,7 +166,7 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
     NSArray *sioKeys = @[ @"Enabled", @"Mode", @"Speed", @"SlowFactor",
                           @"Spring", @"Extra", @"ListAccel", @"Blacklist",
                           @"FPSEnabled",
-                          @"HighFPSEnabled", @"HighFPSRate", @"HighFPSMetalTriple",
+                          @"HighFPSEnabled", @"HighFPSRate", @"HighFPSMetalTriple", @"HighFPSLock",
                           @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
                           @"FUBGFloatingBall", @"FUBGExcludeApps" ];
     for (NSString *k in sioKeys) {
@@ -227,7 +228,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UITextView *_blacklist;
     UILabel *_status;
     UISwitch *_swRM, *_swCF, *_swUIKit;
-    UISwitch *_swFPS, *_swHighFPS, *_swHighFPSMetal;
+    UISwitch *_swFPS, *_swHighFPS, *_swHighFPSMetal, *_swHighFPSLock;
     UISegmentedControl *_segHighFPSRate;
     UISwitch *_swFUBG, *_swFUBGScene, *_swFUBGAudio, *_swFUBGBall;
 }
@@ -259,7 +260,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.5.7 · 修复CAFrameRateRange致命ABI(float→CGFloat)" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.6.0 · 新增锁定最高帧率开关 · HUD精简" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -325,6 +326,10 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *lblHFPMetal = [self label:@"Metal 三缓冲（降延迟）" size:17 dim:NO];
     _swHighFPSMetal = [[UISwitch alloc] init];
     _swHighFPSMetal.on = [cfg[@"HighFPSMetalTriple"] boolValue];
+
+    UILabel *lblHFPLock = [self label:@"锁定最高帧率（不降帧·更耗电发热）" size:17 dim:NO];
+    _swHighFPSLock = [[UISwitch alloc] init];
+    _swHighFPSLock.on = [cfg[@"HighFPSLock"] boolValue];
 
     // === 真后台保活区块 ===
     UILabel *fubgTitle = [self label:@"真后台保活（FUBackground 引擎）" size:15 dim:YES];
@@ -406,6 +411,7 @@ static void WriteUIKitDrag(BOOL enabled) {
         [self row:lblHighFPS ctrl:_swHighFPS],
         [self row:lblHFPRate ctrl:_segHighFPSRate],
         [self row:lblHFPMetal ctrl:_swHighFPSMetal],
+        [self row:lblHFPLock ctrl:_swHighFPSLock],
         fubgTitle,
         [self row:lblFUBG ctrl:_swFUBG],
         [self row:lblFUBGScene ctrl:_swFUBGScene],
@@ -460,6 +466,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     NSArray *rates = @[@60, @90, @120];
     cfg[@"HighFPSRate"] = rates[(int)_segHighFPSRate.selectedSegmentIndex];
     cfg[@"HighFPSMetalTriple"] = @(_swHighFPSMetal.on);
+    cfg[@"HighFPSLock"] = @(_swHighFPSLock.on);
     // 真后台保活
     cfg[@"FUBGEnabled"] = @(_swFUBG.on);
     cfg[@"FUBGSceneFake"] = @(_swFUBGScene.on);

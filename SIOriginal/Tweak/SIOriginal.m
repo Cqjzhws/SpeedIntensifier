@@ -547,6 +547,7 @@ static void SIOriginalInit(void) {
 static BOOL      gHighFPSEnabled = YES;
 static NSInteger gHighFPSRate = 120;   // 用户选择 60/90/120
 static BOOL      gHighFPSMetal = YES;
+static BOOL      gHighFPSLock = NO;    // 锁定模式：minimum=preferred=maximum=target，全程不降帧
 
 // 全部 hook（含 Metal 渲染线程）只读以下主线程预计算的 volatile 缓存，零 UIKit/锁调用
 static volatile BOOL      gHFPActive   = YES;
@@ -597,6 +598,7 @@ static void HFP_reload(void) {
             if (gHighFPSRate <= 0) gHighFPSRate = 120;
         }
         if (d[@"HighFPSMetalTriple"]) gHighFPSMetal = [d[@"HighFPSMetalTriple"] boolValue];
+        if (d[@"HighFPSLock"]) gHighFPSLock = [d[@"HighFPSLock"] boolValue];
     }
     HFP_compute();
     gHFPActive = gHighFPSEnabled && !HFP_blocked();
@@ -622,13 +624,13 @@ static void hfp_setFI(id self, SEL _cmd, NSInteger interval) {
     if (!gHFPActive) { o_hfp_setFI(self, _cmd, interval); return; }
     o_hfp_setFI(self, _cmd, gHFPInterval);
     if ([self respondsToSelector:@selector(setPreferredFramesPerSecond:)])
-        o_hfp_setPFPS(self, _cmd, gHFPUseCustom ? gHFPTarget : 0);
+        o_hfp_setPFPS(self, _cmd, (gHFPUseCustom || gHighFPSLock) ? gHFPTarget : 0);
 }
-// setPreferredFramesPerSecond: → 非自定义时传 0（关键！0=不限制，用屏幕最大；硬传120会被钳）
+// setPreferredFramesPerSecond: → 默认传 0（交回屏幕最大值）；锁定模式显式传目标值钉死
 static void hfp_setPFPS(id self, SEL _cmd, NSInteger fps) {
     gDBGCallPFS++;
     if (!gHFPActive) { o_hfp_setPFPS(self, _cmd, fps); return; }
-    o_hfp_setPFPS(self, _cmd, gHFPUseCustom ? gHFPTarget : 0);
+    o_hfp_setPFPS(self, _cmd, (gHFPUseCustom || gHighFPSLock) ? gHFPTarget : 0);
 }
 // setPreferredFrameRateRange:（iOS 15+）
 // ★致命：CAFrameRateRange 真实 ABI 是 3 个 CGFloat（arm64=double/8字节，共24字节，走 d0-d2），
@@ -640,7 +642,9 @@ static void hfp_setPFRR(id self, SEL _cmd, HFPFrameRateRange r) {
     gDBGLastInMin = r.minimum; gDBGLastInMax = r.maximum; gDBGLastInPref = r.preferred;
     if (!gHFPActive) { o_hfp_setPFRR(self, _cmd, r); return; }
     HFPFrameRateRange nr;
-    nr.minimum = 30;                            // 允许 LTPO 静止降帧（与官方一致）
+    // 锁定模式：三个值全设成目标→系统全程钉死，不允许 LTPO 降帧（更耗电）
+    // 非锁定：minimum=30 允许静止降帧省电，需要时上探到目标
+    nr.minimum = gHighFPSLock ? (CGFloat)gHFPTarget : 30;
     nr.maximum = (CGFloat)gHFPTarget;
     nr.preferred = (CGFloat)gHFPTarget;
     o_hfp_setPFRR(self, _cmd, nr);
@@ -786,7 +790,6 @@ static NSString *const kHUDPosY = @"SIO_HUD_PosY";
 static SIOFPSContainerView *gHUDContainer = nil;
 static UIView            *gHUDChip    = nil;
 static UILabel           *gFPSLabel   = nil;
-static UILabel           *gDbgLabel   = nil;
 static CADisplayLink    *gFPSLink    = nil;
 static int              gFPSCount    = 0;
 static NSTimeInterval   gFPSLastTs   = 0;
@@ -844,7 +847,7 @@ static void FPS_attachIfNeeded(void) {
         c.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         c.userInteractionEnabled = YES;
 
-        UIView *chip = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 158, 34)];
+        UIView *chip = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 70, 26)];
         chip.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.62];
         chip.layer.cornerRadius = 8;
         chip.layer.borderWidth = 0.5;
@@ -852,26 +855,17 @@ static void FPS_attachIfNeeded(void) {
         chip.clipsToBounds = YES;
         chip.userInteractionEnabled = YES;
 
-        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(0, 2, 158, 18)];
-        label.font = [UIFont boldSystemFontOfSize:13];
+        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 70, 26)];
+        label.font = [UIFont boldSystemFontOfSize:14];
         label.textColor = [UIColor whiteColor];
         label.textAlignment = NSTextAlignmentCenter;
         label.text = @"-- Hz";
         [chip addSubview:label];
 
-        UILabel *dbg = [[UILabel alloc] initWithFrame:CGRectMake(2, 19, 154, 13)];
-        dbg.font = [UIFont monospacedSystemFontOfSize:8 weight:UIFontWeightRegular];
-        dbg.textColor = [UIColor colorWithWhite:0.8 alpha:0.95];
-        dbg.textAlignment = NSTextAlignmentCenter;
-        dbg.adjustsFontSizeToFitWidth = YES;
-        dbg.minimumScaleFactor = 0.5;
-        dbg.text = @"...";
-        [chip addSubview:dbg];
-
         double px = [[NSUserDefaults standardUserDefaults] doubleForKey:kHUDPosX];
         double py = [[NSUserDefaults standardUserDefaults] doubleForKey:kHUDPosY];
         chip.center = (px > 0 || py > 0) ? CGPointMake(px, py)
-                                          : CGPointMake(90, kw.bounds.size.height > 500 ? 90 : 46);
+                                          : CGPointMake(46, kw.bounds.size.height > 500 ? 86 : 44);
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
             initWithTarget:gFPSMonitor action:@selector(panHUD:)];
         [chip addGestureRecognizer:pan];
@@ -881,7 +875,6 @@ static void FPS_attachIfNeeded(void) {
         gHUDContainer = c;
         gHUDChip = chip;
         gFPSLabel = label;
-        gDbgLabel = dbg;
     }
     if (gHUDContainer.superview != kw) {
         [gHUDContainer removeFromSuperview];
@@ -913,18 +906,6 @@ static void FPS_attachIfNeeded(void) {
                 gFPSLabel.textColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.25 alpha:1.0];
             } else {
                 gFPSLabel.textColor = [UIColor colorWithRed:1.0 green:0.4 blue:0.4 alpha:1.0];
-            }
-            // 诊断小字：raw=系统屏幕最大；in=微信原始请求preferred(应≈60正常数,垃圾值=ABI错)；
-            // F=三个DisplayLink hook命中；M=两个Metal呈现hook命中；末两位=Drawable/CmdBuf是否装上
-            if (gDbgLabel) {
-                long fi = gDBGCallFI, pf = gDBGCallPFS, pr = gDBGCallPFR;
-                long pd = gDBGCallDur, cb = gDBGCallCmd;
-                if (fi > 999) fi = 999; if (pf > 999) pf = 999; if (pr > 999) pr = 999;
-                if (pd > 999) pd = 999; if (cb > 999) cb = 999;
-                gDbgLabel.text = [NSString stringWithFormat:
-                    @"raw%ld in%.0f F%ld/%ld/%ld M%ld/%ld %d%d",
-                    (long)gDBGScreenMaxRaw, gDBGLastInPref,
-                    fi, pf, pr, pd, cb, gDBGHookDrawable?1:0, gDBGHookCmdBuf?1:0];
             }
         });
     }
