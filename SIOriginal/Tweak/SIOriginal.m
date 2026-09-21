@@ -1,4 +1,4 @@
-﻿// SIOriginal — 原版重制
+// SIOriginal — 原版重制
 // 基于 pw5a29 Speed Intensifier 10.1-1 的机制还原（CAAnimation setDuration: 单基类 hook
 // + CASpring 参数缩放 + 慢放模式），针对 TrollStore / iOS 16 全新实现：
 //   · 无 CydiaSubstrate 依赖，纯 ObjC runtime swizzle（TrollFools 注入友好）
@@ -77,14 +77,12 @@ static void SIO_reload(void) {
     gBlacklist = [d[@"Blacklist"] componentsJoinedByString:@","];
 }
 
-static void HFP_reload(void);
 static void FPS_reload(void);
 
 static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
                                 CFNotificationName name, const void *object,
                                 CFDictionaryRef userInfo) {
     SIO_reload();
-    HFP_reload();
     FPS_reload();
 }
 
@@ -542,230 +540,6 @@ static void SIOriginalInit(void) {
     }
 }
 
-#pragma mark - HighFPS（1:1 移植 PoomSmart CAHighFPS 官方 Tweak.x，纯 runtime swizzle）
-
-static BOOL      gHighFPSEnabled = YES;
-static NSInteger gHighFPSRate = 120;   // 用户选择 60/90/120
-static BOOL      gHighFPSMetal = YES;
-static BOOL      gHighFPSLock = NO;    // 锁定模式：minimum=preferred=maximum=target，全程不降帧
-
-// 全部 hook（含 Metal 渲染线程）只读以下主线程预计算的 volatile 缓存，零 UIKit/锁调用
-static volatile BOOL      gHFPActive   = YES;
-static volatile NSInteger gHFPMax      = 120;  // 屏幕真实最大帧率
-static volatile NSInteger gHFPTarget   = 120;  // 实际目标
-static volatile BOOL      gHFPUseCustom= NO;   // 是否自定义（选择值 < 屏幕最大值）
-static volatile NSInteger gHFPInterval = 1;    // frameInterval = max/target
-static volatile double    gHFPDuration = 1.0/120.0; // Metal present 最小间隔
-
-// 诊断（HUD 第二行）：屏幕真实最大帧率 + 各 hook 安装/命中情况
-static volatile NSInteger gDBGScreenMaxRaw = 0;     // hook 前系统返回的 maximumFramesPerSecond
-static volatile long      gDBGCallFI  = 0;          // setFrameInterval: 被调次数
-static volatile long      gDBGCallPFS = 0;          // setPreferredFramesPerSecond:
-static volatile long      gDBGCallPFR = 0;          // setPreferredFrameRateRange:
-static volatile long      gDBGCallDur = 0;          // presentAfterMinimumDuration:
-static volatile long      gDBGCallCmd = 0;          // presentDrawable:afterMinimumDuration:
-static volatile BOOL      gDBGHookDrawable = NO;    // CAMetalDrawable hook 是否装上
-static volatile BOOL      gDBGHookCmdBuf   = NO;    // MTLCommandBuffer hook 是否装上
-static volatile BOOL      gDBGHookMaxFPS   = NO;    // UIScreen maximumFramesPerSecond 是否装上
-// 微信最近一次传给 setPreferredFrameRateRange 的原始值（确认 ABI 读取正确）
-static volatile double    gDBGLastInMin = 0, gDBGLastInMax = 0, gDBGLastInPref = 0;
-
-static BOOL HFP_blocked(void);  // 前向声明
-
-static void HFP_compute(void) {
-    NSInteger max = 120;
-    @try {
-        NSInteger real = [UIScreen mainScreen].maximumFramesPerSecond;
-        if (real >= 60) max = real;
-    } @catch (__unused NSException *e) {}
-    NSInteger cfg = gHighFPSRate > 0 ? gHighFPSRate : 120;
-    BOOL useCustom = (cfg > 0 && cfg < max);
-    NSInteger target = useCustom ? cfg : max;
-    NSInteger interval = (NSInteger)lround((double)max / (double)target);
-    gHFPMax = max;
-    gHFPTarget = target;
-    gHFPUseCustom = useCustom;
-    gHFPInterval = interval < 1 ? 1 : interval;
-    gHFPDuration = 1.0 / (double)target;
-}
-
-static void HFP_reload(void) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
-    if (d) {
-        if (d[@"HighFPSEnabled"]) gHighFPSEnabled = [d[@"HighFPSEnabled"] boolValue];
-        if (d[@"HighFPSRate"]) {
-            gHighFPSRate = [d[@"HighFPSRate"] integerValue];
-            if (gHighFPSRate <= 0) gHighFPSRate = 120;
-        }
-        if (d[@"HighFPSMetalTriple"]) gHighFPSMetal = [d[@"HighFPSMetalTriple"] boolValue];
-        if (d[@"HighFPSLock"]) gHighFPSLock = [d[@"HighFPSLock"] boolValue];
-    }
-    HFP_compute();
-    gHFPActive = gHighFPSEnabled && !HFP_blocked();
-}
-
-static BOOL HFP_blocked(void) {
-    if (!gSelfBundle) gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-    if ([gSelfBundle isEqualToString:@"com.apple.springboard"]) return YES;
-    if (gSelfBundle.length == 0 || !gBlacklist) return NO;
-    for (NSString *s in [gBlacklist componentsSeparatedByString:@","]) {
-        if ([gSelfBundle isEqualToString:[s stringByTrimmingCharactersInSet:
-                [NSCharacterSet whitespaceCharacterSet]]]) return YES;
-    }
-    return NO;
-}
-
-// ---------- CADisplayLink ----------
-// setFrameInterval: → max/target，并清 preferredFramesPerSecond=0（交回屏幕最大值）
-static void (*o_hfp_setFI)(id, SEL, NSInteger) = NULL;
-static void (*o_hfp_setPFPS)(id, SEL, NSInteger) = NULL;
-static void hfp_setFI(id self, SEL _cmd, NSInteger interval) {
-    gDBGCallFI++;
-    if (!gHFPActive) { o_hfp_setFI(self, _cmd, interval); return; }
-    o_hfp_setFI(self, _cmd, gHFPInterval);
-    if ([self respondsToSelector:@selector(setPreferredFramesPerSecond:)])
-        o_hfp_setPFPS(self, _cmd, (gHFPUseCustom || gHighFPSLock) ? gHFPTarget : 0);
-}
-// setPreferredFramesPerSecond: → 默认传 0（交回屏幕最大值）；锁定模式显式传目标值钉死
-static void hfp_setPFPS(id self, SEL _cmd, NSInteger fps) {
-    gDBGCallPFS++;
-    if (!gHFPActive) { o_hfp_setPFPS(self, _cmd, fps); return; }
-    o_hfp_setPFPS(self, _cmd, (gHFPUseCustom || gHighFPSLock) ? gHFPTarget : 0);
-}
-// setPreferredFrameRateRange:（iOS 15+）
-// ★致命：CAFrameRateRange 真实 ABI 是 3 个 CGFloat（arm64=double/8字节，共24字节，走 d0-d2），
-// 绝不能用 float（4字节/12字节走 s0-s2），否则传给系统原方法的是错位垃圾→永远回落 60Hz。
-typedef struct { CGFloat minimum; CGFloat maximum; CGFloat preferred; } HFPFrameRateRange;
-static void (*o_hfp_setPFRR)(id, SEL, HFPFrameRateRange) = NULL;
-static void hfp_setPFRR(id self, SEL _cmd, HFPFrameRateRange r) {
-    gDBGCallPFR++;
-    gDBGLastInMin = r.minimum; gDBGLastInMax = r.maximum; gDBGLastInPref = r.preferred;
-    if (!gHFPActive) { o_hfp_setPFRR(self, _cmd, r); return; }
-    HFPFrameRateRange nr;
-    // 锁定模式：三个值全设成目标→系统全程钉死，不允许 LTPO 降帧（更耗电）
-    // 非锁定：minimum=30 允许静止降帧省电，需要时上探到目标
-    nr.minimum = gHighFPSLock ? (CGFloat)gHFPTarget : 30;
-    nr.maximum = (CGFloat)gHFPTarget;
-    nr.preferred = (CGFloat)gHFPTarget;
-    o_hfp_setPFRR(self, _cmd, nr);
-}
-
-// ---------- UIScreen maximumFramesPerSecond（原版有，之前漏了）----------
-// iOS15.4+ 未声明 plist 键的 App 该接口可能只报 60，App/UIKit 据此设链，必须强制报目标值
-static NSInteger (*o_hfp_maxFPS)(id, SEL) = NULL;
-static NSInteger hfp_maxFPS(id self, SEL _cmd) {
-    NSInteger raw = o_hfp_maxFPS(self, _cmd);
-    if (raw > 0) gDBGScreenMaxRaw = raw;
-    if (!gHFPActive) return raw;
-    return gHFPUseCustom ? gHFPTarget : (raw > gHFPTarget ? raw : gHFPTarget);
-}
-
-// ---------- CAMetalLayer（原版只 hook setter → 2）----------
-static void (*o_hfp_mdcSetter)(id, SEL, NSUInteger) = NULL;
-static void hfp_mdcSetter(id self, SEL _cmd, NSUInteger c) {
-    if (gHFPActive && gHighFPSMetal) { o_hfp_mdcSetter(self, _cmd, 2); return; }
-    o_hfp_mdcSetter(self, _cmd, c);
-}
-
-// ---------- Metal 呈现节奏（微信/抖音等真正的 60Hz 锁点）----------
-// App 用 presentAfterMinimumDuration:1/60 主动把 Metal 帧呈现锁在 60，改成 1/target
-static void (*o_hfp_presentDur)(id, SEL, CFTimeInterval) = NULL;
-static void hfp_presentDur(id self, SEL _cmd, CFTimeInterval duration) {
-    gDBGCallDur++;
-    if (gHFPActive && gHighFPSMetal) { o_hfp_presentDur(self, _cmd, gHFPDuration); return; }
-    o_hfp_presentDur(self, _cmd, duration);
-}
-static void (*o_hfp_presentDrawableDur)(id, SEL, id, CFTimeInterval) = NULL;
-static void hfp_presentDrawableDur(id self, SEL _cmd, id drawable, CFTimeInterval duration) {
-    gDBGCallCmd++;
-    if (gHFPActive && gHighFPSMetal) { o_hfp_presentDrawableDur(self, _cmd, drawable, gHFPDuration); return; }
-    o_hfp_presentDrawableDur(self, _cmd, drawable, duration);
-}
-
-// 普通单类 hook（方法确定存在于该类时）
-static void HFP_hook(Class c, SEL sel, IMP newImp, IMP *out) {
-    if (!c) return;
-    Method m = class_getInstanceMethod(c, sel);
-    if (!m) return;
-    if (out) *out = method_getImplementation(m);
-    method_setImplementation(m, newImp);
-}
-
-// protocol 同名类不一定存在（MTLCommandBuffer 是协议）。遍历 classlist，
-// 对【所有】符合协议且实现了该方法的类挂钩（可能有 AGX/GPU 多个实现类），
-// 用 class_addMethod 兜底处理继承自基类的情况，确保命中真正被调用的实现。
-static void HFP_hookAllConforming(Protocol *proto, SEL sel, IMP newImp, IMP *out, volatile BOOL *flag) {
-    if (!proto) return;
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    for (unsigned int i = 0; i < count; i++) {
-        Class c = classes[i];
-        if (!c || !class_conformsToProtocol(c, proto)) continue;
-        Method m = class_getInstanceMethod(c, sel);
-        if (!m) continue;
-        IMP orig = method_getImplementation(m);
-        const char *types = method_getTypeEncoding(m);
-        // 若该类自身未实现（继承自基类），先在本类添加一份再替换，避免改动基类、且保证本类走新 IMP
-        BOOL added = class_addMethod(c, sel, newImp, types);
-        if (!added) {
-            method_setImplementation(m, newImp);  // 本类自有实现，直接替换
-        }
-        if (out && !*out) *out = orig;
-        if (flag) *flag = YES;
-    }
-    free(classes);
-}
-
-// MTLCommandBuffer 的实现类（AGXMetal 驱动）在 App 首次创建 MTLDevice 时才动态注册，
-// constructor 阶段往往还不存在，必须延迟重试，否则最关键的 presentDrawable hook 装不上。
-static void HFP_installMetalHooks(void) {
-    if (!gDBGHookDrawable) {
-        HFP_hookAllConforming(@protocol(CAMetalDrawable),
-            NSSelectorFromString(@"presentAfterMinimumDuration:"),
-            (IMP)hfp_presentDur, (IMP *)&o_hfp_presentDur, &gDBGHookDrawable);
-        // CAMetalDrawable 继承 MTLDrawable，某些版本实现类只声明 MTLDrawable
-        if (!gDBGHookDrawable)
-            HFP_hookAllConforming(@protocol(MTLDrawable),
-                NSSelectorFromString(@"presentAfterMinimumDuration:"),
-                (IMP)hfp_presentDur, (IMP *)&o_hfp_presentDur, &gDBGHookDrawable);
-    }
-    if (!gDBGHookCmdBuf) {
-        HFP_hookAllConforming(@protocol(MTLCommandBuffer),
-            NSSelectorFromString(@"presentDrawable:afterMinimumDuration:"),
-            (IMP)hfp_presentDrawableDur, (IMP *)&o_hfp_presentDrawableDur, &gDBGHookCmdBuf);
-    }
-}
-
-__attribute__((constructor))
-static void HighFPSInit(void) {
-    @autoreleasepool {
-        HFP_reload();
-        // constructor 可能早于 UIScreen 就绪，主线程 runloop 起来后再校正一次帧率缓存
-        dispatch_async(dispatch_get_main_queue(), ^{ HFP_compute(); });
-
-        Class scr = objc_getClass("UIScreen");
-        Method mm = class_getInstanceMethod(scr, @selector(maximumFramesPerSecond));
-        if (mm) { o_hfp_maxFPS = (typeof(o_hfp_maxFPS))method_getImplementation(mm);
-            method_setImplementation(mm, (IMP)hfp_maxFPS); gDBGHookMaxFPS = YES; }
-
-        Class dl = objc_getClass("CADisplayLink");
-        HFP_hook(dl, @selector(setFrameInterval:), (IMP)hfp_setFI, (IMP *)&o_hfp_setFI);
-        HFP_hook(dl, @selector(setPreferredFramesPerSecond:), (IMP)hfp_setPFPS, (IMP *)&o_hfp_setPFPS);
-        HFP_hook(dl, NSSelectorFromString(@"setPreferredFrameRateRange:"), (IMP)hfp_setPFRR, (IMP *)&o_hfp_setPFRR);
-
-        Class ml = objc_getClass("CAMetalLayer");
-        HFP_hook(ml, @selector(setMaximumDrawableCount:), (IMP)hfp_mdcSetter, (IMP *)&o_hfp_mdcSetter);
-
-        // Metal 驱动类懒加载：立即试一次，之后 0.8s / 2.5s / 6s 重试直到装上
-        HFP_installMetalHooks();
-        double delays[5] = {0.8, 2.5, 6.0, 12.0, 20.0};
-        for (int i = 0; i < 5; i++) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[i] * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ HFP_installMetalHooks(); });
-        }
-    }
-}
-
 #pragma mark - 实时 FPS HUD（挂在 keyWindow 上，点击穿透，可拖动）
 
 static NSString *const kHUDPosX = @"SIO_HUD_PosX";
@@ -899,8 +673,8 @@ static void FPS_attachIfNeeded(void) {
             FPS_attachIfNeeded();
             if (!gFPSEnabled || !gFPSLabel) return;
             gFPSLabel.text = [NSString stringWithFormat:@"%d Hz", gFPSCur];
-            // 颜色：达到目标帧率=绿，60 左右=橙，更低=红
-            if (gFPSCur >= gHFPTarget - 3) {
+            // 纯被动监测（高刷改由配置 App 的全局 PiP 悬浮窗负责）：120=绿，55~116=橙，更低=红
+            if (gFPSCur >= 117) {
                 gFPSLabel.textColor = [UIColor colorWithRed:0.35 green:1.0 blue:0.45 alpha:1.0];
             } else if (gFPSCur >= 55) {
                 gFPSLabel.textColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.25 alpha:1.0];
