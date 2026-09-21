@@ -17,6 +17,7 @@ jobs:
 
           $CC -arch arm64 -isysroot "$SDK" \
             -fobjc-arc -fmodules \
+            -I HeliumMax -I HeliumMax/HUD -I HeliumMax/App \
             -miphoneos-version-min=14.0 \
             -framework UIKit -framework Foundation -framework AVFoundation \
             -framework CoreTelephony -framework IOKit \

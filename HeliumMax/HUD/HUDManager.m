@@ -5,6 +5,7 @@
 #import "HUDManager.h"
 #import <AVFoundation/AVFoundation.h>
 #import <notify.h>
+#import <objc/runtime.h>
 
 #define kPrefPath  @"/var/Managed Preferences/mobile/com.local.heliummax.plist"
 #define kNotifyKey @"com.local.heliummax.reload"

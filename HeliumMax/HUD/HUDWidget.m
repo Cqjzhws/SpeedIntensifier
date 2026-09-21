@@ -5,6 +5,8 @@
 #import "HUDWidget.h"
 #import <ifaddrs.h>
 #import <net/if.h>
+#import <arpa/inet.h>
+#import <netinet/in.h>
 #import <sys/sysctl.h>
 #import <sys/statvfs.h>
 #import <mach/mach.h>
@@ -22,7 +24,7 @@ static NSTimeInterval prevSpeedTime = 0;
 #pragma mark - 电池信息
 static NSDictionary *getBatteryInfo(void) {
     CFDictionaryRef matching = IOServiceMatching("IOPMPowerSource");
-    io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault, matching);
+    io_service_t service = IOServiceGetMatchingService(0, matching);
     if (!service) return nil;
     CFMutableDictionaryRef prop = NULL;
     IORegistryEntryCreateCFProperties(service, &prop, NULL, 0);
