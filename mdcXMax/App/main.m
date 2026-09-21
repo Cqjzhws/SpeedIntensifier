@@ -43,8 +43,8 @@ static const char *P_avatar[]     = {"/System/Library/PrivateFrameworks/UserNoti
 static const char *P_folder[]     = {"/System/Library/PrivateFrameworks/SpringBoardHome.framework/folderDark.materialrecipe",
                                      "/System/Library/PrivateFrameworks/SpringBoardHome.framework/folderLight.materialrecipe"};
 static const char *P_overlay[]    = {"/System/Library/PrivateFrameworks/SpringBoardHome.framework/homeScreenOverlay.materialrecipe"};
-static const char *P_switcher[]   = {"/System/Library/PrivateFrameworks/SpringBoard.framework/homeScreenBackdrop-application.materialrecipe",
-                                     "/System/Library/PrivateFrameworks/SpringBoard.framework/homeScreenBackdrop-switcher.materialrecipe"};
+static const char *P_switcher[]   = {"/System/Library/PrivateFrameworks/SpringBoard.framework/homeScreenBackdrop-switcher.materialrecipe"};
+static const char *P_appBg[]      = {"/System/Library/PrivateFrameworks/SpringBoard.framework/homeScreenBackdrop-application.materialrecipe"};
 static const char *P_spotBlur[]   = {"/System/Library/PrivateFrameworks/SpringBoard.framework/spotlightBlurBackground.materialrecipe",
                                      "/System/Library/PrivateFrameworks/SpringBoard.framework/spotlightLumSatBackground.materialrecipe"};
 static const char *P_homeBar[]    = {"/System/Library/PrivateFrameworks/MaterialKit.framework/Assets.car"};
@@ -72,7 +72,8 @@ static const MdxTweak gTweaks[] = {
     {"界面元素", "透明 UI 元素", "通知/媒体播放器背景透明", 6, P_transUI},
     {"界面元素", "隐藏文件夹背景", "主屏文件夹背景透明", 2, P_folder},
     {"界面元素", "移除主屏编辑遮罩", "抖动模式变暗遮罩移除", 1, P_overlay},
-    {"界面元素", "移除多任务模糊", "App 切换器背景模糊移除", 2, P_switcher},
+    {"界面元素", "移除多任务模糊", "App 切换器背景模糊移除", 1, P_switcher},
+    {"界面元素", "App 背景透明", "App 切换器内应用卡片背景透明", 1, P_appBg},
     {"界面元素", "移除 Spotlight 模糊", "主屏搜索背景模糊移除", 2, P_spotBlur},
     {"界面元素", "隐藏 Home 条", "隐藏底部指示条", 1, P_homeBar},
     {"通知", "透明通知头像", "通知内 App 图标背景透明", 2, P_avatar},
@@ -170,6 +171,8 @@ static void SaveTweakState(NSString *name, NSString *state) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"mdcX Max";
+    self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeNever;
+    self.navigationController.navigationBar.prefersLargeTitles = NO;
     self.view.backgroundColor = [UIColor systemBackgroundColor];
     _log = [NSMutableArray array];
     _busy = [NSMutableSet set];
@@ -187,19 +190,29 @@ static void SaveTweakState(NSString *name, NSString *state) {
 
     _rootOK = RootAvailable();
 
-    // 引擎状态头
-    UIView *head = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 0, 108)];
-    _engineLabel = [[UILabel alloc] init];
-    _engineLabel.numberOfLines = 0;
-    _engineLabel.font = [UIFont systemFontOfSize:12];
-    _engineLabel.textColor = [UIColor secondaryLabelColor];
+    // 引擎状态头（Auto Layout，避免 viewDidLoad 时 bounds 未就绪导致错位）
     NSMutableString *e = [NSMutableString string];
     [e appendFormat:@"引擎A 零页漏洞：就绪（页大小 %dKB）\n", (int)(vm_page_size / 1024)];
     [e appendFormat:@"引擎B TrollStore 根权限：%@（无沙盒读写 + 根 respring）\n", _rootOK ? @"✅ 可用" : @"❌ 不可用"];
     [e appendFormat:@"系统版本：%@ · 共 %d 项 / 34 文件 · SSV 零页重启后还原", [UIDevice currentDevice].systemVersion, gTweakCount];
+
+    CGFloat availW = [UIScreen mainScreen].bounds.size.width - 32;
+    _engineLabel = [[UILabel alloc] init];
+    _engineLabel.numberOfLines = 0;
+    _engineLabel.font = [UIFont systemFontOfSize:13];
+    _engineLabel.textColor = [UIColor secondaryLabelColor];
     _engineLabel.text = e;
-    _engineLabel.frame = CGRectMake(20, 8, self.view.bounds.size.width - 40, 100);
+    CGSize sz = [_engineLabel sizeThatFits:CGSizeMake(availW, CGFLOAT_MAX)];
+    CGFloat headH = ceil(sz.height) + 20;
+    UIView *head = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 0, headH)];
+    _engineLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [head addSubview:_engineLabel];
+    [NSLayoutConstraint activateConstraints:@[
+        [_engineLabel.topAnchor constraintEqualToAnchor:head.topAnchor constant:10],
+        [_engineLabel.leadingAnchor constraintEqualToAnchor:head.leadingAnchor constant:16],
+        [_engineLabel.trailingAnchor constraintEqualToAnchor:head.trailingAnchor constant:-16],
+        [_engineLabel.bottomAnchor constraintLessThanOrEqualToAnchor:head.bottomAnchor constant:-10],
+    ]];
     self.tableView.tableHeaderView = head;
 
     // 底部日志
@@ -311,7 +324,7 @@ static void SaveTweakState(NSString *name, NSString *state) {
 
 // 核心：应用一个 tweak（零页 + 校验 + 持久化）
 - (void)applyIndex:(int)gi {
-    if (_allBusy || [_busy containsObject:@(gi)]) return;
+    if ([_busy containsObject:@(gi)]) return;
     const MdxTweak *t = &gTweaks[gi];
     NSString *name = [NSString stringWithUTF8String:t->name];
     [_busy addObject:@(gi)];
