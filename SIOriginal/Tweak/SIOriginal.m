@@ -546,10 +546,8 @@ static void SIOriginalInit(void) {
 static BOOL      gHighFPSEnabled = YES;
 static NSInteger gHighFPSRate = 120;
 static BOOL      gHighFPSMetal = YES;
-// 渲染线程专用缓存：minimumFrameDuration 在 QuartzCore 渲染线程每帧高频调用，
-// hook 内严禁任何 ObjC/锁/函数调用，只能读这两个在主线程 reload 时预计算好的值
+// 开关状态缓存：配置 reload 时在主线程预计算，hook 内只读，避免高频调用时做 ObjC 操作
 static volatile BOOL   gHFPActive = YES;   // enabled && !blocked
-static volatile double gHFPMinFD  = 1.0 / 120.0;
 
 static BOOL HFP_blocked(void);  // 前向声明
 
@@ -565,7 +563,6 @@ static void HFP_reload(void) {
         }
         if (d[@"HighFPSMetalTriple"]) gHighFPSMetal = [d[@"HighFPSMetalTriple"] boolValue];
     }
-    gHFPMinFD = 1.0 / (double)gHighFPSRate;
     gHFPActive = gHighFPSEnabled && !HFP_blocked();
 }
 
@@ -605,7 +602,9 @@ typedef struct { float minimum; float maximum; float preferred; } HFPFrameRateRa
 static void (*o_hfp_setPFRR)(id, SEL, HFPFrameRateRange) = NULL;
 static void hfp_setPFRR(id self, SEL _cmd, HFPFrameRateRange r) {
     if (!gHFPActive) { o_hfp_setPFRR(self, _cmd, r); return; }
-    HFPFrameRateRange nr; nr.minimum = 60; nr.maximum = gHighFPSRate; nr.preferred = gHighFPSRate;
+    // minimum=30：与 Duraid FrameRateRequest 一致，允许 LTPO 静止时降到 30，
+    // 系统调度器才会接受这个 range；maximum/preferred 给目标帧率
+    HFPFrameRateRange nr; nr.minimum = 30; nr.maximum = gHighFPSRate; nr.preferred = gHighFPSRate;
     o_hfp_setPFRR(self, _cmd, nr);
 }
 
@@ -616,60 +615,10 @@ static void hfp_setMDC(id self, SEL _cmd, NSUInteger c) {
     o_hfp_setMDC(self, _cmd, 3);
 }
 
-// ★ 真正的 60Hz 封顶执行点（iOS 15.4+，QuartzCore 渲染线程每帧调用）★
-// 未声明 CADisableMinimumFrameDurationOnPhone 的 App，这两个方法返回 1/60 秒，
-// QuartzCore 据此把帧间隔钳制在 16.67ms → 物理上永远 ≤60fps。
-// 返回 1/目标刷新率（120Hz=8.33ms）即可在进程内即时解锁，无需 plist/重启。
-// 致命细节：此函数运行在渲染线程且每帧调用，体内只能读 volatile 基本类型，
-// 禁止任何 ObjC 消息、锁、NSBundle、字符串操作，否则与启动流程死锁→App 卡死。
-static CFTimeInterval (*o_hfp_displayMinFD)(id, SEL) = NULL;
-static CFTimeInterval hfp_displayMinFD(id self, SEL _cmd) {
-    if (gHFPActive) return gHFPMinFD;
-    return o_hfp_displayMinFD(self, _cmd);
-}
-static CFTimeInterval (*o_hfp_linkMinFD)(id, SEL) = NULL;
-static CFTimeInterval hfp_linkMinFD(id self, SEL _cmd) {
-    if (gHFPActive) return gHFPMinFD;
-    return o_hfp_linkMinFD(self, _cmd);
-}
-
-// NSBundle Info.plist 键伪装（内存级，辅助路径；真正解锁靠 minimumFrameDuration hook）
-static id (*o_hfp_bundleObjForKey)(id, SEL, NSString *) = NULL;
-static id hfp_bundleObjForKey(id self, SEL _cmd, NSString *key) {
-    if (gHFPActive &&
-        [key isEqualToString:@"CADisableMinimumFrameDurationOnPhone"]) {
-        return @YES;
-    }
-    return o_hfp_bundleObjForKey(self, _cmd, key);
-}
-
-static NSDictionary *(*o_hfp_bundleInfoDict)(id, SEL) = NULL;
-static NSDictionary *hfp_bundleInfoDict(id self, SEL _cmd) {
-    NSDictionary *orig = o_hfp_bundleInfoDict(self, _cmd);
-    if (gHFPActive &&
-        ![orig[@"CADisableMinimumFrameDurationOnPhone"] boolValue]) {
-        NSMutableDictionary *m = [orig mutableCopy] ?: [NSMutableDictionary dictionary];
-        m[@"CADisableMinimumFrameDurationOnPhone"] = @YES;
-        return m;
-    }
-    return orig;
-}
-
 __attribute__((constructor))
 static void HighFPSInit(void) {
     @autoreleasepool {
         HFP_reload();
-
-        // 必须最先安装：系统在 UIKit/CoreAnimation 初始化早期读取该键
-        Class bundle = objc_getClass("NSBundle");
-        if (bundle) {
-            Method m1 = class_getInstanceMethod(bundle, @selector(objectForInfoDictionaryKey:));
-            if (m1) { o_hfp_bundleObjForKey = (typeof(o_hfp_bundleObjForKey))method_getImplementation(m1);
-                method_setImplementation(m1, (IMP)hfp_bundleObjForKey); }
-            Method m2 = class_getInstanceMethod(bundle, @selector(infoDictionary));
-            if (m2) { o_hfp_bundleInfoDict = (typeof(o_hfp_bundleInfoDict))method_getImplementation(m2);
-                method_setImplementation(m2, (IMP)hfp_bundleInfoDict); }
-        }
 
         Class screen = objc_getClass("UIScreen");
         if (screen) {
@@ -700,20 +649,6 @@ static void HighFPSInit(void) {
             Method m = class_getInstanceMethod(ml, @selector(setMaximumDrawableCount:));
             if (m) { o_hfp_setMDC = (typeof(o_hfp_setMDC))method_getImplementation(m);
                 class_replaceMethod(ml, @selector(setMaximumDrawableCount:), (IMP)hfp_setMDC, method_getTypeEncoding(m)); }
-        }
-
-        // ★ minimumFrameDuration 双 hook：iOS 15.4+ 的 60Hz 硬封顶（iOS 14 无此方法，自动跳过）
-        SEL sMinFD = sel_registerName("minimumFrameDuration");
-        Class cad = objc_getClass("CADisplay");
-        if (cad) {
-            Method m = class_getInstanceMethod(cad, sMinFD);
-            if (m) { o_hfp_displayMinFD = (typeof(o_hfp_displayMinFD))method_getImplementation(m);
-                class_replaceMethod(cad, sMinFD, (IMP)hfp_displayMinFD, method_getTypeEncoding(m)); }
-        }
-        if (dl) {
-            Method m = class_getInstanceMethod(dl, sMinFD);
-            if (m) { o_hfp_linkMinFD = (typeof(o_hfp_linkMinFD))method_getImplementation(m);
-                class_replaceMethod(dl, sMinFD, (IMP)hfp_linkMinFD, method_getTypeEncoding(m)); }
         }
     }
 }
