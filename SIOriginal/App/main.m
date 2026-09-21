@@ -4,12 +4,15 @@
 #import <spawn.h>
 #import <sys/wait.h>
 #import <sys/stat.h>
-#import <sys/reboot.h>
 #import <signal.h>
 #import <unistd.h>
 #import <stdlib.h>
 #import <string.h>
 #import <sys/sysctl.h>
+
+// iOS SDK 没有 sys/reboot.h，手动声明
+extern int reboot(int);
+#define RB_AUTOBOOT 0
 
 #ifndef POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE
 #define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE 1
