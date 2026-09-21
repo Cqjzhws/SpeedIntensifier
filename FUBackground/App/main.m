@@ -31,10 +31,9 @@ static int FBKillProcessNamed(const char *name) {
     return killed;
 }
 static void FBRespring(void) {
-    int k1 = FBKillProcessNamed("SpringBoard");
-    if (k1 > 0) return;
-    if (system("killall SpringBoard 2>/dev/null") == 0) return;
-    system("killall backboardd 2>/dev/null");
+    // 同 mobile uid 可 kill SpringBoard（SIFusion 已验证路径）；杀掉后 launchd 自动拉起
+    (void)FBKillProcessNamed("SpringBoard");
+    FBKillProcessNamed("backboardd");
 }
 
 #pragma mark ==================== 配置读写 ====================
