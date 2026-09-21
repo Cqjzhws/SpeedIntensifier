@@ -630,10 +630,51 @@ static NSDictionary *hfp_bundleInfoDict(id self, SEL _cmd) {
     return orig;
 }
 
+// 直接把 CADisableMinimumFrameDurationOnPhone=YES 写入目标 App 磁盘 Info.plist。
+// iOS 15.4+ 由 backboardd（系统进程）在 App 启动【前】读磁盘 plist 决定该进程帧率上限，
+// 进程内 hook NSBundle 无法影响系统进程的决策，必须落盘，下次冷启动生效。
+// TrollFools 注入的 TrollStore App：bundle 目录 mobile 可写且无完整签名校验，可安全改写。
+static void HFP_patchBundlePlist(void) {
+    if (!gHighFPSEnabled || HFP_blocked()) return;
+    @try {
+        NSString *plistPath = [[NSBundle mainBundle] pathForResource:@"Info" ofType:@"plist"];
+        if (!plistPath) return;
+        NSData *data = [NSData dataWithContentsOfFile:plistPath];
+        if (!data) return;
+        NSError *err = nil;
+        NSMutableDictionary *info = [NSPropertyListSerialization
+            propertyListWithData:data
+                         options:NSPropertyListMutableContainersAndLeaves
+                          format:NULL error:&err];
+        if (![info isKindOfClass:[NSDictionary class]]) return;
+        if ([info[@"CADisableMinimumFrameDurationOnPhone"] boolValue]) return;  // 已打补丁
+
+        info[@"CADisableMinimumFrameDurationOnPhone"] = @YES;
+        NSData *out = [NSPropertyListSerialization
+            dataWithPropertyList:info
+                          format:NSPropertyListBinaryFormat_v1_0
+                         options:0 error:&err];
+        if (!out) {
+            // 极少数原始 plist 是 XML，回退 XML 格式写
+            out = [NSPropertyListSerialization
+                dataWithPropertyList:info
+                              format:NSPropertyListXMLFormat_v1_0
+                             options:0 error:NULL];
+        }
+        BOOL ok = [out writeToFile:plistPath atomically:YES];
+        NSLog(@"[HFP] CADisableMinimumFrameDurationOnPhone patched=%@ path=%@",
+              ok ? @"YES" : @"NO", plistPath);
+    } @catch (__unused NSException *e) {}
+}
+
 __attribute__((constructor))
 static void HighFPSInit(void) {
     @autoreleasepool {
         HFP_reload();
+
+        // 落盘补丁（下次冷启动由 backboardd 读取，解锁 120Hz 上限）；
+        // 异步到主线程，避免 constructor 极早期 mainBundle 未就绪
+        dispatch_async(dispatch_get_main_queue(), ^{ HFP_patchBundlePlist(); });
 
         // 必须最先安装：系统在 UIKit/CoreAnimation 初始化早期读取该键
         Class bundle = objc_getClass("NSBundle");

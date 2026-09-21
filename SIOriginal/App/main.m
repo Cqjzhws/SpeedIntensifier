@@ -18,6 +18,12 @@ extern int posix_spawnattr_set_persona_np(const posix_spawnattr_t * __restrict, 
 extern int posix_spawnattr_set_persona_uid_np(const posix_spawnattr_t * __restrict, uid_t);
 extern int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t * __restrict, uid_t);
 
+// unistd.h 已声明 reboot()，补 RB_AUTOBOOT
+#ifndef RB_AUTOBOOT
+#define RB_AUTOBOOT 0
+#endif
+extern int reboot(int);
+
 static NSString * const PrefPath  = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
 static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 
@@ -57,6 +63,55 @@ static void SpawnRootNowait(NSString *path, NSArray *args) {
     argv[args.count + 1] = NULL;
     posix_spawn(&pid, path.fileSystemRepresentation, NULL, &attr, argv, environ);
     posix_spawnattr_destroy(&attr);
+}
+
+// 硬重启（移植自 SIFusion 已验证方案）：
+// ① root persona 拉起自身 --sio-reboot-helper，子进程进 UIKit 前直调 reboot()（最可靠）
+// ② /usr/sbin/reboot（iOS 15+ 路径）③ /sbin/reboot（旧路径）
+// ④ killall launchd ⑤ killall backboardd
+static NSString *SIOReboot(void) {
+    pid_t pid;
+
+    NSString *selfPath = [[NSBundle mainBundle] executablePath];
+    if (selfPath.length) {
+        posix_spawnattr_t attr0;
+        posix_spawnattr_init(&attr0);
+        posix_spawnattr_set_persona_np(&attr0, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+        posix_spawnattr_set_persona_uid_np(&attr0, 0);
+        posix_spawnattr_set_persona_gid_np(&attr0, 0);
+        char *a0[] = { (char *)[selfPath UTF8String], "--sio-reboot-helper", NULL };
+        int s0 = posix_spawn(&pid, [selfPath UTF8String], NULL, &attr0, a0, environ);
+        posix_spawnattr_destroy(&attr0);
+        if (s0 == 0) return @"root 助手 reboot()";
+    }
+
+    const char *paths[] = { "/usr/sbin/reboot", "/sbin/reboot" };
+    for (int i = 0; i < 2; i++) {
+        posix_spawnattr_t a;
+        posix_spawnattr_init(&a);
+        posix_spawnattr_set_persona_np(&a, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+        posix_spawnattr_set_persona_uid_np(&a, 0);
+        posix_spawnattr_set_persona_gid_np(&a, 0);
+        char *av[] = { (char *)paths[i], NULL };
+        int s = posix_spawn(&pid, paths[i], NULL, &a, av, environ);
+        posix_spawnattr_destroy(&a);
+        if (s == 0) return [NSString stringWithFormat:@"%s", paths[i]];
+    }
+
+    const char *kills[][3] = { {"/usr/bin/killall","-9","launchd"},
+                               {"/usr/bin/killall","-9","backboardd"} };
+    for (int i = 0; i < 2; i++) {
+        posix_spawnattr_t a;
+        posix_spawnattr_init(&a);
+        posix_spawnattr_set_persona_np(&a, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+        posix_spawnattr_set_persona_uid_np(&a, 0);
+        posix_spawnattr_set_persona_gid_np(&a, 0);
+        char *av[] = { (char *)kills[i][0], (char *)kills[i][1], (char *)kills[i][2], NULL };
+        int s = posix_spawn(&pid, kills[i][0], NULL, &a, av, environ);
+        posix_spawnattr_destroy(&a);
+        if (s == 0) return [NSString stringWithFormat:@"%s %s", kills[i][1], kills[i][2]];
+    }
+    return @"全部失败";
 }
 
 static void Respring(void) {
@@ -204,7 +259,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.4.4 · 解锁120Hz系统锁 + 修复硬重启" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.4.5 · 落盘解锁120Hz + SIFusion硬重启" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -462,11 +517,8 @@ static void WriteUIKitDrag(BOOL enabled) {
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [a addAction:[UIAlertAction actionWithTitle:@"重启" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *x) {
         [self onSave];
-        // 不依赖 UI 队列延迟，立即以 root persona 执行重启；
-        // /sbin/reboot 成功则系统立刻复位（永不返回），逐级 fallback
-        SpawnRootNowait(@"/sbin/reboot", @[]);
-        SpawnRootNowait(@"/bin/kill", @[@"-9", @"1"]);
-        SpawnRootNowait(@"/usr/bin/killall", @[@"-9", @"backboardd"]);
+        NSString *way = SIOReboot();
+        _status.text = [NSString stringWithFormat:@"重启触发：%@", way];
     }]];
     [self presentViewController:a animated:YES completion:nil];
 }
@@ -488,6 +540,21 @@ static void WriteUIKitDrag(BOOL enabled) {
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
+        // 硬重启助手：以 root persona 被拉起，进 UIKit 前直调 reboot()（最可靠路径）
+        if ([[NSProcessInfo processInfo].arguments containsObject:@"--sio-reboot-helper"]) {
+            reboot(RB_AUTOBOOT);
+            // 不返回；万一返回，killall launchd 兜底
+            pid_t pid;
+            posix_spawnattr_t attr;
+            posix_spawnattr_init(&attr);
+            posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+            posix_spawnattr_set_persona_uid_np(&attr, 0);
+            posix_spawnattr_set_persona_gid_np(&attr, 0);
+            char *a[] = { "/usr/bin/killall", "-9", "launchd", NULL };
+            posix_spawn(&pid, "/usr/bin/killall", NULL, &attr, a, environ);
+            posix_spawnattr_destroy(&attr);
+            return 0;
+        }
         return UIApplicationMain(argc, argv, nil, NSStringFromClass([SIOAppDelegate class]));
     }
 }
