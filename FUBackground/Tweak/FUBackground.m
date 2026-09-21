@@ -31,7 +31,7 @@ static BOOL    gActive = NO;             // 当前 App 是否参与保活
 static BOOL    gHasAudioMode = NO;       // Info.plist 是否声明了 audio 后台模式
 
 static AVAudioPlayer *gPlayer = nil;
-static UIBackgroundTaskIdentifier gTask = UIBackgroundTaskInvalid;
+static UIBackgroundTaskIdentifier gTask = 0;   // 0 = 未持有桥接任务（不用 UIBackgroundTaskInvalid 做文件级初始化，非编译期常量）
 static NSTimer *gWatchdog = nil;
 
 // ================================ 配置 ================================
@@ -121,12 +121,12 @@ static void _fbg_start(void) {
     @try {
         // 桥接宽限：给音频栈启动留时间；音频断言生效后不会被调用过期
         UIApplication *app = [UIApplication sharedApplication];
-        if (gTask == UIBackgroundTaskInvalid) {
+        if (gTask == 0) {
             gTask = [app beginBackgroundTaskWithName:@"fubg-bridge" expirationHandler:^{
                 NSLog(@"[FUBG] bridge task expired (audio assertion not granted)");
-                if (gTask != UIBackgroundTaskInvalid) {
+                if (gTask != 0) {
                     [app endBackgroundTask:gTask];
-                    gTask = UIBackgroundTaskInvalid;
+                    gTask = 0;
                 }
             }];
         }
@@ -146,9 +146,9 @@ static void _fbg_stop(void) {
                                       withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
                                             error:&e];
         UIApplication *app = [UIApplication sharedApplication];
-        if (gTask != UIBackgroundTaskInvalid) {
+        if (gTask != 0) {
             [app endBackgroundTask:gTask];
-            gTask = UIBackgroundTaskInvalid;
+            gTask = 0;
         }
         NSLog(@"[FUBG] keep-alive stopped");
     } @catch (__unused NSException *e) {}
