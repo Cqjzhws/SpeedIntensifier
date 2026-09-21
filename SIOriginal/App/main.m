@@ -94,6 +94,26 @@ static void WriteAx(NSString *key, BOOL val) {
     [d writeToFile:AxPath atomically:YES];
 }
 
+// ---- UIKit 全局动画系数（UIAnimationDragCoefficient，需重启目标 App / 注销） ----
+static NSString * const UIKitPath = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
+static BOOL ReadUIKitDrag(void) {
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:UIKitPath];
+    NSNumber *v = d[@"UIAnimationDragCoefficient"];
+    return v != nil;
+}
+static void WriteUIKitDrag(BOOL enabled) {
+    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:UIKitPath] mutableCopy];
+    if (!d) d = [NSMutableDictionary dictionary];
+    if (enabled) {
+        d[@"UIAnimationDragCoefficient"] = @0.0001;  // 全局 UIKit 动画近乎瞬切
+    } else {
+        [d removeObjectForKey:@"UIAnimationDragCoefficient"];
+    }
+    mkdir("/var/Managed Preferences", 0755);
+    mkdir("/var/Managed Preferences/mobile", 0755);
+    [d writeToFile:UIKitPath atomically:YES];
+}
+
 @interface SIOVC : UIViewController
 @end
 
@@ -104,7 +124,7 @@ static void WriteAx(NSString *key, BOOL val) {
     UILabel *_sliderLabel;
     UITextView *_blacklist;
     UILabel *_status;
-    UISwitch *_swRM, *_swCF;
+    UISwitch *_swRM, *_swCF, *_swUIKit;
 }
 
 - (UIStackView *)row:(UIView *)l ctrl:(UIView *)c {
@@ -176,6 +196,11 @@ static void WriteAx(NSString *key, BOOL val) {
     _swCF = [[UISwitch alloc] init];
     _swCF.on = ReadAx(@"PreferCrossFadeTransitions");
 
+    UILabel *uiKitTitle = [self label:@"UIKit 全局动画系数（写入 com.apple.UIKit，需注销/重启目标 App）" size:15 dim:YES];
+    UILabel *lblUIKit = [self label:@"全局动画近乎瞬切（0.0001）" size:17 dim:NO];
+    _swUIKit = [[UISwitch alloc] init];
+    _swUIKit.on = ReadUIKitDrag();
+
     UILabel *lblBL = [self label:@"黑名单（每行一个 Bundle ID）" size:15 dim:YES];
     _blacklist = [[UITextView alloc] init];
     _blacklist.font = [UIFont systemFontOfSize:14];
@@ -221,6 +246,8 @@ static void WriteAx(NSString *key, BOOL val) {
         axTitle,
         [self row:lblRM ctrl:_swRM],
         [self row:lblCF ctrl:_swCF],
+        uiKitTitle,
+        [self row:lblUIKit ctrl:_swUIKit],
         lblBL, _blacklist, save, rs, listHint, hint, _status
     ]];
     stack.axis = UILayoutConstraintAxisVertical;
@@ -275,14 +302,15 @@ static void WriteAx(NSString *key, BOOL val) {
     WriteConfig(cfg);
     WriteAx(@"ReduceMotionEnabled", _swRM.on);
     WriteAx(@"PreferCrossFadeTransitions", _swCF.on);
+    WriteUIKitDrag(_swUIKit.on);
     _status.text = [NSString stringWithFormat:@"已保存：%@ · %@ · 弹簧%@ · 转场%@ · 列表%@",
                     _swEnabled.on ? @"开" : @"关",
                     ModeText((int)_segMode.selectedSegmentIndex),
                     _swSpring.on ? @"开" : @"关",
                     _swExtra.on ? @"开" : @"关",
                     _swList.on ? @"开" : @"关"];
-    if (_swRM.on || _swCF.on) {
-        _status.text = [_status.text stringByAppendingString:@" · 系统动态效果已写入，需注销"];
+    if (_swRM.on || _swCF.on || _swUIKit.on) {
+        _status.text = [_status.text stringByAppendingString:@" · 系统级配置已写入，需注销/重启目标 App"];
     }
 }
 
