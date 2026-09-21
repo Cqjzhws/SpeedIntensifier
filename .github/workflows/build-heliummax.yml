@@ -4,18 +4,26 @@ on:
     tags: ['heliummax-v*']
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
       - name: Build
         run: |
+          set -e
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           CC=$(xcrun -sdk iphoneos -f clang)
           mkdir -p build/Payload/HeliumMax.app
 
-          $CC -arch arm64 -isysroot "$SDK" \
+          $CC -arch arm64 -O2 -isysroot "$SDK" \
             -fobjc-arc -fmodules \
             -I HeliumMax -I HeliumMax/HUD -I HeliumMax/App \
             -miphoneos-version-min=14.0 \
@@ -23,23 +31,18 @@ jobs:
             -framework CoreTelephony -framework IOKit \
             -framework CoreGraphics -framework QuartzCore \
             -o build/Payload/HeliumMax.app/HeliumMax \
-            HeliumMax/App/main.m HeliumMax/HUD/HUDWidget.m HeliumMax/HUD/HUDManager.m \
-            || exit 1
+            HeliumMax/App/main.m HeliumMax/HUD/HUDWidget.m HeliumMax/HUD/HUDManager.m
 
           cp HeliumMax/App/Info.plist build/Payload/HeliumMax.app/Info.plist
 
-          # entitlements
-          /usr/libexec/PlistBuddy -c "Delete :CFBundleInfoDictionaryVersion" build/Payload/HeliumMax.app/Info.plist 2>/dev/null || true
-          ldid -SHeliumMax/entitlements.plist build/Payload/HeliumMax.app/HeliumMax || \
-            ldid -S build/Payload/HeliumMax.app/HeliumMax
+          codesign --force --sign - --entitlements HeliumMax/entitlements.plist build/Payload/HeliumMax.app/HeliumMax
 
-          # verify arm64
           file build/Payload/HeliumMax.app/HeliumMax
-
-          cd build && zip -qr ../HeliumMax.ipa Payload && cd ..
+          (cd build && zip -qry ../HeliumMax.ipa Payload -x "*.DS_Store")
           mkdir -p artifacts
           cp HeliumMax.ipa artifacts/
-          ls -la artifacts/
+          ls -lh artifacts/
+
       - uses: actions/upload-artifact@v4
         with:
           name: HeliumMax-artifacts
