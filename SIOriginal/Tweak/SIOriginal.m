@@ -546,17 +546,27 @@ static void SIOriginalInit(void) {
 static BOOL      gHighFPSEnabled = YES;
 static NSInteger gHighFPSRate = 120;
 static BOOL      gHighFPSMetal = YES;
+// 渲染线程专用缓存：minimumFrameDuration 在 QuartzCore 渲染线程每帧高频调用，
+// hook 内严禁任何 ObjC/锁/函数调用，只能读这两个在主线程 reload 时预计算好的值
+static volatile BOOL   gHFPActive = YES;   // enabled && !blocked
+static volatile double gHFPMinFD  = 1.0 / 120.0;
+
+static BOOL HFP_blocked(void);  // 前向声明
 
 static void HFP_reload(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
-    if (!d) return;
-    // 键不存在时保持默认值（默认全开 120），避免 [nil boolValue]=NO 误关
-    if (d[@"HighFPSEnabled"]) gHighFPSEnabled = [d[@"HighFPSEnabled"] boolValue];
-    if (d[@"HighFPSRate"]) {
-        gHighFPSRate = [d[@"HighFPSRate"] integerValue];
-        if (gHighFPSRate <= 0) gHighFPSRate = 120;
+    // 注意：即使 d 为 nil（无配置文件）也要刷新 gHFPActive，默认全开
+    if (d) {
+        // 键不存在时保持默认值（默认全开 120），避免 [nil boolValue]=NO 误关
+        if (d[@"HighFPSEnabled"]) gHighFPSEnabled = [d[@"HighFPSEnabled"] boolValue];
+        if (d[@"HighFPSRate"]) {
+            gHighFPSRate = [d[@"HighFPSRate"] integerValue];
+            if (gHighFPSRate <= 0) gHighFPSRate = 120;
+        }
+        if (d[@"HighFPSMetalTriple"]) gHighFPSMetal = [d[@"HighFPSMetalTriple"] boolValue];
     }
-    if (d[@"HighFPSMetalTriple"]) gHighFPSMetal = [d[@"HighFPSMetalTriple"] boolValue];
+    gHFPMinFD = 1.0 / (double)gHighFPSRate;
+    gHFPActive = gHighFPSEnabled && !HFP_blocked();
 }
 
 static BOOL HFP_blocked(void) {
@@ -572,21 +582,21 @@ static BOOL HFP_blocked(void) {
 // UIScreen maximumFramesPerSecond
 static NSInteger (*o_hfp_maxFPS)(id, SEL) = NULL;
 static NSInteger hfp_maxFPS(id self, SEL _cmd) {
-    if (!gHighFPSEnabled || HFP_blocked()) return o_hfp_maxFPS(self, _cmd);
+    if (!gHFPActive) return o_hfp_maxFPS(self, _cmd);
     return gHighFPSRate;
 }
 
 // CADisplayLink setFrameInterval:
 static void (*o_hfp_setFI)(id, SEL, NSInteger) = NULL;
 static void hfp_setFI(id self, SEL _cmd, NSInteger i) {
-    if (!gHighFPSEnabled || HFP_blocked()) { o_hfp_setFI(self, _cmd, i); return; }
+    if (!gHFPActive) { o_hfp_setFI(self, _cmd, i); return; }
     o_hfp_setFI(self, _cmd, 1);
 }
 
 // CADisplayLink setPreferredFramesPerSecond:
 static void (*o_hfp_setPFPS)(id, SEL, NSInteger) = NULL;
 static void hfp_setPFPS(id self, SEL _cmd, NSInteger fps) {
-    if (!gHighFPSEnabled || HFP_blocked()) { o_hfp_setPFPS(self, _cmd, fps); return; }
+    if (!gHFPActive) { o_hfp_setPFPS(self, _cmd, fps); return; }
     o_hfp_setPFPS(self, _cmd, gHighFPSRate);
 }
 
@@ -594,7 +604,7 @@ static void hfp_setPFPS(id self, SEL _cmd, NSInteger fps) {
 typedef struct { float minimum; float maximum; float preferred; } HFPFrameRateRange;
 static void (*o_hfp_setPFRR)(id, SEL, HFPFrameRateRange) = NULL;
 static void hfp_setPFRR(id self, SEL _cmd, HFPFrameRateRange r) {
-    if (!gHighFPSEnabled || HFP_blocked()) { o_hfp_setPFRR(self, _cmd, r); return; }
+    if (!gHFPActive) { o_hfp_setPFRR(self, _cmd, r); return; }
     HFPFrameRateRange nr; nr.minimum = 60; nr.maximum = gHighFPSRate; nr.preferred = gHighFPSRate;
     o_hfp_setPFRR(self, _cmd, nr);
 }
@@ -602,33 +612,31 @@ static void hfp_setPFRR(id self, SEL _cmd, HFPFrameRateRange r) {
 // CAMetalLayer setMaximumDrawableCount:
 static void (*o_hfp_setMDC)(id, SEL, NSUInteger) = NULL;
 static void hfp_setMDC(id self, SEL _cmd, NSUInteger c) {
-    if (!gHighFPSEnabled || !gHighFPSMetal || HFP_blocked()) { o_hfp_setMDC(self, _cmd, c); return; }
+    if (!gHFPActive || !gHighFPSMetal) { o_hfp_setMDC(self, _cmd, c); return; }
     o_hfp_setMDC(self, _cmd, 3);
 }
 
-// ★ 真正的 60Hz 封顶执行点（iOS 15.4+，QuartzCore 每帧调度时调用，非启动期缓存）★
+// ★ 真正的 60Hz 封顶执行点（iOS 15.4+，QuartzCore 渲染线程每帧调用）★
 // 未声明 CADisableMinimumFrameDurationOnPhone 的 App，这两个方法返回 1/60 秒，
-// QuartzCore 据此把帧间隔钳制在 16.67ms → 物理上永远 ≤60fps，
-// 改 CADisplayLink 的 preferredRange 也会被这个下限拉回 60。
-// 直接把最小帧间隔改成 1/目标刷新率（120Hz=8.33ms）即可在进程内即时解锁，
-// 不依赖 backboardd 读磁盘 plist，无需重启。
+// QuartzCore 据此把帧间隔钳制在 16.67ms → 物理上永远 ≤60fps。
+// 返回 1/目标刷新率（120Hz=8.33ms）即可在进程内即时解锁，无需 plist/重启。
+// 致命细节：此函数运行在渲染线程且每帧调用，体内只能读 volatile 基本类型，
+// 禁止任何 ObjC 消息、锁、NSBundle、字符串操作，否则与启动流程死锁→App 卡死。
 static CFTimeInterval (*o_hfp_displayMinFD)(id, SEL) = NULL;
 static CFTimeInterval hfp_displayMinFD(id self, SEL _cmd) {
-    if (!gHighFPSEnabled || HFP_blocked()) return o_hfp_displayMinFD(self, _cmd);
-    return 1.0 / (CFTimeInterval)gHighFPSRate;
+    if (gHFPActive) return gHFPMinFD;
+    return o_hfp_displayMinFD(self, _cmd);
 }
 static CFTimeInterval (*o_hfp_linkMinFD)(id, SEL) = NULL;
 static CFTimeInterval hfp_linkMinFD(id self, SEL _cmd) {
-    if (!gHighFPSEnabled || HFP_blocked()) return o_hfp_linkMinFD(self, _cmd);
-    return 1.0 / (CFTimeInterval)gHighFPSRate;
+    if (gHFPActive) return gHFPMinFD;
+    return o_hfp_linkMinFD(self, _cmd);
 }
 
-// NSBundle Info.plist 键伪装：
-// iOS 15.4+ ProMotion 设备要求 App 声明 CADisableMinimumFrameDurationOnPhone=YES，
-// 否则系统合成器把 App 锁死在 60Hz，hook CADisplayLink 也无效。微信等 App 未声明。
+// NSBundle Info.plist 键伪装（内存级，辅助路径；真正解锁靠 minimumFrameDuration hook）
 static id (*o_hfp_bundleObjForKey)(id, SEL, NSString *) = NULL;
 static id hfp_bundleObjForKey(id self, SEL _cmd, NSString *key) {
-    if (gHighFPSEnabled && !HFP_blocked() &&
+    if (gHFPActive &&
         [key isEqualToString:@"CADisableMinimumFrameDurationOnPhone"]) {
         return @YES;
     }
@@ -638,7 +646,7 @@ static id hfp_bundleObjForKey(id self, SEL _cmd, NSString *key) {
 static NSDictionary *(*o_hfp_bundleInfoDict)(id, SEL) = NULL;
 static NSDictionary *hfp_bundleInfoDict(id self, SEL _cmd) {
     NSDictionary *orig = o_hfp_bundleInfoDict(self, _cmd);
-    if (gHighFPSEnabled && !HFP_blocked() &&
+    if (gHFPActive &&
         ![orig[@"CADisableMinimumFrameDurationOnPhone"] boolValue]) {
         NSMutableDictionary *m = [orig mutableCopy] ?: [NSMutableDictionary dictionary];
         m[@"CADisableMinimumFrameDurationOnPhone"] = @YES;
@@ -647,51 +655,10 @@ static NSDictionary *hfp_bundleInfoDict(id self, SEL _cmd) {
     return orig;
 }
 
-// 直接把 CADisableMinimumFrameDurationOnPhone=YES 写入目标 App 磁盘 Info.plist。
-// iOS 15.4+ 由 backboardd（系统进程）在 App 启动【前】读磁盘 plist 决定该进程帧率上限，
-// 进程内 hook NSBundle 无法影响系统进程的决策，必须落盘，下次冷启动生效。
-// TrollFools 注入的 TrollStore App：bundle 目录 mobile 可写且无完整签名校验，可安全改写。
-static void HFP_patchBundlePlist(void) {
-    if (!gHighFPSEnabled || HFP_blocked()) return;
-    @try {
-        NSString *plistPath = [[NSBundle mainBundle] pathForResource:@"Info" ofType:@"plist"];
-        if (!plistPath) return;
-        NSData *data = [NSData dataWithContentsOfFile:plistPath];
-        if (!data) return;
-        NSError *err = nil;
-        NSMutableDictionary *info = [NSPropertyListSerialization
-            propertyListWithData:data
-                         options:NSPropertyListMutableContainersAndLeaves
-                          format:NULL error:&err];
-        if (![info isKindOfClass:[NSDictionary class]]) return;
-        if ([info[@"CADisableMinimumFrameDurationOnPhone"] boolValue]) return;  // 已打补丁
-
-        info[@"CADisableMinimumFrameDurationOnPhone"] = @YES;
-        NSData *out = [NSPropertyListSerialization
-            dataWithPropertyList:info
-                          format:NSPropertyListBinaryFormat_v1_0
-                         options:0 error:&err];
-        if (!out) {
-            // 极少数原始 plist 是 XML，回退 XML 格式写
-            out = [NSPropertyListSerialization
-                dataWithPropertyList:info
-                              format:NSPropertyListXMLFormat_v1_0
-                             options:0 error:NULL];
-        }
-        BOOL ok = [out writeToFile:plistPath atomically:YES];
-        NSLog(@"[HFP] CADisableMinimumFrameDurationOnPhone patched=%@ path=%@",
-              ok ? @"YES" : @"NO", plistPath);
-    } @catch (__unused NSException *e) {}
-}
-
 __attribute__((constructor))
 static void HighFPSInit(void) {
     @autoreleasepool {
         HFP_reload();
-
-        // 落盘补丁（下次冷启动由 backboardd 读取，解锁 120Hz 上限）；
-        // 异步到主线程，避免 constructor 极早期 mainBundle 未就绪
-        dispatch_async(dispatch_get_main_queue(), ^{ HFP_patchBundlePlist(); });
 
         // 必须最先安装：系统在 UIKit/CoreAnimation 初始化早期读取该键
         Class bundle = objc_getClass("NSBundle");
@@ -751,62 +718,35 @@ static void HighFPSInit(void) {
     }
 }
 
-#pragma mark - 实时 FPS HUD（独立悬浮窗，可拖动，注入目标 App 后显示当前帧率）
+#pragma mark - 实时 FPS HUD（挂在 keyWindow 上，点击穿透，可拖动）
 
 static NSString *const kHUDPosX = @"SIO_HUD_PosX";
 static NSString *const kHUDPosY = @"SIO_HUD_PosY";
 
-// 只把触摸交给 HUD 标签，其余全部穿透给下层 App
-@interface SIOFPSHUDWindow : UIWindow
+// 全屏透明容器：只有点中标签区域才接收触摸，其余全部穿透给下层 App。
+// 绝不自建 UIWindow——早期无 scene 的 window 会与 App 主窗口竞争 key 状态导致卡死。
+@interface SIOFPSContainerView : UIView
+@property (nonatomic, weak) UILabel *fpsLabel;
 @end
-@implementation SIOFPSHUDWindow
-- (BOOL)canBecomeKey { return NO; }
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-    return (hit == self || hit == self.rootViewController.view) ? nil : hit;
+@implementation SIOFPSContainerView
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    if (!self.fpsLabel || self.fpsLabel.hidden) return NO;
+    CGRect hot = CGRectInset(self.fpsLabel.frame, -10, -10);  // 10pt 热区，方便拖动
+    return CGRectContainsPoint(hot, point);
 }
-@end
-
-@interface SIOFPSViewController : UIViewController
-@property (nonatomic, strong) UILabel *label;
-@end
-@implementation SIOFPSViewController
-- (void)loadView {
-    self.view = [[UIView alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    self.view.backgroundColor = [UIColor clearColor];
-    self.view.userInteractionEnabled = NO;
-}
-- (void)onPan:(UIPanGestureRecognizer *)g {
-    CGPoint t = [g translationInView:self.view];
-    CGPoint c = self.label.center;
-    c.x += t.x; c.y += t.y;
-    [g setTranslation:CGPointZero inView:self.view];
-    CGFloat hw = self.label.bounds.size.width / 2.0;
-    CGFloat hh = self.label.bounds.size.height / 2.0;
-    CGRect b = self.view.bounds;
-    c.x = MAX(hw, MIN(b.size.width - hw, c.x));
-    c.y = MAX(hh + 10, MIN(b.size.height - hh - 10, c.y));
-    self.label.center = c;
-    if (g.state == UIGestureRecognizerStateEnded ||
-        g.state == UIGestureRecognizerStateCancelled) {
-        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        [ud setDouble:c.x forKey:kHUDPosX];
-        [ud setDouble:c.y forKey:kHUDPosY];
-    }
-}
-- (BOOL)prefersStatusBarHidden { return YES; }
 @end
 
 @interface SIOFPSMonitor : NSObject
 @end
 
-static SIOFPSHUDWindow *gHUDWindow = nil;
+static SIOFPSContainerView *gHUDContainer = nil;
 static UILabel          *gFPSLabel   = nil;
 static CADisplayLink    *gFPSLink    = nil;
 static int              gFPSCount    = 0;
 static NSTimeInterval   gFPSLastTs   = 0;
 static BOOL             gFPSEnabled  = YES;
 static int              gFPSCur      = 0;
+static SIOFPSMonitor    *gFPSMonitor = nil;
 
 static void FPS_reload(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
@@ -814,48 +754,85 @@ static void FPS_reload(void) {
     if (d[@"FPSEnabled"]) gFPSEnabled = [d[@"FPSEnabled"] boolValue];
 }
 
-static void FPS_ensureHUD(void) {
-    if (gHUDWindow) return;
-    CGRect f = [UIScreen mainScreen].bounds;
-    SIOFPSHUDWindow *win = [[SIOFPSHUDWindow alloc] initWithFrame:f];
-    win.backgroundColor = [UIColor clearColor];
-    win.windowLevel = UIWindowLevelStatusBar + 100.0;
-    win.userInteractionEnabled = YES;
-    SIOFPSViewController *vc = [[SIOFPSViewController alloc] init];
-    win.rootViewController = vc;
-
-    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 66, 26)];
-    label.font = [UIFont boldSystemFontOfSize:13];
-    label.textColor = [UIColor whiteColor];
-    label.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
-    label.layer.cornerRadius = 7;
-    label.layer.borderWidth = 0.5;
-    label.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.25].CGColor;
-    label.clipsToBounds = YES;
-    label.textAlignment = NSTextAlignmentCenter;
-    label.userInteractionEnabled = YES;
-    label.text = @"-- Hz";
-
-    double px = [[NSUserDefaults standardUserDefaults] doubleForKey:kHUDPosX];
-    double py = [[NSUserDefaults standardUserDefaults] doubleForKey:kHUDPosY];
-    if (px > 0 || py > 0) {
-        label.center = CGPointMake(px, py);
-    } else {
-        label.center = CGPointMake(42, f.size.height > 500 ? 82 : 40);
+static UIWindow *FPS_keyWindow(void) {
+    UIWindow *kw = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (scene.activationState != UISceneActivationStateForegroundActive) continue;
+        UIWindowScene *ws = (UIWindowScene *)scene;
+        if (![ws isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ws.windows) if (w.isKeyWindow) { kw = w; break; }
+        if (kw) break;
     }
+    if (!kw) {
+        for (UIWindow *w in [UIApplication sharedApplication].windows)
+            if (w.isKeyWindow) { kw = w; break; }
+    }
+    return kw;
+}
 
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
-        initWithTarget:vc action:@selector(onPan:)];
-    [label addGestureRecognizer:pan];
+static void FPS_onPan(UIPanGestureRecognizer *g) {
+    UIView *v = g.view;
+    CGPoint t = [g translationInView:v.superview];
+    CGPoint c = v.center;
+    c.x += t.x; c.y += t.y;
+    [g setTranslation:CGPointZero inView:v.superview];
+    CGRect b = v.superview.bounds;
+    c.x = MAX(v.bounds.size.width/2.0,  MIN(b.size.width  - v.bounds.size.width/2.0,  c.x));
+    c.y = MAX(v.bounds.size.height/2.0 + 10, MIN(b.size.height - v.bounds.size.height/2.0 - 10, c.y));
+    v.center = c;
+    if (g.state == UIGestureRecognizerStateEnded ||
+        g.state == UIGestureRecognizerStateCancelled) {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        [ud setDouble:c.x forKey:kHUDPosX];
+        [ud setDouble:c.y forKey:kHUDPosY];
+    }
+}
 
-    vc.label = label;
-    [vc.view addSubview:label];
-    win.hidden = NO;
-    gHUDWindow = win;
-    gFPSLabel = label;
+// 只在 App 已运行、keyWindow 已存在后调用（首个 tick）
+static void FPS_attachIfNeeded(void) {
+    UIWindow *kw = FPS_keyWindow();
+    if (!kw) return;
+    if (!gHUDContainer) {
+        SIOFPSContainerView *c = [[SIOFPSContainerView alloc] initWithFrame:kw.bounds];
+        c.backgroundColor = [UIColor clearColor];
+        c.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        c.userInteractionEnabled = YES;
+
+        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 66, 26)];
+        label.font = [UIFont boldSystemFontOfSize:13];
+        label.textColor = [UIColor whiteColor];
+        label.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
+        label.layer.cornerRadius = 7;
+        label.layer.borderWidth = 0.5;
+        label.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.25].CGColor;
+        label.clipsToBounds = YES;
+        label.textAlignment = NSTextAlignmentCenter;
+        label.userInteractionEnabled = YES;
+        label.text = @"-- Hz";
+        double px = [[NSUserDefaults standardUserDefaults] doubleForKey:kHUDPosX];
+        double py = [[NSUserDefaults standardUserDefaults] doubleForKey:kHUDPosY];
+        label.center = (px > 0 || py > 0) ? CGPointMake(px, py)
+                                          : CGPointMake(42, kw.bounds.size.height > 500 ? 82 : 40);
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
+            initWithTarget:gFPSMonitor action:@selector(panHUD:)];
+        [label addGestureRecognizer:pan];
+
+        c.fpsLabel = label;
+        [c addSubview:label];
+        gHUDContainer = c;
+        gFPSLabel = label;
+    }
+    if (gHUDContainer.superview != kw) {
+        [gHUDContainer removeFromSuperview];
+        gHUDContainer.frame = kw.bounds;
+        [kw addSubview:gHUDContainer];
+    }
+    [kw bringSubviewToFront:gHUDContainer];
+    gHUDContainer.hidden = !gFPSEnabled;
 }
 
 @implementation SIOFPSMonitor
+- (void)panHUD:(UIPanGestureRecognizer *)g { FPS_onPan(g); }
 - (void)tick:(CADisplayLink *)link {
     if (gFPSLastTs == 0) { gFPSLastTs = link.timestamp; return; }
     gFPSCount++;
@@ -865,9 +842,8 @@ static void FPS_ensureHUD(void) {
         gFPSCount = 0;
         gFPSLastTs = link.timestamp;
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (!gFPSEnabled) { gHUDWindow.hidden = YES; return; }
-            FPS_ensureHUD();
-            gHUDWindow.hidden = NO;
+            FPS_attachIfNeeded();
+            if (!gFPSEnabled || !gFPSLabel) return;
             gFPSLabel.text = [NSString stringWithFormat:@"%d Hz", gFPSCur];
             // 颜色：达到目标帧率=绿，60 左右=橙，更低=红
             if (gFPSCur >= gHighFPSRate - 3) {
@@ -886,15 +862,10 @@ __attribute__((constructor))
 static void SIOFPSHUDInit(void) {
     @autoreleasepool {
         FPS_reload();
-        SIOFPSMonitor *m = [[SIOFPSMonitor alloc] init];
-        objc_setAssociatedObject([UIApplication class], @selector(init), m, OBJC_ASSOCIATION_RETAIN);
-        // 主线程创建 window，并把测量 displaylink 加入 common modes
-        dispatch_async(dispatch_get_main_queue(), ^{
-            FPS_ensureHUD();
-            gHUDWindow.hidden = !gFPSEnabled;
-            gFPSLink = [CADisplayLink displayLinkWithTarget:m selector:@selector(tick:)];
-            [gFPSLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-        });
+        gFPSMonitor = [[SIOFPSMonitor alloc] init];
+        // 只建 displaylink，不碰任何 UI/window；UI 在首个 tick（App 已运行）后惰性创建
+        gFPSLink = [CADisplayLink displayLinkWithTarget:gFPSMonitor selector:@selector(tick:)];
+        [gFPSLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     }
 }
 
