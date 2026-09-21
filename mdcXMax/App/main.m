@@ -345,8 +345,8 @@ static void SaveTweakState(NSString *name, NSString *state) {
         }
         SaveTweakState(name, [NSString stringWithFormat:@"%@ %@", state,
                              [NSDateFormatter localizedStringFromDate:[NSDate date]
-                                                           dateStyle:NSDateFormatterShortDate
-                                                           timeStyle:NSDateFormatterShortTime]]);
+                                                           dateStyle:NSDateFormatterShortStyle
+                                                           timeStyle:NSDateFormatterShortStyle]]);
         dispatch_async(dispatch_get_main_queue(), ^{
             _status[gi] = status;
             [_busy removeObject:@(gi)];
