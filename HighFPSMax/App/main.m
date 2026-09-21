@@ -3,6 +3,7 @@
 //
 #import <UIKit/UIKit.h>
 #import <spawn.h>
+#import <notify.h>
 #import <sys/wait.h>
 #import <sys/stat.h>
 #import <sys/sysctl.h>
