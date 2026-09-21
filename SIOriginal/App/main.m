@@ -259,7 +259,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.5.6 · 1:1复刻原版hook+诊断行(看raw/M/末两位)" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.5.7 · 修复CAFrameRateRange致命ABI(float→CGFloat)" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];

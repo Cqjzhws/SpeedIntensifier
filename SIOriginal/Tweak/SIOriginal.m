@@ -566,6 +566,8 @@ static volatile long      gDBGCallCmd = 0;          // presentDrawable:afterMini
 static volatile BOOL      gDBGHookDrawable = NO;    // CAMetalDrawable hook 是否装上
 static volatile BOOL      gDBGHookCmdBuf   = NO;    // MTLCommandBuffer hook 是否装上
 static volatile BOOL      gDBGHookMaxFPS   = NO;    // UIScreen maximumFramesPerSecond 是否装上
+// 微信最近一次传给 setPreferredFrameRateRange 的原始值（确认 ABI 读取正确）
+static volatile double    gDBGLastInMin = 0, gDBGLastInMax = 0, gDBGLastInPref = 0;
 
 static BOOL HFP_blocked(void);  // 前向声明
 
@@ -628,16 +630,19 @@ static void hfp_setPFPS(id self, SEL _cmd, NSInteger fps) {
     if (!gHFPActive) { o_hfp_setPFPS(self, _cmd, fps); return; }
     o_hfp_setPFPS(self, _cmd, gHFPUseCustom ? gHFPTarget : 0);
 }
-// setPreferredFrameRateRange:（iOS 15+，真实 ABI: {float minimum, maximum, preferred}）
-typedef struct { float minimum; float maximum; float preferred; } HFPFrameRateRange;
+// setPreferredFrameRateRange:（iOS 15+）
+// ★致命：CAFrameRateRange 真实 ABI 是 3 个 CGFloat（arm64=double/8字节，共24字节，走 d0-d2），
+// 绝不能用 float（4字节/12字节走 s0-s2），否则传给系统原方法的是错位垃圾→永远回落 60Hz。
+typedef struct { CGFloat minimum; CGFloat maximum; CGFloat preferred; } HFPFrameRateRange;
 static void (*o_hfp_setPFRR)(id, SEL, HFPFrameRateRange) = NULL;
 static void hfp_setPFRR(id self, SEL _cmd, HFPFrameRateRange r) {
     gDBGCallPFR++;
+    gDBGLastInMin = r.minimum; gDBGLastInMax = r.maximum; gDBGLastInPref = r.preferred;
     if (!gHFPActive) { o_hfp_setPFRR(self, _cmd, r); return; }
     HFPFrameRateRange nr;
-    nr.minimum = 30;                       // 允许 LTPO 静止降帧
-    nr.maximum = (float)gHFPTarget;
-    nr.preferred = (float)gHFPTarget;
+    nr.minimum = 30;                            // 允许 LTPO 静止降帧（与官方一致）
+    nr.maximum = (CGFloat)gHFPTarget;
+    nr.preferred = (CGFloat)gHFPTarget;
     o_hfp_setPFRR(self, _cmd, nr);
 }
 
@@ -909,17 +914,16 @@ static void FPS_attachIfNeeded(void) {
             } else {
                 gFPSLabel.textColor = [UIColor colorWithRed:1.0 green:0.4 blue:0.4 alpha:1.0];
             }
-            // 诊断小字：raw=系统原始屏幕最大；FI/PF/PR=三个DisplayLink hook命中数；
-            // pd/cb=两个Metal呈现hook命中数；末两位=Drawable/CommandBuffer hook是否已安装
+            // 诊断小字：raw=系统屏幕最大；in=微信原始请求preferred(应≈60正常数,垃圾值=ABI错)；
+            // F=三个DisplayLink hook命中；M=两个Metal呈现hook命中；末两位=Drawable/CmdBuf是否装上
             if (gDbgLabel) {
                 long fi = gDBGCallFI, pf = gDBGCallPFS, pr = gDBGCallPFR;
                 long pd = gDBGCallDur, cb = gDBGCallCmd;
-                // 计数封顶显示，避免字符串变长
                 if (fi > 999) fi = 999; if (pf > 999) pf = 999; if (pr > 999) pr = 999;
                 if (pd > 999) pd = 999; if (cb > 999) cb = 999;
                 gDbgLabel.text = [NSString stringWithFormat:
-                    @"raw%ld t%ld %@ F%ld/%ld/%ld M%ld/%ld %d%d",
-                    (long)gDBGScreenMaxRaw, (long)gHFPTarget, gHFPActive?@"on":@"off",
+                    @"raw%ld in%.0f F%ld/%ld/%ld M%ld/%ld %d%d",
+                    (long)gDBGScreenMaxRaw, gDBGLastInPref,
                     fi, pf, pr, pd, cb, gDBGHookDrawable?1:0, gDBGHookCmdBuf?1:0];
             }
         });
