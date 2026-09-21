@@ -1,0 +1,90 @@
+name: Build FUBackground (dylib + IPA)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'fubg-v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build FUBackground dylib + IPA
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      # ① dylib — 真后台保活（静音音频断言），TrollFools 注入
+      - name: Build dylib (pure clang)
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          mkdir -p artifacts
+          clang -arch arm64 -dynamiclib -O2 \
+            -install_name @rpath/FUBackground.dylib \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -undefined dynamic_lookup -fobjc-arc \
+            -framework Foundation -framework UIKit -framework AVFoundation -framework AudioToolbox \
+            -o artifacts/FUBackground.dylib FUBackground/Tweak/FUBackground.m
+          codesign --force --sign - artifacts/FUBackground.dylib
+          lipo -info artifacts/FUBackground.dylib
+          file artifacts/FUBackground.dylib
+
+      # ② 配置 App IPA
+      - name: Build app & IPA
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          APP="build/FUBackground.app"
+          rm -rf build
+          mkdir -p "$APP"
+
+          clang -arch arm64 -O2 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -framework Foundation -framework UIKit \
+            -o "$APP/FUBackground" FUBackground/App/main.m
+
+          cp FUBackground/App/Info.plist "$APP/Info.plist"
+          cp FUBackground/App/AppIcon.png "$APP/AppIcon.png"
+          for f in FUBackground/App/Icon-*.png; do cp "$f" "$APP/$(basename $f)"; done
+          codesign --force --sign - --entitlements FUBackground/entitlements.plist "$APP"
+
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/FUBackground.app
+          ( cd build && zip -qry ../artifacts/FUBackground.ipa Payload -x "*.DS_Store" )
+          echo "IPA size: $(du -h artifacts/FUBackground.ipa | cut -f1)"
+
+      - name: Verify artifacts
+        run: |
+          set -e
+          ls -lh artifacts/
+          file artifacts/FUBackground.dylib
+          unzip -l artifacts/FUBackground.ipa
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FUBackground-artifacts
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/fubg-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: FUBackground ${{ github.ref_name }}
+          files: |
+            artifacts/FUBackground.dylib
+            artifacts/FUBackground.ipa
+          generate_release_notes: true
