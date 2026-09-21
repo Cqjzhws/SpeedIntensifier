@@ -12,8 +12,8 @@
 #import <objc/runtime.h>
 #import <pthread.h>
 
-#define kPrefDomain  @"com.local.sioriginal"
-#define kPrefPath    @"/var/Managed Preferences/mobile/com.local.sioriginal.plist"
+#define kPrefDomain  @"com.apple.UIKit"
+#define kPrefPath    @"/var/Managed Preferences/mobile/com.apple.UIKit.plist"
 #define kNotifyName  @"com.local.sioriginal.settingschanged"
 
 // ---------- 配置 ----------

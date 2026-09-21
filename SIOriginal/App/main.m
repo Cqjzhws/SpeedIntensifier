@@ -18,7 +18,7 @@ extern int posix_spawnattr_set_persona_np(const posix_spawnattr_t * __restrict, 
 extern int posix_spawnattr_set_persona_uid_np(const posix_spawnattr_t * __restrict, uid_t);
 extern int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t * __restrict, uid_t);
 
-static NSString * const PrefPath  = @"/var/Managed Preferences/mobile/com.local.sioriginal.plist";
+static NSString * const PrefPath  = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
 static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 
 static void SpawnRoot(NSString *path, NSArray *args) {
@@ -72,7 +72,15 @@ static NSMutableDictionary *ReadConfig(void) {
 static void WriteConfig(NSMutableDictionary *cfg) {
     mkdir("/var/Managed Preferences", 0755);
     mkdir("/var/Managed Preferences/mobile", 0755);
-    [cfg writeToFile:PrefPath atomically:YES];
+    // 合并写入：保留 com.apple.UIKit.plist 原有系统键（如 UIAnimationDragCoefficient）
+    NSMutableDictionary *merged = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
+    if (!merged) merged = [NSMutableDictionary dictionary];
+    NSArray *sioKeys = @[ @"Enabled", @"Mode", @"Speed", @"SlowFactor",
+                          @"Spring", @"Extra", @"ListAccel", @"Blacklist" ];
+    for (NSString *k in sioKeys) {
+        if (cfg[k]) merged[k] = cfg[k];
+    }
+    [merged writeToFile:PrefPath atomically:YES];
     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                          (__bridge CFStringRef)NotifyKey, NULL, NULL, YES);
 }
