@@ -53,7 +53,7 @@ jobs:
             -miphoneos-version-min=14.0 \
             -fobjc-arc \
             -framework Foundation -framework UIKit \
-            -framework AVKit -framework AVFoundation \
+            -framework AVKit -framework AVFoundation -framework QuartzCore \
             -o "$APP/SIOriginal" SIOriginal/App/main.m
 
           cp SIOriginal/App/Info.plist "$APP/Info.plist"
