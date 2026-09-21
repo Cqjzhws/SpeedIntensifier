@@ -4,6 +4,7 @@
 #import <spawn.h>
 #import <sys/wait.h>
 #import <sys/stat.h>
+#import <sys/reboot.h>
 #import <signal.h>
 #import <unistd.h>
 #import <stdlib.h>
@@ -33,8 +34,12 @@ static void SpawnRoot(NSString *path, NSArray *args) {
     for (NSUInteger i = 0; i < args.count; i++)
         argv[i + 1] = (char *)[args[i] UTF8String];
     argv[args.count + 1] = NULL;
-    posix_spawn(&pid, path.fileSystemRepresentation, NULL, &attr, argv, environ);
+    int rc = posix_spawn(&pid, path.fileSystemRepresentation, NULL, &attr, argv, environ);
     posix_spawnattr_destroy(&attr);
+    if (rc == 0 && pid > 0) {
+        int status;
+        waitpid(pid, &status, 0);
+    }
 }
 
 static void Respring(void) {
@@ -136,6 +141,9 @@ static void WriteUIKitDrag(BOOL enabled) {
     UITextView *_blacklist;
     UILabel *_status;
     UISwitch *_swRM, *_swCF, *_swUIKit;
+    UISwitch *_swFPS, *_swHighFPS, *_swHighFPSMetal;
+    UISegmentedControl *_segHighFPSRate;
+    UISwitch *_swFUBG, *_swFUBGScene, *_swFUBGAudio, *_swFUBGBall;
 }
 
 - (UIStackView *)row:(UIView *)l ctrl:(UIView *)c {
@@ -165,7 +173,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.2.3 · 41 Hooks · 默认瞬切 0.01s" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.4.0 · 动画加速 + 高刷 + 实时FPS + 真后台保活" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -211,6 +219,45 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *lblUIKit = [self label:@"全局动画近乎瞬切（0.0001）" size:17 dim:NO];
     _swUIKit = [[UISwitch alloc] init];
     _swUIKit.on = ReadUIKitDrag();
+
+    // === 高刷 / FPS 区块 ===
+    UILabel *hfpTitle = [self label:@"高刷新率 + 实时帧率显示" size:15 dim:YES];
+
+    UILabel *lblFPS = [self label:@"目标 App 显示实时帧率 HUD" size:17 dim:NO];
+    _swFPS = [[UISwitch alloc] init];
+    _swFPS.on = [cfg[@"FPSEnabled"] boolValue];
+
+    UILabel *lblHighFPS = [self label:@"强制高刷新率（需 ProMotion 屏）" size:17 dim:NO];
+    _swHighFPS = [[UISwitch alloc] init];
+    _swHighFPS.on = [cfg[@"HighFPSEnabled"] boolValue];
+
+    UILabel *lblHFPRate = [self label:@"目标刷新率" size:17 dim:NO];
+    _segHighFPSRate = [[UISegmentedControl alloc] initWithItems:@[ @"60", @"90", @"120" ]];
+    NSInteger hr = [cfg[@"HighFPSRate"] integerValue];
+    _segHighFPSRate.selectedSegmentIndex = (hr >= 120) ? 2 : (hr >= 90 ? 1 : 0);
+
+    UILabel *lblHFPMetal = [self label:@"Metal 三缓冲（降延迟）" size:17 dim:NO];
+    _swHighFPSMetal = [[UISwitch alloc] init];
+    _swHighFPSMetal.on = [cfg[@"HighFPSMetalTriple"] boolValue];
+
+    // === 真后台保活区块 ===
+    UILabel *fubgTitle = [self label:@"真后台保活（FUBackground 引擎）" size:15 dim:YES];
+
+    UILabel *lblFUBG = [self label:@"启用真后台保活" size:17 dim:NO];
+    _swFUBG = [[UISwitch alloc] init];
+    _swFUBG.on = [cfg[@"FUBGEnabled"] boolValue];
+
+    UILabel *lblFUBGScene = [self label:@"场景伪装引擎（推荐）" size:17 dim:NO];
+    _swFUBGScene = [[UISwitch alloc] init];
+    _swFUBGScene.on = [cfg[@"FUBGSceneFake"] boolValue];
+
+    UILabel *lblFUBGAudio = [self label:@"音频断言兜底（静音白噪）" size:17 dim:NO];
+    _swFUBGAudio = [[UISwitch alloc] init];
+    _swFUBGAudio.on = [cfg[@"FUBGAudioKeep"] boolValue];
+
+    UILabel *lblFUBGBall = [self label:@"注入 App 悬浮球开关" size:17 dim:NO];
+    _swFUBGBall = [[UISwitch alloc] init];
+    _swFUBGBall.on = [cfg[@"FUBGFloatingBall"] boolValue];
 
     UILabel *lblBL = [self label:@"黑名单（每行一个 Bundle ID）" size:15 dim:YES];
     _blacklist = [[UITextView alloc] init];
@@ -268,6 +315,16 @@ static void WriteUIKitDrag(BOOL enabled) {
         [self row:lblCF ctrl:_swCF],
         uiKitTitle,
         [self row:lblUIKit ctrl:_swUIKit],
+        hfpTitle,
+        [self row:lblFPS ctrl:_swFPS],
+        [self row:lblHighFPS ctrl:_swHighFPS],
+        [self row:lblHFPRate ctrl:_segHighFPSRate],
+        [self row:lblHFPMetal ctrl:_swHighFPSMetal],
+        fubgTitle,
+        [self row:lblFUBG ctrl:_swFUBG],
+        [self row:lblFUBGScene ctrl:_swFUBGScene],
+        [self row:lblFUBGAudio ctrl:_swFUBGAudio],
+        [self row:lblFUBGBall ctrl:_swFUBGBall],
         lblBL, _blacklist, save, rs, rb, listHint, hint, _status
     ]];
     stack.axis = UILayoutConstraintAxisVertical;
@@ -311,6 +368,17 @@ static void WriteUIKitDrag(BOOL enabled) {
     cfg[@"Spring"] = @(_swSpring.on);
     cfg[@"Extra"] = @(_swExtra.on);
     cfg[@"ListAccel"] = @(_swList.on);
+    // 高刷 / FPS
+    cfg[@"FPSEnabled"] = @(_swFPS.on);
+    cfg[@"HighFPSEnabled"] = @(_swHighFPS.on);
+    NSArray *rates = @[@60, @90, @120];
+    cfg[@"HighFPSRate"] = rates[(int)_segHighFPSRate.selectedSegmentIndex];
+    cfg[@"HighFPSMetalTriple"] = @(_swHighFPSMetal.on);
+    // 真后台保活
+    cfg[@"FUBGEnabled"] = @(_swFUBG.on);
+    cfg[@"FUBGSceneFake"] = @(_swFUBGScene.on);
+    cfg[@"FUBGAudioKeep"] = @(_swFUBGAudio.on);
+    cfg[@"FUBGFloatingBall"] = @(_swFUBGBall.on);
     NSMutableArray *bl = [NSMutableArray array];
     for (NSString *line in [_blacklist.text componentsSeparatedByCharactersInSet:
             [NSCharacterSet newlineCharacterSet]]) {
@@ -365,7 +433,16 @@ static void WriteUIKitDrag(BOOL enabled) {
         [self onSave];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            SpawnRoot(@"/sbin/reboot", @[]);
+            // 方案1：reboot(2) 系统调用（需 root）
+            int rc = reboot(RB_AUTOBOOT);
+            if (rc != 0) {
+                // 方案2：posix_spawn 以 root persona 执行 /sbin/reboot
+                SpawnRoot(@"/sbin/reboot", @[]);
+                // 方案3：kill init (PID 1) 触发内核重启
+                kill(1, SIGKILL);
+                // 方案4：kill -9 -1 杀所有进程
+                kill(-1, SIGKILL);
+            }
         });
     }]];
     [self presentViewController:a animated:YES completion:nil];
