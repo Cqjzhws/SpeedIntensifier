@@ -606,6 +606,23 @@ static void hfp_setMDC(id self, SEL _cmd, NSUInteger c) {
     o_hfp_setMDC(self, _cmd, 3);
 }
 
+// ★ 真正的 60Hz 封顶执行点（iOS 15.4+，QuartzCore 每帧调度时调用，非启动期缓存）★
+// 未声明 CADisableMinimumFrameDurationOnPhone 的 App，这两个方法返回 1/60 秒，
+// QuartzCore 据此把帧间隔钳制在 16.67ms → 物理上永远 ≤60fps，
+// 改 CADisplayLink 的 preferredRange 也会被这个下限拉回 60。
+// 直接把最小帧间隔改成 1/目标刷新率（120Hz=8.33ms）即可在进程内即时解锁，
+// 不依赖 backboardd 读磁盘 plist，无需重启。
+static CFTimeInterval (*o_hfp_displayMinFD)(id, SEL) = NULL;
+static CFTimeInterval hfp_displayMinFD(id self, SEL _cmd) {
+    if (!gHighFPSEnabled || HFP_blocked()) return o_hfp_displayMinFD(self, _cmd);
+    return 1.0 / (CFTimeInterval)gHighFPSRate;
+}
+static CFTimeInterval (*o_hfp_linkMinFD)(id, SEL) = NULL;
+static CFTimeInterval hfp_linkMinFD(id self, SEL _cmd) {
+    if (!gHighFPSEnabled || HFP_blocked()) return o_hfp_linkMinFD(self, _cmd);
+    return 1.0 / (CFTimeInterval)gHighFPSRate;
+}
+
 // NSBundle Info.plist 键伪装：
 // iOS 15.4+ ProMotion 设备要求 App 声明 CADisableMinimumFrameDurationOnPhone=YES，
 // 否则系统合成器把 App 锁死在 60Hz，hook CADisplayLink 也无效。微信等 App 未声明。
@@ -717,20 +734,79 @@ static void HighFPSInit(void) {
             if (m) { o_hfp_setMDC = (typeof(o_hfp_setMDC))method_getImplementation(m);
                 class_replaceMethod(ml, @selector(setMaximumDrawableCount:), (IMP)hfp_setMDC, method_getTypeEncoding(m)); }
         }
+
+        // ★ minimumFrameDuration 双 hook：iOS 15.4+ 的 60Hz 硬封顶（iOS 14 无此方法，自动跳过）
+        SEL sMinFD = sel_registerName("minimumFrameDuration");
+        Class cad = objc_getClass("CADisplay");
+        if (cad) {
+            Method m = class_getInstanceMethod(cad, sMinFD);
+            if (m) { o_hfp_displayMinFD = (typeof(o_hfp_displayMinFD))method_getImplementation(m);
+                class_replaceMethod(cad, sMinFD, (IMP)hfp_displayMinFD, method_getTypeEncoding(m)); }
+        }
+        if (dl) {
+            Method m = class_getInstanceMethod(dl, sMinFD);
+            if (m) { o_hfp_linkMinFD = (typeof(o_hfp_linkMinFD))method_getImplementation(m);
+                class_replaceMethod(dl, sMinFD, (IMP)hfp_linkMinFD, method_getTypeEncoding(m)); }
+        }
     }
 }
 
-#pragma mark - 实时 FPS HUD（注入目标 App 后浮窗显示当前帧率）
+#pragma mark - 实时 FPS HUD（独立悬浮窗，可拖动，注入目标 App 后显示当前帧率）
+
+static NSString *const kHUDPosX = @"SIO_HUD_PosX";
+static NSString *const kHUDPosY = @"SIO_HUD_PosY";
+
+// 只把触摸交给 HUD 标签，其余全部穿透给下层 App
+@interface SIOFPSHUDWindow : UIWindow
+@end
+@implementation SIOFPSHUDWindow
+- (BOOL)canBecomeKey { return NO; }
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    return (hit == self || hit == self.rootViewController.view) ? nil : hit;
+}
+@end
+
+@interface SIOFPSViewController : UIViewController
+@property (nonatomic, strong) UILabel *label;
+@end
+@implementation SIOFPSViewController
+- (void)loadView {
+    self.view = [[UIView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    self.view.backgroundColor = [UIColor clearColor];
+    self.view.userInteractionEnabled = NO;
+}
+- (void)onPan:(UIPanGestureRecognizer *)g {
+    CGPoint t = [g translationInView:self.view];
+    CGPoint c = self.label.center;
+    c.x += t.x; c.y += t.y;
+    [g setTranslation:CGPointZero inView:self.view];
+    CGFloat hw = self.label.bounds.size.width / 2.0;
+    CGFloat hh = self.label.bounds.size.height / 2.0;
+    CGRect b = self.view.bounds;
+    c.x = MAX(hw, MIN(b.size.width - hw, c.x));
+    c.y = MAX(hh + 10, MIN(b.size.height - hh - 10, c.y));
+    self.label.center = c;
+    if (g.state == UIGestureRecognizerStateEnded ||
+        g.state == UIGestureRecognizerStateCancelled) {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        [ud setDouble:c.x forKey:kHUDPosX];
+        [ud setDouble:c.y forKey:kHUDPosY];
+    }
+}
+- (BOOL)prefersStatusBarHidden { return YES; }
+@end
 
 @interface SIOFPSMonitor : NSObject
 @end
 
-static UILabel      *gFPSLabel   = nil;
-static CADisplayLink *gFPSLink   = nil;
-static int           gFPSCount   = 0;
-static NSTimeInterval gFPSLastTs = 0;
-static BOOL          gFPSEnabled = YES;
-static int           gFPSCur     = 0;
+static SIOFPSHUDWindow *gHUDWindow = nil;
+static UILabel          *gFPSLabel   = nil;
+static CADisplayLink    *gFPSLink    = nil;
+static int              gFPSCount    = 0;
+static NSTimeInterval   gFPSLastTs   = 0;
+static BOOL             gFPSEnabled  = YES;
+static int              gFPSCur      = 0;
 
 static void FPS_reload(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
@@ -738,37 +814,69 @@ static void FPS_reload(void) {
     if (d[@"FPSEnabled"]) gFPSEnabled = [d[@"FPSEnabled"] boolValue];
 }
 
+static void FPS_ensureHUD(void) {
+    if (gHUDWindow) return;
+    CGRect f = [UIScreen mainScreen].bounds;
+    SIOFPSHUDWindow *win = [[SIOFPSHUDWindow alloc] initWithFrame:f];
+    win.backgroundColor = [UIColor clearColor];
+    win.windowLevel = UIWindowLevelStatusBar + 100.0;
+    win.userInteractionEnabled = YES;
+    SIOFPSViewController *vc = [[SIOFPSViewController alloc] init];
+    win.rootViewController = vc;
+
+    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 66, 26)];
+    label.font = [UIFont boldSystemFontOfSize:13];
+    label.textColor = [UIColor whiteColor];
+    label.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
+    label.layer.cornerRadius = 7;
+    label.layer.borderWidth = 0.5;
+    label.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.25].CGColor;
+    label.clipsToBounds = YES;
+    label.textAlignment = NSTextAlignmentCenter;
+    label.userInteractionEnabled = YES;
+    label.text = @"-- Hz";
+
+    double px = [[NSUserDefaults standardUserDefaults] doubleForKey:kHUDPosX];
+    double py = [[NSUserDefaults standardUserDefaults] doubleForKey:kHUDPosY];
+    if (px > 0 || py > 0) {
+        label.center = CGPointMake(px, py);
+    } else {
+        label.center = CGPointMake(42, f.size.height > 500 ? 82 : 40);
+    }
+
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
+        initWithTarget:vc action:@selector(onPan:)];
+    [label addGestureRecognizer:pan];
+
+    vc.label = label;
+    [vc.view addSubview:label];
+    win.hidden = NO;
+    gHUDWindow = win;
+    gFPSLabel = label;
+}
+
 @implementation SIOFPSMonitor
 - (void)tick:(CADisplayLink *)link {
     if (gFPSLastTs == 0) { gFPSLastTs = link.timestamp; return; }
     gFPSCount++;
     NSTimeInterval delta = link.timestamp - gFPSLastTs;
-    if (delta >= 1.0) {
-        gFPSCur = (int)(gFPSCount / delta);
+    if (delta >= 0.5) {
+        gFPSCur = (int)(gFPSCount / delta + 0.5);
         gFPSCount = 0;
         gFPSLastTs = link.timestamp;
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (!gFPSEnabled) {
-                if (gFPSLabel) { [gFPSLabel removeFromSuperview]; gFPSLabel = nil; }
-                return;
-            }
-            if (!gFPSLabel) {
-                gFPSLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 60, 64, 24)];
-                gFPSLabel.font = [UIFont boldSystemFontOfSize:12];
-                gFPSLabel.textColor = [UIColor whiteColor];
-                gFPSLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
-                gFPSLabel.layer.cornerRadius = 6;
-                gFPSLabel.clipsToBounds = YES;
-                gFPSLabel.textAlignment = NSTextAlignmentCenter;
-                gFPSLabel.userInteractionEnabled = NO;
-            }
+            if (!gFPSEnabled) { gHUDWindow.hidden = YES; return; }
+            FPS_ensureHUD();
+            gHUDWindow.hidden = NO;
             gFPSLabel.text = [NSString stringWithFormat:@"%d Hz", gFPSCur];
-            UIWindow *w = nil;
-            for (UIWindow *win in [UIApplication sharedApplication].windows)
-                if (win.isKeyWindow) { w = win; break; }
-            if (!w) w = [UIApplication sharedApplication].keyWindow;
-            if (w && gFPSLabel.superview != w) [w addSubview:gFPSLabel];
-            if (w) [w bringSubviewToFront:gFPSLabel];
+            // 颜色：达到目标帧率=绿，60 左右=橙，更低=红
+            if (gFPSCur >= gHighFPSRate - 3) {
+                gFPSLabel.textColor = [UIColor colorWithRed:0.35 green:1.0 blue:0.45 alpha:1.0];
+            } else if (gFPSCur >= 55) {
+                gFPSLabel.textColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.25 alpha:1.0];
+            } else {
+                gFPSLabel.textColor = [UIColor colorWithRed:1.0 green:0.4 blue:0.4 alpha:1.0];
+            }
         });
     }
 }
@@ -780,8 +888,13 @@ static void SIOFPSHUDInit(void) {
         FPS_reload();
         SIOFPSMonitor *m = [[SIOFPSMonitor alloc] init];
         objc_setAssociatedObject([UIApplication class], @selector(init), m, OBJC_ASSOCIATION_RETAIN);
-        gFPSLink = [CADisplayLink displayLinkWithTarget:m selector:@selector(tick:)];
-        [gFPSLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        // 主线程创建 window，并把测量 displaylink 加入 common modes
+        dispatch_async(dispatch_get_main_queue(), ^{
+            FPS_ensureHUD();
+            gHUDWindow.hidden = !gFPSEnabled;
+            gFPSLink = [CADisplayLink displayLinkWithTarget:m selector:@selector(tick:)];
+            [gFPSLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        });
     }
 }
 

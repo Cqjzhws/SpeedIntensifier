@@ -259,7 +259,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.4.5 · 落盘解锁120Hz + SIFusion硬重启" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.5.0 · hook minimumFrameDuration 真·解锁120Hz · HUD可拖动" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
