@@ -1,0 +1,99 @@
+name: Build FUClean (root-helper IPA)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'fuclean-v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build FUClean IPA
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Install ldid
+        run: |
+          set -e
+          if ! which ldid; then brew update -q && brew install ldid; fi
+          ldid 2>&1 | head -1 || true
+
+      - name: Build root helper + app
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          APP="build/FUClean.app"
+          rm -rf build artifacts
+          mkdir -p "$APP/Helpers" artifacts
+
+          # ① root 清理助手（Foundation 命令行，uid 0 运行）
+          clang -arch arm64 -O2 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -framework Foundation \
+            -o "$APP/Helpers/fuclean-helper" FUClean/Helper/main.m
+          chmod 755 "$APP/Helpers/fuclean-helper"
+
+          # ② 主 App
+          clang -arch arm64 -O2 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -framework Foundation -framework UIKit \
+            -o "$APP/FUClean" FUClean/App/main.m
+
+          cp FUClean/App/Info.plist "$APP/Info.plist"
+          cp FUClean/App/AppIcon.png "$APP/AppIcon.png"
+          for f in FUClean/App/Icon-*.png; do cp "$f" "$APP/$(basename $f)"; done
+
+      - name: Sign (ldid, keep root entitlements)
+        run: |
+          set -e
+          APP="build/FUClean.app"
+          # 两个 Mach-O 都签入 persona-mgmt / no-sandbox 等权限；
+          # 先签嵌套 helper，再签主程序，避免整包重签覆盖 helper 的 entitlements
+          ldid -SFUClean/entitlements.plist "$APP/Helpers/fuclean-helper"
+          ldid -SFUClean/entitlements.plist "$APP/FUClean"
+          echo '--- helper entitlements ---'
+          ldid -e "$APP/Helpers/fuclean-helper" | head -30
+          echo '--- app entitlements ---'
+          ldid -e "$APP/FUClean" | head -30
+          file "$APP/Helpers/fuclean-helper" "$APP/FUClean"
+
+      - name: Package IPA
+        run: |
+          set -e
+          mkdir -p build/Payload
+          cp -R build/FUClean.app build/Payload/FUClean.app
+          # 校验 helper 可执行位仍在
+          ls -l build/Payload/FUClean.app/Helpers/fuclean-helper
+          ( cd build && zip -qry ../artifacts/FUClean.ipa Payload -x "*.DS_Store" )
+          unzip -l artifacts/FUClean.ipa
+          echo "IPA size: $(du -h artifacts/FUClean.ipa | cut -f1)"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FUClean-artifacts
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/fuclean-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: FUClean ${{ github.ref_name }}
+          files: |
+            artifacts/FUClean.ipa
+          generate_release_notes: true
