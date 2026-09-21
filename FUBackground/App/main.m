@@ -1,4 +1,4 @@
-// FUBackground — 真后台保活配置 App（TrollStore 安装用）
+// FUBackground v2.0 — 真后台保活配置 App（TrollStore 安装用）
 // 写 plist + 发 Darwin 通知（dylib 热重载）；提供已装 App audio 后台模式扫描、注销。
 #import <UIKit/UIKit.h>
 #import <sys/sysctl.h>
@@ -31,16 +31,19 @@ static int FBKillProcessNamed(const char *name) {
     return killed;
 }
 static void FBRespring(void) {
-    // 同 mobile uid 可 kill SpringBoard（SIFusion 已验证路径）；杀掉后 launchd 自动拉起
     (void)FBKillProcessNamed("SpringBoard");
     FBKillProcessNamed("backboardd");
 }
 
 #pragma mark ==================== 配置读写 ====================
-static void FBWriteConfig(BOOL enabled, NSArray *exclude) {
+static void FBWriteConfig(BOOL enabled, BOOL sceneFake, BOOL audioKeep, BOOL ball,
+                          NSArray *exclude) {
     mkdir("/var/Managed Preferences", 0755);
     mkdir("/var/Managed Preferences/mobile", 0755);
     NSDictionary *d = @{ @"Enabled": @(enabled),
+                         @"SceneFake": @(sceneFake),
+                         @"AudioKeep": @(audioKeep),
+                         @"FloatingBall": @(ball),
                          @"ExcludeApps": exclude ?: @[] };
     BOOL ok = [d writeToFile:kPrefPath atomically:YES];
     NSLog(@"[FUBApp] write pref -> %d", ok);
@@ -49,7 +52,9 @@ static void FBWriteConfig(BOOL enabled, NSArray *exclude) {
 }
 static NSDictionary *FBReadConfig(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
-    if (!d) d = @{ @"Enabled": @YES, @"ExcludeApps": @[] };
+    if (!d) d = @{ @"Enabled": @YES, @"SceneFake": @YES,
+                   @"AudioKeep": @YES, @"FloatingBall": @YES,
+                   @"ExcludeApps": @[] };
     return d;
 }
 
@@ -75,7 +80,6 @@ static NSString *FBScanInstalledApps(void) {
             if (!info) continue;
             NSString *bid = info[@"CFBundleIdentifier"];
             if (!bid || ![bid isKindOfClass:[NSString class]]) continue;
-            // 跳过系统注入不到的 App（理论上数据卷里没有，但保险）
             if ([bid hasPrefix:@"com.apple."]) continue;
             NSString *name = info[@"CFBundleDisplayName"] ?: info[@"CFBundleName"] ?: sub;
             NSArray *modes = info[@"UIBackgroundModes"];
@@ -84,17 +88,18 @@ static NSString *FBScanInstalledApps(void) {
             if (hasAudio) {
                 [yesLines addObject:[NSString stringWithFormat:@"✅ %@\n    %@", name, bid]];
             } else {
-                [noLines addObject:[NSString stringWithFormat:@"❌ %@\n    %@", name, bid]];
+                [noLines addObject:[NSString stringWithFormat:@"▪️ %@\n    %@", name, bid]];
             }
         }
     }
 
     NSMutableString *out = [NSMutableString string];
-    [out appendFormat:@"扫描到 %d 个用户 App\n\n", total];
-    [out appendFormat:@"【✅ 自带 audio 后台模式 — 可直接保活】%d 个\n%@\n\n",
+    [out appendFormat:@"扫描到 %d 个用户 App\n", total];
+    [out appendString:@"v2.0 默认开启【场景伪装】：无论是否有 audio 声明，注入 dylib 即可保活；下方分组仅反映“音频兜底”引擎的前提条件。\n\n"];
+    [out appendFormat:@"【✅ 自带 audio 声明 — 双引擎完整】%d 个\n%@\n\n",
      (int)yesLines.count,
      yesLines.count ? [yesLines componentsJoinedByString:@"\n"] : @"(无)"];
-    [out appendFormat:@"【❌ 未声明 audio — 需改包加入 UIBackgroundModes 后重装】%d 个\n%@\n",
+    [out appendFormat:@"【▪️ 无 audio 声明 — 场景伪装仍可保活；仅关场景伪装时才需改包】%d 个\n%@\n",
      (int)noLines.count,
      noLines.count ? [noLines componentsJoinedByString:@"\n"] : @"(无)"];
     return out;
@@ -106,6 +111,9 @@ static NSString *FBScanInstalledApps(void) {
 
 @implementation FBRootVC {
     UISwitch *_enableSwitch;
+    UISwitch *_sceneSwitch;
+    UISwitch *_audioSwitch;
+    UISwitch *_ballSwitch;
     UITextView *_exclude;
     UITextView *_scanResult;
     UILabel *_status;
@@ -121,6 +129,15 @@ static NSString *FBScanInstalledApps(void) {
     [left setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
     [left setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
     return row;
+}
+
+- (UILabel *)_label:(NSString *)text color:(UIColor *)color size:(CGFloat)size {
+    UILabel *l = [[UILabel alloc] init];
+    l.text = text;
+    l.font = [UIFont systemFontOfSize:size];
+    l.textColor = color;
+    l.numberOfLines = 0;
+    return l;
 }
 
 - (NSArray *)_collectExclude {
@@ -140,6 +157,9 @@ static NSString *FBScanInstalledApps(void) {
 
     NSDictionary *cfg = FBReadConfig();
     BOOL cfgEnabled = cfg[@"Enabled"] ? [cfg[@"Enabled"] boolValue] : YES;
+    BOOL cfgScene   = cfg[@"SceneFake"] ? [cfg[@"SceneFake"] boolValue] : YES;
+    BOOL cfgAudio   = cfg[@"AudioKeep"] ? [cfg[@"AudioKeep"] boolValue] : YES;
+    BOOL cfgBall    = cfg[@"FloatingBall"] ? [cfg[@"FloatingBall"] boolValue] : YES;
     NSArray *cfgEx = cfg[@"ExcludeApps"] ?: @[];
 
     UILabel *title = [[UILabel alloc] init];
@@ -148,29 +168,34 @@ static NSString *FBScanInstalledApps(void) {
     title.textAlignment = NSTextAlignmentCenter;
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"FUBackground v1.0.0 · TrollStore 专用";
+    sub.text = @"FUBackground v2.0 Max · 场景伪装 + 音频断言双引擎";
     sub.font = [UIFont systemFontOfSize:13];
     sub.textColor = [UIColor secondaryLabelColor];
     sub.textAlignment = NSTextAlignmentCenter;
     sub.numberOfLines = 0;
 
-    UILabel *lbl1 = [[UILabel alloc] init];
-    lbl1.text = @"启用真后台保活（注入 dylib 后对各 App 生效）";
-    lbl1.font = [UIFont systemFontOfSize:15];
-    lbl1.numberOfLines = 0;
-    _enableSwitch = [[UISwitch alloc] init];
-    _enableSwitch.on = cfgEnabled;
+    // —— 开关组 ——
+    _enableSwitch = [[UISwitch alloc] init]; _enableSwitch.on = cfgEnabled;
+    _sceneSwitch  = [[UISwitch alloc] init]; _sceneSwitch.on  = cfgScene;
+    _audioSwitch  = [[UISwitch alloc] init]; _audioSwitch.on  = cfgAudio;
+    _ballSwitch   = [[UISwitch alloc] init]; _ballSwitch.on   = cfgBall;
 
-    UILabel *lbl2 = [[UILabel alloc] init];
-    lbl2.text = @"排除名单（每行一个 Bundle ID 前缀，命中不保活）";
-    lbl2.font = [UIFont systemFontOfSize:15];
-    lbl2.textColor = [UIColor secondaryLabelColor];
-    lbl2.numberOfLines = 0;
+    UIView *row1 = [self _rowWith:[self _label:@"总开关（注入 dylib 的 App 全部生效）"
+                                         color:[UIColor labelColor] size:15] ctrl:_enableSwitch];
+    UIView *row2 = [self _rowWith:[self _label:@"场景伪装（核心：拦截后台化指令，App 始终以为自己在前台；不依赖 audio 声明）"
+                                         color:[UIColor labelColor] size:15] ctrl:_sceneSwitch];
+    UIView *row3 = [self _rowWith:[self _label:@"音频断言兜底（无声白噪声防挂起，不打断音乐；与场景伪装双保险）"
+                                         color:[UIColor secondaryLabelColor] size:13] ctrl:_audioSwitch];
+    UIView *row4 = [self _rowWith:[self _label:@"悬浮球（App 内可拖动的开关，点击对该 App 单独暂停/恢复）"
+                                         color:[UIColor secondaryLabelColor] size:13] ctrl:_ballSwitch];
+
+    UILabel *lbl2 = [self _label:@"排除名单（每行一个 Bundle ID 前缀，命中不保活）"
+                           color:[UIColor secondaryLabelColor] size:15];
     _exclude = [[UITextView alloc] init];
     _exclude.font = [UIFont systemFontOfSize:14];
     _exclude.text = [cfgEx componentsJoinedByString:@"\n"];
     _exclude.layer.cornerRadius = 8;
-    [_exclude.heightAnchor constraintEqualToConstant:90].active = YES;
+    [_exclude.heightAnchor constraintEqualToConstant:80].active = YES;
 
     UIButton *scanBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     [scanBtn setTitle:@"扫描已安装 App 的后台支持情况" forState:UIControlStateNormal];
@@ -180,15 +205,13 @@ static NSString *FBScanInstalledApps(void) {
     _scanResult = [[UITextView alloc] init];
     _scanResult.font = [UIFont systemFontOfSize:12];
     _scanResult.editable = NO;
-    _scanResult.text = @"点上方按钮扫描。\n带 ✅ 的 App 用 TrollFools 注入 FUBackground.dylib 即可保活；\n带 ❌ 的 App 需自行改包：在 Info.plist 的 UIBackgroundModes 加 audio，重签后 TrollStore 重装再注入。";
+    _scanResult.text = @"点上方按钮扫描。\nv2.0 开启场景伪装后，所有 App 注入 FUBackground.dylib 即可保活（无需改包）；audio 声明只影响音频兜底引擎。";
     _scanResult.layer.cornerRadius = 8;
-    [_scanResult.heightAnchor constraintEqualToConstant:240].active = YES;
+    [_scanResult.heightAnchor constraintEqualToConstant:220].active = YES;
 
-    UILabel *hint = [[UILabel alloc] init];
-    hint.text = @"原理：进后台时播放无限循环的静音音频（不打断正在播放的音乐），借用系统音频后台断言防止进程被挂起；看门狗每 5 秒自愈，来电/闹钟中断后自动恢复。配置即时生效，已运行的 App 会自动重读。";
-    hint.font = [UIFont systemFontOfSize:12];
-    hint.textColor = [UIColor secondaryLabelColor];
-    hint.numberOfLines = 0;
+    UILabel *hint = [self _label:
+        @"用法：TrollFools 把 FUBackground.dylib 注入目标 App；App 内出现沙漏悬浮球即生效，点球可单独开关。场景伪装拦截系统下发的后台化指令，音频断言防止进程被挂起，看门狗自愈、来电中断自动恢复。配置即时生效，无需注销。"
+                           color:[UIColor secondaryLabelColor] size:12];
 
     UIButton *apply = [UIButton buttonWithType:UIButtonTypeSystem];
     [apply setTitle:@"保存配置（即时生效）" forState:UIControlStateNormal];
@@ -211,8 +234,7 @@ static NSString *FBScanInstalledApps(void) {
     _status.numberOfLines = 0;
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        title, sub,
-        [self _rowWith:lbl1 ctrl:_enableSwitch],
+        title, sub, row1, row2, row3, row4,
         lbl2, _exclude,
         scanBtn, _scanResult,
         hint,
@@ -250,9 +272,10 @@ static NSString *FBScanInstalledApps(void) {
 }
 
 - (void)onApply {
-    FBWriteConfig(_enableSwitch.on, [self _collectExclude]);
+    FBWriteConfig(_enableSwitch.on, _sceneSwitch.on, _audioSwitch.on, _ballSwitch.on,
+                  [self _collectExclude]);
     _status.text = _enableSwitch.on
-        ? @"已保存：保活开启，排除名单已更新，即时生效。"
+        ? @"已保存：保活配置已更新，即时生效。"
         : @"已保存：保活已关闭。";
 }
 
@@ -262,7 +285,8 @@ static NSString *FBScanInstalledApps(void) {
                                                          preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [ac addAction:[UIAlertAction actionWithTitle:@"注销" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-        FBWriteConfig(_enableSwitch.on, [self _collectExclude]);
+        FBWriteConfig(_enableSwitch.on, _sceneSwitch.on, _audioSwitch.on, _ballSwitch.on,
+                      [self _collectExclude]);
         FBRespring();
     }]];
     [self presentViewController:ac animated:YES completion:nil];

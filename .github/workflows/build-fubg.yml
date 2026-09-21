@@ -20,7 +20,7 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 
-      # ① dylib — 真后台保活（静音音频断言），TrollFools 注入
+      # ① dylib — 真后台保活（场景伪装 + 音频断言双引擎），TrollFools 注入
       - name: Build dylib (pure clang)
         run: |
           set -e
@@ -30,9 +30,11 @@ jobs:
           clang -arch arm64 -dynamiclib -O2 \
             -install_name @rpath/FUBackground.dylib \
             -isysroot "$SDK" \
+            -IFUBackground/Tweak \
             -miphoneos-version-min=14.0 \
             -undefined dynamic_lookup -fobjc-arc \
             -framework Foundation -framework UIKit -framework AVFoundation -framework AudioToolbox \
+            -framework UserNotifications \
             -o artifacts/FUBackground.dylib FUBackground/Tweak/FUBackground.m
           codesign --force --sign - artifacts/FUBackground.dylib
           lipo -info artifacts/FUBackground.dylib
