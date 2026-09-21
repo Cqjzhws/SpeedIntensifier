@@ -448,7 +448,7 @@ int main(int argc, char *argv[]) {
         // 受保护 App 列表（按大小降序，取前 30）
         NSArray *sortedProt = [gProtApps sortedArrayUsingComparator:
             ^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-            return [b[@"bytes"] compare:a[@"bytes"];
+            return [b[@"bytes"] compare:a[@"bytes"]];
         }];
         NSArray *top = [sortedProt subarrayWithRange:
             NSMakeRange(0, MIN(30, sortedProt.count))];
