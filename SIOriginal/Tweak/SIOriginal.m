@@ -23,6 +23,8 @@ static double   gSpeed     = 5.0;    // 加速倍率（时长 ÷ 倍率）
 static double   gSlowFactor = 2.0;   // 慢放倍率（时长 × 因子）
 static BOOL     gSpring    = YES;    // CASpring 参数缩放
 static BOOL     gExtra     = YES;    // 导航/模态进阶转场
+static BOOL     gListAccel = YES;    // TV/CV 列表全家桶（微信已硬保护）
+static BOOL     gIsWeChat  = NO;     // 硬保护：TV/CV hook 对微信永远关闭
 static NSString *gBlacklist = nil;   // 逗号拼接，逐进程缓存
 static NSString *gSelfBundle = nil;
 
@@ -36,12 +38,12 @@ static inline double SIO_targetDuration(double orig) {
     double d;
     switch (gMode) {
         case 1:  d = orig * gSlowFactor; break;            // 慢放
-        case 2:  d = 0.0;                break;            // 瞬切
+        case 2:  d = 0.01;               break;            // 瞬切 0.01s
         default:
             if (gSpeed <= 1.0001) return orig;
             d = orig / gSpeed;         break;              // 加速
     }
-    if (d > 0.0 && d < 0.02) d = 0.02;                     // 防零时长渲染异常
+    if (d > 0.0 && d < 0.01) d = 0.01;                     // 时长下限 0.01s
     return d;
 }
 
@@ -65,6 +67,7 @@ static void SIO_reload(void) {
     gSlowFactor = (sf > 1.0 && sf <= 10.0) ? sf : 2.0;
     gSpring = d[@"Spring"] ? [d[@"Spring"] boolValue] : YES;
     gExtra  = d[@"Extra"]  ? [d[@"Extra"] boolValue]  : YES;
+    gListAccel = d[@"ListAccel"] ? [d[@"ListAccel"] boolValue] : YES;
     gBlacklist = [d[@"Blacklist"] componentsJoinedByString:@","];
 }
 
@@ -262,12 +265,148 @@ static void sio_vc_dismiss(id self, SEL _cmd, BOOL anim, void (^c)(void)) {
     [CATransaction commit];
 }
 
+#pragma mark - TV/CV 列表全家桶（ListAccel 控制；com.tencent.xin 硬保护）
+
+static BOOL SIO_listOK(void) { return gListAccel && !gIsWeChat && !SIO_blocked(); }
+
+static void SIO_listWrap(void (^block)(void)) {
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:SIO_targetDuration(0.25)];
+    block();
+    [CATransaction commit];
+}
+
+// ---- UITableView ----
+static void (*o_tv_selectRow)(id, SEL, NSIndexPath *, BOOL, UITableViewScrollPosition);
+static void sio_tv_selectRow(id self, SEL _cmd, NSIndexPath *ip, BOOL anim, UITableViewScrollPosition pos) {
+    if (!SIO_listOK()) { o_tv_selectRow(self, _cmd, ip, anim, pos); return; }
+    SIO_listWrap(^{ o_tv_selectRow(self, _cmd, ip, anim, pos); });
+}
+static void (*o_tv_deselectRow)(id, SEL, NSIndexPath *, BOOL);
+static void sio_tv_deselectRow(id self, SEL _cmd, NSIndexPath *ip, BOOL anim) {
+    if (!SIO_listOK()) { o_tv_deselectRow(self, _cmd, ip, anim); return; }
+    SIO_listWrap(^{ o_tv_deselectRow(self, _cmd, ip, anim); });
+}
+static void (*o_tv_scrollToRow)(id, SEL, NSIndexPath *, UITableViewScrollPosition, BOOL);
+static void sio_tv_scrollToRow(id self, SEL _cmd, NSIndexPath *ip, UITableViewScrollPosition pos, BOOL anim) {
+    if (!SIO_listOK()) { o_tv_scrollToRow(self, _cmd, ip, pos, anim); return; }
+    SIO_listWrap(^{ o_tv_scrollToRow(self, _cmd, ip, pos, anim); });
+}
+static void (*o_tv_scrollNearest)(id, SEL, UITableViewScrollPosition, BOOL);
+static void sio_tv_scrollNearest(id self, SEL _cmd, UITableViewScrollPosition pos, BOOL anim) {
+    if (!SIO_listOK()) { o_tv_scrollNearest(self, _cmd, pos, anim); return; }
+    SIO_listWrap(^{ o_tv_scrollNearest(self, _cmd, pos, anim); });
+}
+static void (*o_tv_reloadData)(id, SEL);
+static void sio_tv_reloadData(id self, SEL _cmd) {
+    if (!SIO_listOK()) { o_tv_reloadData(self, _cmd); return; }
+    SIO_listWrap(^{ o_tv_reloadData(self, _cmd); });
+}
+static void (*o_tv_reloadRows)(id, SEL, NSArray *, UITableViewRowAnimation);
+static void sio_tv_reloadRows(id self, SEL _cmd, NSArray *ips, UITableViewRowAnimation a) {
+    if (!SIO_listOK()) { o_tv_reloadRows(self, _cmd, ips, a); return; }
+    SIO_listWrap(^{ o_tv_reloadRows(self, _cmd, ips, a); });
+}
+static void (*o_tv_reloadSections)(id, SEL, NSIndexSet *, UITableViewRowAnimation);
+static void sio_tv_reloadSections(id self, SEL _cmd, NSIndexSet *sec, UITableViewRowAnimation a) {
+    if (!SIO_listOK()) { o_tv_reloadSections(self, _cmd, sec, a); return; }
+    SIO_listWrap(^{ o_tv_reloadSections(self, _cmd, sec, a); });
+}
+static void (*o_tv_insertRows)(id, SEL, NSArray *, UITableViewRowAnimation);
+static void sio_tv_insertRows(id self, SEL _cmd, NSArray *ips, UITableViewRowAnimation a) {
+    if (!SIO_listOK()) { o_tv_insertRows(self, _cmd, ips, a); return; }
+    SIO_listWrap(^{ o_tv_insertRows(self, _cmd, ips, a); });
+}
+static void (*o_tv_deleteRows)(id, SEL, NSArray *, UITableViewRowAnimation);
+static void sio_tv_deleteRows(id self, SEL _cmd, NSArray *ips, UITableViewRowAnimation a) {
+    if (!SIO_listOK()) { o_tv_deleteRows(self, _cmd, ips, a); return; }
+    SIO_listWrap(^{ o_tv_deleteRows(self, _cmd, ips, a); });
+}
+static void (*o_tv_moveRow)(id, SEL, NSIndexPath *, NSIndexPath *);
+static void sio_tv_moveRow(id self, SEL _cmd, NSIndexPath *from, NSIndexPath *to) {
+    if (!SIO_listOK()) { o_tv_moveRow(self, _cmd, from, to); return; }
+    SIO_listWrap(^{ o_tv_moveRow(self, _cmd, from, to); });
+}
+static void (*o_tv_insertSections)(id, SEL, NSIndexSet *, UITableViewRowAnimation);
+static void sio_tv_insertSections(id self, SEL _cmd, NSIndexSet *sec, UITableViewRowAnimation a) {
+    if (!SIO_listOK()) { o_tv_insertSections(self, _cmd, sec, a); return; }
+    SIO_listWrap(^{ o_tv_insertSections(self, _cmd, sec, a); });
+}
+static void (*o_tv_deleteSections)(id, SEL, NSIndexSet *, UITableViewRowAnimation);
+static void sio_tv_deleteSections(id self, SEL _cmd, NSIndexSet *sec, UITableViewRowAnimation a) {
+    if (!SIO_listOK()) { o_tv_deleteSections(self, _cmd, sec, a); return; }
+    SIO_listWrap(^{ o_tv_deleteSections(self, _cmd, sec, a); });
+}
+static void (*o_tv_moveSection)(id, SEL, NSUInteger, NSUInteger);
+static void sio_tv_moveSection(id self, SEL _cmd, NSUInteger from, NSUInteger to) {
+    if (!SIO_listOK()) { o_tv_moveSection(self, _cmd, from, to); return; }
+    SIO_listWrap(^{ o_tv_moveSection(self, _cmd, from, to); });
+}
+static void (*o_tv_setEditing)(id, SEL, BOOL, BOOL);
+static void sio_tv_setEditing(id self, SEL _cmd, BOOL editing, BOOL anim) {
+    if (!SIO_listOK()) { o_tv_setEditing(self, _cmd, editing, anim); return; }
+    SIO_listWrap(^{ o_tv_setEditing(self, _cmd, editing, anim); });
+}
+static void (*o_tv_batchUpdates)(id, SEL, void (^)(void), void (^)(BOOL));
+static void sio_tv_batchUpdates(id self, SEL _cmd, void (^updates)(void), void (^comp)(BOOL)) {
+    if (!SIO_listOK()) { o_tv_batchUpdates(self, _cmd, updates, comp); return; }
+    SIO_listWrap(^{ o_tv_batchUpdates(self, _cmd, updates, comp); });
+}
+
+// ---- UICollectionView ----
+static void (*o_cv_reloadData)(id, SEL);
+static void sio_cv_reloadData(id self, SEL _cmd) {
+    if (!SIO_listOK()) { o_cv_reloadData(self, _cmd); return; }
+    SIO_listWrap(^{ o_cv_reloadData(self, _cmd); });
+}
+static void (*o_cv_reloadItems)(id, SEL, NSArray *);
+static void sio_cv_reloadItems(id self, SEL _cmd, NSArray *ips) {
+    if (!SIO_listOK()) { o_cv_reloadItems(self, _cmd, ips); return; }
+    SIO_listWrap(^{ o_cv_reloadItems(self, _cmd, ips); });
+}
+static void (*o_cv_reloadSections)(id, SEL, NSArray *);
+static void sio_cv_reloadSections(id self, SEL _cmd, NSArray *secs) {
+    if (!SIO_listOK()) { o_cv_reloadSections(self, _cmd, secs); return; }
+    SIO_listWrap(^{ o_cv_reloadSections(self, _cmd, secs); });
+}
+static void (*o_cv_insertItems)(id, SEL, NSArray *);
+static void sio_cv_insertItems(id self, SEL _cmd, NSArray *ips) {
+    if (!SIO_listOK()) { o_cv_insertItems(self, _cmd, ips); return; }
+    SIO_listWrap(^{ o_cv_insertItems(self, _cmd, ips); });
+}
+static void (*o_cv_deleteItems)(id, SEL, NSArray *);
+static void sio_cv_deleteItems(id self, SEL _cmd, NSArray *ips) {
+    if (!SIO_listOK()) { o_cv_deleteItems(self, _cmd, ips); return; }
+    SIO_listWrap(^{ o_cv_deleteItems(self, _cmd, ips); });
+}
+static void (*o_cv_moveItem)(id, SEL, NSIndexPath *, NSIndexPath *);
+static void sio_cv_moveItem(id self, SEL _cmd, NSIndexPath *from, NSIndexPath *to) {
+    if (!SIO_listOK()) { o_cv_moveItem(self, _cmd, from, to); return; }
+    SIO_listWrap(^{ o_cv_moveItem(self, _cmd, from, to); });
+}
+static void (*o_cv_scrollToItem)(id, SEL, NSIndexPath *, UICollectionViewScrollPosition, BOOL);
+static void sio_cv_scrollToItem(id self, SEL _cmd, NSIndexPath *ip, UICollectionViewScrollPosition pos, BOOL anim) {
+    if (!SIO_listOK()) { o_cv_scrollToItem(self, _cmd, ip, pos, anim); return; }
+    SIO_listWrap(^{ o_cv_scrollToItem(self, _cmd, ip, pos, anim); });
+}
+static void (*o_cv_selectItem)(id, SEL, NSIndexPath *, BOOL, UICollectionViewScrollPosition);
+static void sio_cv_selectItem(id self, SEL _cmd, NSIndexPath *ip, BOOL anim, UICollectionViewScrollPosition pos) {
+    if (!SIO_listOK()) { o_cv_selectItem(self, _cmd, ip, anim, pos); return; }
+    SIO_listWrap(^{ o_cv_selectItem(self, _cmd, ip, anim, pos); });
+}
+static void (*o_cv_deselectItem)(id, SEL, NSIndexPath *, BOOL);
+static void sio_cv_deselectItem(id self, SEL _cmd, NSIndexPath *ip, BOOL anim) {
+    if (!SIO_listOK()) { o_cv_deselectItem(self, _cmd, ip, anim); return; }
+    SIO_listWrap(^{ o_cv_deselectItem(self, _cmd, ip, anim); });
+}
+
 #pragma mark - 安装
 
 __attribute__((constructor))
 static void SIOriginalInit(void) {
     pthread_key_create(&gInUIViewAnimKey, NULL);
     gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    gIsWeChat = [gSelfBundle isEqualToString:@"com.tencent.xin"];
     SIO_reload();
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
@@ -333,5 +472,61 @@ static void SIOriginalInit(void) {
                             (IMP)sio_vc_present, (IMP *)&o_vc_present);
         SIO_swizzleInstance(vc, @selector(dismissViewControllerAnimated:completion:),
                             (IMP)sio_vc_dismiss, (IMP *)&o_vc_dismiss);
+    }
+
+    // TV/CV 列表全家桶 ×24（ListAccel 控制，微信硬保护）
+    Class tv = objc_getClass("UITableView");
+    Class cv = objc_getClass("UICollectionView");
+    if (tv) {
+        SIO_swizzleInstance(tv, @selector(selectRowAtIndexPath:animated:scrollPosition:),
+                            (IMP)sio_tv_selectRow, (IMP *)&o_tv_selectRow);
+        SIO_swizzleInstance(tv, @selector(deselectRowAtIndexPath:animated:),
+                            (IMP)sio_tv_deselectRow, (IMP *)&o_tv_deselectRow);
+        SIO_swizzleInstance(tv, @selector(scrollToRowAtIndexPath:atScrollPosition:animated:),
+                            (IMP)sio_tv_scrollToRow, (IMP *)&o_tv_scrollToRow);
+        SIO_swizzleInstance(tv, @selector(scrollToNearestSelectedRowAtScrollPosition:animated:),
+                            (IMP)sio_tv_scrollNearest, (IMP *)&o_tv_scrollNearest);
+        SIO_swizzleInstance(tv, @selector(reloadData),
+                            (IMP)sio_tv_reloadData, (IMP *)&o_tv_reloadData);
+        SIO_swizzleInstance(tv, @selector(reloadRowsAtIndexPaths:withRowAnimation:),
+                            (IMP)sio_tv_reloadRows, (IMP *)&o_tv_reloadRows);
+        SIO_swizzleInstance(tv, @selector(reloadSections:withRowAnimation:),
+                            (IMP)sio_tv_reloadSections, (IMP *)&o_tv_reloadSections);
+        SIO_swizzleInstance(tv, @selector(insertRowsAtIndexPaths:withRowAnimation:),
+                            (IMP)sio_tv_insertRows, (IMP *)&o_tv_insertRows);
+        SIO_swizzleInstance(tv, @selector(deleteRowsAtIndexPaths:withRowAnimation:),
+                            (IMP)sio_tv_deleteRows, (IMP *)&o_tv_deleteRows);
+        SIO_swizzleInstance(tv, @selector(moveRowAtIndexPath:toIndexPath:),
+                            (IMP)sio_tv_moveRow, (IMP *)&o_tv_moveRow);
+        SIO_swizzleInstance(tv, @selector(insertSections:withRowAnimation:),
+                            (IMP)sio_tv_insertSections, (IMP *)&o_tv_insertSections);
+        SIO_swizzleInstance(tv, @selector(deleteSections:withRowAnimation:),
+                            (IMP)sio_tv_deleteSections, (IMP *)&o_tv_deleteSections);
+        SIO_swizzleInstance(tv, @selector(moveSection:toSection:),
+                            (IMP)sio_tv_moveSection, (IMP *)&o_tv_moveSection);
+        SIO_swizzleInstance(tv, @selector(setEditing:animated:),
+                            (IMP)sio_tv_setEditing, (IMP *)&o_tv_setEditing);
+        SIO_swizzleInstance(tv, @selector(performBatchUpdates:completion:),
+                            (IMP)sio_tv_batchUpdates, (IMP *)&o_tv_batchUpdates);
+    }
+    if (cv) {
+        SIO_swizzleInstance(cv, @selector(reloadData),
+                            (IMP)sio_cv_reloadData, (IMP *)&o_cv_reloadData);
+        SIO_swizzleInstance(cv, @selector(reloadItemsAtIndexPaths:),
+                            (IMP)sio_cv_reloadItems, (IMP *)&o_cv_reloadItems);
+        SIO_swizzleInstance(cv, @selector(reloadSections:),
+                            (IMP)sio_cv_reloadSections, (IMP *)&o_cv_reloadSections);
+        SIO_swizzleInstance(cv, @selector(insertItemsAtIndexPaths:),
+                            (IMP)sio_cv_insertItems, (IMP *)&o_cv_insertItems);
+        SIO_swizzleInstance(cv, @selector(deleteItemsAtIndexPaths:),
+                            (IMP)sio_cv_deleteItems, (IMP *)&o_cv_deleteItems);
+        SIO_swizzleInstance(cv, @selector(moveItemAtIndexPath:toIndexPath:),
+                            (IMP)sio_cv_moveItem, (IMP *)&o_cv_moveItem);
+        SIO_swizzleInstance(cv, @selector(scrollToItemAtIndexPath:atScrollPosition:animated:),
+                            (IMP)sio_cv_scrollToItem, (IMP *)&o_cv_scrollToItem);
+        SIO_swizzleInstance(cv, @selector(selectItemAtIndexPath:animated:scrollPosition:),
+                            (IMP)sio_cv_selectItem, (IMP *)&o_cv_selectItem);
+        SIO_swizzleInstance(cv, @selector(deselectItemAtIndexPath:animated:),
+                            (IMP)sio_cv_deselectItem, (IMP *)&o_cv_deselectItem);
     }
 }

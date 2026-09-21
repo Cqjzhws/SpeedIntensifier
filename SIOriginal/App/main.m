@@ -59,11 +59,12 @@ static NSMutableDictionary *ReadConfig(void) {
     NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
     if (!d) d = [NSMutableDictionary dictionary];
     if (!d[@"Enabled"])    d[@"Enabled"]    = @YES;
-    if (!d[@"Mode"])       d[@"Mode"]       = @0;
+    if (!d[@"Mode"])       d[@"Mode"]       = @2;          // 瞬切 0.01s
     if (!d[@"Speed"])      d[@"Speed"]      = @5.0;
     if (!d[@"SlowFactor"]) d[@"SlowFactor"] = @2.0;
     if (!d[@"Spring"])     d[@"Spring"]     = @YES;
     if (!d[@"Extra"])      d[@"Extra"]      = @YES;
+    if (!d[@"ListAccel"])  d[@"ListAccel"]  = @YES;        // 默认全开（微信已在 dylib 内硬保护）
     if (!d[@"Blacklist"])  d[@"Blacklist"]  = @[ @"com.tencent.wework" ];
     return d;
 }
@@ -77,19 +78,33 @@ static void WriteConfig(NSMutableDictionary *cfg) {
 }
 
 static NSString *ModeText(int m) {
-    return m == 1 ? @"慢放" : (m == 2 ? @"瞬切" : @"加速");
+    return m == 1 ? @"慢放" : (m == 2 ? @"瞬切 0.01s" : @"加速");
+}
+
+// ---- 系统动态效果（辅助功能，需注销生效） ----
+static NSString * const AxPath = @"/var/mobile/Library/Preferences/com.apple.Accessibility.plist";
+static BOOL ReadAx(NSString *key) {
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:AxPath];
+    return d[key] ? [d[key] boolValue] : NO;
+}
+static void WriteAx(NSString *key, BOOL val) {
+    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:AxPath] mutableCopy];
+    if (!d) d = [NSMutableDictionary dictionary];
+    d[key] = @(val);
+    [d writeToFile:AxPath atomically:YES];
 }
 
 @interface SIOVC : UIViewController
 @end
 
 @implementation SIOVC {
-    UISwitch *_swEnabled, *_swSpring, *_swExtra;
+    UISwitch *_swEnabled, *_swSpring, *_swExtra, *_swList;
     UISegmentedControl *_segMode;
     UISlider *_slider;
     UILabel *_sliderLabel;
     UITextView *_blacklist;
     UILabel *_status;
+    UISwitch *_swRM, *_swCF;
 }
 
 - (UIStackView *)row:(UIView *)l ctrl:(UIView *)c {
@@ -119,7 +134,7 @@ static NSString *ModeText(int m) {
     UILabel *title = [self label:@"SI Original · 原版重制" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.0.0 · 17 Hooks · pw5a29 原版机制 iOS16 重制" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.2.0 · 41 Hooks · 默认瞬切 0.01s" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -147,6 +162,20 @@ static NSString *ModeText(int m) {
     _swExtra = [[UISwitch alloc] init];
     _swExtra.on = [cfg[@"Extra"] boolValue];
 
+    UILabel *lblList = [self label:@"列表加速 TV/CV（微信已硬保护）" size:17 dim:NO];
+    lblList.textColor = [UIColor systemRedColor];
+    _swList = [[UISwitch alloc] init];
+    _swList.on = [cfg[@"ListAccel"] boolValue];
+    _swList.onTintColor = [UIColor systemRedColor];
+
+    UILabel *axTitle = [self label:@"系统动态效果（写入辅助功能，需注销生效）" size:15 dim:YES];
+    UILabel *lblRM = [self label:@"减弱动态效果（系统级）" size:17 dim:NO];
+    _swRM = [[UISwitch alloc] init];
+    _swRM.on = ReadAx(@"ReduceMotionEnabled");
+    UILabel *lblCF = [self label:@"首选交叉淡出过渡效果" size:17 dim:NO];
+    _swCF = [[UISwitch alloc] init];
+    _swCF.on = ReadAx(@"PreferCrossFadeTransitions");
+
     UILabel *lblBL = [self label:@"黑名单（每行一个 Bundle ID）" size:15 dim:YES];
     _blacklist = [[UITextView alloc] init];
     _blacklist.font = [UIFont systemFontOfSize:14];
@@ -173,8 +202,11 @@ static NSString *ModeText(int m) {
     [rs.heightAnchor constraintEqualToConstant:40].active = YES;
     [rs addTarget:self action:@selector(onRespring) forControlEvents:UIControlEventTouchUpInside];
 
-    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。慢放 = 原版 slowDownFactor 功能，可观察动画细节。瞬切 = 动画零时长直达。" size:12 dim:YES];
+    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。慢放 = 原版 slowDownFactor 功能，可观察动画细节。瞬切 = 0.01 秒直达。" size:12 dim:YES];
     hint.textAlignment = NSTextAlignmentCenter;
+    UILabel *listHint = [self label:@"列表加速含 24 个 TV/CV hook，企业微信/微信已双重保护（黑名单 + 硬编码）。其他重列表 App（淘宝/京东）若出现卡死请关闭此开关。" size:12 dim:YES];
+    listHint.textColor = [UIColor systemOrangeColor];
+    listHint.numberOfLines = 0;
     _status = [self label:@"" size:13 dim:YES];
     _status.textAlignment = NSTextAlignmentCenter;
 
@@ -185,7 +217,11 @@ static NSString *ModeText(int m) {
         _sliderLabel, _slider,
         [self row:lblSpring ctrl:_swSpring],
         [self row:lblExtra ctrl:_swExtra],
-        lblBL, _blacklist, save, rs, hint, _status
+        [self row:lblList ctrl:_swList],
+        axTitle,
+        [self row:lblRM ctrl:_swRM],
+        [self row:lblCF ctrl:_swCF],
+        lblBL, _blacklist, save, rs, listHint, hint, _status
     ]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 13;
@@ -227,6 +263,7 @@ static NSString *ModeText(int m) {
     cfg[@"Speed"] = @((double)_slider.value);
     cfg[@"Spring"] = @(_swSpring.on);
     cfg[@"Extra"] = @(_swExtra.on);
+    cfg[@"ListAccel"] = @(_swList.on);
     NSMutableArray *bl = [NSMutableArray array];
     for (NSString *line in [_blacklist.text componentsSeparatedByCharactersInSet:
             [NSCharacterSet newlineCharacterSet]]) {
@@ -236,11 +273,17 @@ static NSString *ModeText(int m) {
     }
     cfg[@"Blacklist"] = bl;
     WriteConfig(cfg);
-    _status.text = [NSString stringWithFormat:@"已保存：%@ · %@ · 弹簧%@ · 转场%@",
+    WriteAx(@"ReduceMotionEnabled", _swRM.on);
+    WriteAx(@"PreferCrossFadeTransitions", _swCF.on);
+    _status.text = [NSString stringWithFormat:@"已保存：%@ · %@ · 弹簧%@ · 转场%@ · 列表%@",
                     _swEnabled.on ? @"开" : @"关",
                     ModeText((int)_segMode.selectedSegmentIndex),
                     _swSpring.on ? @"开" : @"关",
-                    _swExtra.on ? @"开" : @"关"];
+                    _swExtra.on ? @"开" : @"关",
+                    _swList.on ? @"开" : @"关"];
+    if (_swRM.on || _swCF.on) {
+        _status.text = [_status.text stringByAppendingString:@" · 系统动态效果已写入，需注销"];
+    }
 }
 
 - (void)onRespring {
