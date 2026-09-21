@@ -24,7 +24,8 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 static void SpawnRoot(NSString *path, NSArray *args) {
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
-    posix_spawnattr_set_persona_np(&attr, 0, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+    // 99 = PERSONA_SYSTEM（root），TrollStore root spawn 的标准值
+    posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
     posix_spawnattr_set_persona_uid_np(&attr, 0);
     posix_spawnattr_set_persona_gid_np(&attr, 0);
     pid_t pid;
@@ -39,6 +40,23 @@ static void SpawnRoot(NSString *path, NSArray *args) {
         int status;
         waitpid(pid, &status, 0);
     }
+}
+
+// 不等待：reboot 成功时系统立即复位、永不返回，等待反而可能阻塞 UI
+static void SpawnRootNowait(NSString *path, NSArray *args) {
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+    posix_spawnattr_set_persona_uid_np(&attr, 0);
+    posix_spawnattr_set_persona_gid_np(&attr, 0);
+    pid_t pid = -1;
+    char *argv[args.count + 2];
+    argv[0] = (char *)path.fileSystemRepresentation;
+    for (NSUInteger i = 0; i < args.count; i++)
+        argv[i + 1] = (char *)[args[i] UTF8String];
+    argv[args.count + 1] = NULL;
+    posix_spawn(&pid, path.fileSystemRepresentation, NULL, &attr, argv, environ);
+    posix_spawnattr_destroy(&attr);
 }
 
 static void Respring(void) {
@@ -186,7 +204,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.4.3 · 默认120Hz+FPS+后台 · 修复保存" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.4.4 · 解锁120Hz系统锁 + 修复硬重启" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -444,14 +462,11 @@ static void WriteUIKitDrag(BOOL enabled) {
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [a addAction:[UIAlertAction actionWithTitle:@"重启" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *x) {
         [self onSave];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            // App 自身是 mobile uid，reboot() 系统调用必被 EPERM 拒绝；
-            // 只能以 root persona spawn /sbin/reboot
-            SpawnRoot(@"/sbin/reboot", @[]);
-            // fallback：杀 PID 1 触发系统重启
-            SpawnRoot(@"/bin/kill", @[@"-9", @"1"]);
-        });
+        // 不依赖 UI 队列延迟，立即以 root persona 执行重启；
+        // /sbin/reboot 成功则系统立刻复位（永不返回），逐级 fallback
+        SpawnRootNowait(@"/sbin/reboot", @[]);
+        SpawnRootNowait(@"/bin/kill", @[@"-9", @"1"]);
+        SpawnRootNowait(@"/usr/bin/killall", @[@"-9", @"backboardd"]);
     }]];
     [self presentViewController:a animated:YES completion:nil];
 }

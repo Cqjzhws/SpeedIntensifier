@@ -606,10 +606,45 @@ static void hfp_setMDC(id self, SEL _cmd, NSUInteger c) {
     o_hfp_setMDC(self, _cmd, 3);
 }
 
+// NSBundle Info.plist 键伪装：
+// iOS 15.4+ ProMotion 设备要求 App 声明 CADisableMinimumFrameDurationOnPhone=YES，
+// 否则系统合成器把 App 锁死在 60Hz，hook CADisplayLink 也无效。微信等 App 未声明。
+static id (*o_hfp_bundleObjForKey)(id, SEL, NSString *) = NULL;
+static id hfp_bundleObjForKey(id self, SEL _cmd, NSString *key) {
+    if (gHighFPSEnabled && !HFP_blocked() &&
+        [key isEqualToString:@"CADisableMinimumFrameDurationOnPhone"]) {
+        return @YES;
+    }
+    return o_hfp_bundleObjForKey(self, _cmd, key);
+}
+
+static NSDictionary *(*o_hfp_bundleInfoDict)(id, SEL) = NULL;
+static NSDictionary *hfp_bundleInfoDict(id self, SEL _cmd) {
+    NSDictionary *orig = o_hfp_bundleInfoDict(self, _cmd);
+    if (gHighFPSEnabled && !HFP_blocked() &&
+        ![orig[@"CADisableMinimumFrameDurationOnPhone"] boolValue]) {
+        NSMutableDictionary *m = [orig mutableCopy] ?: [NSMutableDictionary dictionary];
+        m[@"CADisableMinimumFrameDurationOnPhone"] = @YES;
+        return m;
+    }
+    return orig;
+}
+
 __attribute__((constructor))
 static void HighFPSInit(void) {
     @autoreleasepool {
         HFP_reload();
+
+        // 必须最先安装：系统在 UIKit/CoreAnimation 初始化早期读取该键
+        Class bundle = objc_getClass("NSBundle");
+        if (bundle) {
+            Method m1 = class_getInstanceMethod(bundle, @selector(objectForInfoDictionaryKey:));
+            if (m1) { o_hfp_bundleObjForKey = (typeof(o_hfp_bundleObjForKey))method_getImplementation(m1);
+                method_setImplementation(m1, (IMP)hfp_bundleObjForKey); }
+            Method m2 = class_getInstanceMethod(bundle, @selector(infoDictionary));
+            if (m2) { o_hfp_bundleInfoDict = (typeof(o_hfp_bundleInfoDict))method_getImplementation(m2);
+                method_setImplementation(m2, (IMP)hfp_bundleInfoDict); }
+        }
 
         Class screen = objc_getClass("UIScreen");
         if (screen) {
