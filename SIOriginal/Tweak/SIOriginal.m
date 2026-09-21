@@ -14,6 +14,7 @@
 #import <objc/runtime.h>
 #import <pthread.h>
 #import <dlfcn.h>
+#import <notify.h>
 #import "FUBGNoiseData.h"
 
 #define kPrefDomain  @"com.apple.UIKit"
@@ -74,6 +75,9 @@ static void SIO_reload(void) {
     gListAccel = d[@"ListAccel"] ? [d[@"ListAccel"] boolValue] : YES;
     gBlacklist = [d[@"Blacklist"] componentsJoinedByString:@","];
 }
+
+static void HFP_reload(void);
+static void FPS_reload(void);
 
 static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
                                 CFNotificationName name, const void *object,
@@ -704,8 +708,6 @@ static void SIOFPSHUDInit(void) {
 
 #pragma mark - FUBackground v2.0.0 Max 整合（真后台保活）
 
-static NSString *const kPrefPath = @"/var/Managed Preferences/mobile/com.local.fubg.plist";
-static NSString *const kNotifyName   = @"com.local.fubg.settingschanged";
 static NSString *const kFBGLocalOff = @"fubg_local_off";
 
 // ---- 全局状态 ----
