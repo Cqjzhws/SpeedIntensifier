@@ -556,6 +556,17 @@ static volatile BOOL      gHFPUseCustom= NO;   // 是否自定义（选择值 < 
 static volatile NSInteger gHFPInterval = 1;    // frameInterval = max/target
 static volatile double    gHFPDuration = 1.0/120.0; // Metal present 最小间隔
 
+// 诊断（HUD 第二行）：屏幕真实最大帧率 + 各 hook 安装/命中情况
+static volatile NSInteger gDBGScreenMaxRaw = 0;     // hook 前系统返回的 maximumFramesPerSecond
+static volatile long      gDBGCallFI  = 0;          // setFrameInterval: 被调次数
+static volatile long      gDBGCallPFS = 0;          // setPreferredFramesPerSecond:
+static volatile long      gDBGCallPFR = 0;          // setPreferredFrameRateRange:
+static volatile long      gDBGCallDur = 0;          // presentAfterMinimumDuration:
+static volatile long      gDBGCallCmd = 0;          // presentDrawable:afterMinimumDuration:
+static volatile BOOL      gDBGHookDrawable = NO;    // CAMetalDrawable hook 是否装上
+static volatile BOOL      gDBGHookCmdBuf   = NO;    // MTLCommandBuffer hook 是否装上
+static volatile BOOL      gDBGHookMaxFPS   = NO;    // UIScreen maximumFramesPerSecond 是否装上
+
 static BOOL HFP_blocked(void);  // 前向声明
 
 static void HFP_compute(void) {
@@ -605,6 +616,7 @@ static BOOL HFP_blocked(void) {
 static void (*o_hfp_setFI)(id, SEL, NSInteger) = NULL;
 static void (*o_hfp_setPFPS)(id, SEL, NSInteger) = NULL;
 static void hfp_setFI(id self, SEL _cmd, NSInteger interval) {
+    gDBGCallFI++;
     if (!gHFPActive) { o_hfp_setFI(self, _cmd, interval); return; }
     o_hfp_setFI(self, _cmd, gHFPInterval);
     if ([self respondsToSelector:@selector(setPreferredFramesPerSecond:)])
@@ -612,6 +624,7 @@ static void hfp_setFI(id self, SEL _cmd, NSInteger interval) {
 }
 // setPreferredFramesPerSecond: → 非自定义时传 0（关键！0=不限制，用屏幕最大；硬传120会被钳）
 static void hfp_setPFPS(id self, SEL _cmd, NSInteger fps) {
+    gDBGCallPFS++;
     if (!gHFPActive) { o_hfp_setPFPS(self, _cmd, fps); return; }
     o_hfp_setPFPS(self, _cmd, gHFPUseCustom ? gHFPTarget : 0);
 }
@@ -619,6 +632,7 @@ static void hfp_setPFPS(id self, SEL _cmd, NSInteger fps) {
 typedef struct { float minimum; float maximum; float preferred; } HFPFrameRateRange;
 static void (*o_hfp_setPFRR)(id, SEL, HFPFrameRateRange) = NULL;
 static void hfp_setPFRR(id self, SEL _cmd, HFPFrameRateRange r) {
+    gDBGCallPFR++;
     if (!gHFPActive) { o_hfp_setPFRR(self, _cmd, r); return; }
     HFPFrameRateRange nr;
     nr.minimum = 30;                       // 允许 LTPO 静止降帧
@@ -627,12 +641,17 @@ static void hfp_setPFRR(id self, SEL _cmd, HFPFrameRateRange r) {
     o_hfp_setPFRR(self, _cmd, nr);
 }
 
-// ---------- CAMetalLayer（drawableCount 官方固定 2，getter+setter 都 hook）----------
-static NSUInteger (*o_hfp_mdcGetter)(id, SEL) = NULL;
-static NSUInteger hfp_mdcGetter(id self, SEL _cmd) {
-    if (gHFPActive && gHighFPSMetal) return 2;
-    return o_hfp_mdcGetter(self, _cmd);
+// ---------- UIScreen maximumFramesPerSecond（原版有，之前漏了）----------
+// iOS15.4+ 未声明 plist 键的 App 该接口可能只报 60，App/UIKit 据此设链，必须强制报目标值
+static NSInteger (*o_hfp_maxFPS)(id, SEL) = NULL;
+static NSInteger hfp_maxFPS(id self, SEL _cmd) {
+    NSInteger raw = o_hfp_maxFPS(self, _cmd);
+    if (raw > 0) gDBGScreenMaxRaw = raw;
+    if (!gHFPActive) return raw;
+    return gHFPUseCustom ? gHFPTarget : (raw > gHFPTarget ? raw : gHFPTarget);
 }
+
+// ---------- CAMetalLayer（原版只 hook setter → 2）----------
 static void (*o_hfp_mdcSetter)(id, SEL, NSUInteger) = NULL;
 static void hfp_mdcSetter(id self, SEL _cmd, NSUInteger c) {
     if (gHFPActive && gHighFPSMetal) { o_hfp_mdcSetter(self, _cmd, 2); return; }
@@ -643,51 +662,59 @@ static void hfp_mdcSetter(id self, SEL _cmd, NSUInteger c) {
 // App 用 presentAfterMinimumDuration:1/60 主动把 Metal 帧呈现锁在 60，改成 1/target
 static void (*o_hfp_presentDur)(id, SEL, CFTimeInterval) = NULL;
 static void hfp_presentDur(id self, SEL _cmd, CFTimeInterval duration) {
+    gDBGCallDur++;
     if (gHFPActive && gHighFPSMetal) { o_hfp_presentDur(self, _cmd, gHFPDuration); return; }
     o_hfp_presentDur(self, _cmd, duration);
 }
 static void (*o_hfp_presentDrawableDur)(id, SEL, id, CFTimeInterval) = NULL;
 static void hfp_presentDrawableDur(id self, SEL _cmd, id drawable, CFTimeInterval duration) {
+    gDBGCallCmd++;
     if (gHFPActive && gHighFPSMetal) { o_hfp_presentDrawableDur(self, _cmd, drawable, gHFPDuration); return; }
     o_hfp_presentDrawableDur(self, _cmd, drawable, duration);
 }
 
-// protocol 同名类不一定存在（MTLCommandBuffer 是协议），遍历 classlist 找实现类
-static Class HFP_classForProtocol(Protocol *proto) {
-    if (!proto) return Nil;
+// protocol 同名类不一定存在（MTLCommandBuffer 是协议）。遍历 classlist，
+// 对【所有】符合协议且实现了该方法的类挂钩（可能有 AGX/GPU 多个实现类），
+// 用 class_addMethod 兜底处理继承自基类的情况，确保命中真正被调用的实现。
+static void HFP_hookAllConforming(Protocol *proto, SEL sel, IMP newImp, IMP *out, volatile BOOL *flag) {
+    if (!proto) return;
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
-    Class found = Nil;
     for (unsigned int i = 0; i < count; i++) {
         Class c = classes[i];
-        if (class_conformsToProtocol(c, proto)) { found = c; break; }
+        if (!c || !class_conformsToProtocol(c, proto)) continue;
+        Method m = class_getInstanceMethod(c, sel);
+        if (!m) continue;
+        IMP orig = method_getImplementation(m);
+        const char *types = method_getTypeEncoding(m);
+        // 若该类自身未实现（继承自基类），先在本类添加一份再替换，避免改动基类、且保证本类走新 IMP
+        BOOL added = class_addMethod(c, sel, newImp, types);
+        if (!added) {
+            method_setImplementation(m, newImp);  // 本类自有实现，直接替换
+        }
+        if (out && !*out) *out = orig;
+        if (flag) *flag = YES;
     }
     free(classes);
-    return found;
-}
-
-static void HFP_hook(Class c, SEL sel, IMP newImp, IMP *out) {
-    if (!c) return;
-    Method m = class_getInstanceMethod(c, sel);
-    if (!m) return;
-    *out = method_getImplementation(m);
-    method_setImplementation(m, newImp);
 }
 
 // MTLCommandBuffer 的实现类（AGXMetal 驱动）在 App 首次创建 MTLDevice 时才动态注册，
 // constructor 阶段往往还不存在，必须延迟重试，否则最关键的 presentDrawable hook 装不上。
-static volatile BOOL gHFPMetalHooked = NO;
 static void HFP_installMetalHooks(void) {
-    if (gHFPMetalHooked) return;
-    Class cd = objc_getClass("CAMetalDrawable") ?: HFP_classForProtocol(@protocol(CAMetalDrawable));
-    if (cd && !o_hfp_presentDur)
-        HFP_hook(cd, NSSelectorFromString(@"presentAfterMinimumDuration:"),
-                 (IMP)hfp_presentDur, (IMP *)&o_hfp_presentDur);
-    Class cb = objc_getClass("MTLCommandBuffer") ?: HFP_classForProtocol(@protocol(MTLCommandBuffer));
-    if (cb) {
-        HFP_hook(cb, NSSelectorFromString(@"presentDrawable:afterMinimumDuration:"),
-                 (IMP)hfp_presentDrawableDur, (IMP *)&o_hfp_presentDrawableDur);
-        if (o_hfp_presentDrawableDur) gHFPMetalHooked = YES;
+    if (!gDBGHookDrawable) {
+        HFP_hookAllConforming(@protocol(CAMetalDrawable),
+            NSSelectorFromString(@"presentAfterMinimumDuration:"),
+            (IMP)hfp_presentDur, (IMP *)&o_hfp_presentDur, &gDBGHookDrawable);
+        // CAMetalDrawable 继承 MTLDrawable，某些版本实现类只声明 MTLDrawable
+        if (!gDBGHookDrawable)
+            HFP_hookAllConforming(@protocol(MTLDrawable),
+                NSSelectorFromString(@"presentAfterMinimumDuration:"),
+                (IMP)hfp_presentDur, (IMP *)&o_hfp_presentDur, &gDBGHookDrawable);
+    }
+    if (!gDBGHookCmdBuf) {
+        HFP_hookAllConforming(@protocol(MTLCommandBuffer),
+            NSSelectorFromString(@"presentDrawable:afterMinimumDuration:"),
+            (IMP)hfp_presentDrawableDur, (IMP *)&o_hfp_presentDrawableDur, &gDBGHookCmdBuf);
     }
 }
 
@@ -698,19 +725,23 @@ static void HighFPSInit(void) {
         // constructor 可能早于 UIScreen 就绪，主线程 runloop 起来后再校正一次帧率缓存
         dispatch_async(dispatch_get_main_queue(), ^{ HFP_compute(); });
 
+        Class scr = objc_getClass("UIScreen");
+        Method mm = class_getInstanceMethod(scr, @selector(maximumFramesPerSecond));
+        if (mm) { o_hfp_maxFPS = (typeof(o_hfp_maxFPS))method_getImplementation(mm);
+            method_setImplementation(mm, (IMP)hfp_maxFPS); gDBGHookMaxFPS = YES; }
+
         Class dl = objc_getClass("CADisplayLink");
         HFP_hook(dl, @selector(setFrameInterval:), (IMP)hfp_setFI, (IMP *)&o_hfp_setFI);
         HFP_hook(dl, @selector(setPreferredFramesPerSecond:), (IMP)hfp_setPFPS, (IMP *)&o_hfp_setPFPS);
         HFP_hook(dl, NSSelectorFromString(@"setPreferredFrameRateRange:"), (IMP)hfp_setPFRR, (IMP *)&o_hfp_setPFRR);
 
         Class ml = objc_getClass("CAMetalLayer");
-        HFP_hook(ml, @selector(maximumDrawableCount), (IMP)hfp_mdcGetter, (IMP *)&o_hfp_mdcGetter);
         HFP_hook(ml, @selector(setMaximumDrawableCount:), (IMP)hfp_mdcSetter, (IMP *)&o_hfp_mdcSetter);
 
         // Metal 驱动类懒加载：立即试一次，之后 0.8s / 2.5s / 6s 重试直到装上
         HFP_installMetalHooks();
-        double delays[3] = {0.8, 2.5, 6.0};
-        for (int i = 0; i < 3; i++) {
+        double delays[5] = {0.8, 2.5, 6.0, 12.0, 20.0};
+        for (int i = 0; i < 5; i++) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[i] * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ HFP_installMetalHooks(); });
         }
@@ -725,12 +756,12 @@ static NSString *const kHUDPosY = @"SIO_HUD_PosY";
 // 全屏透明容器：只有点中标签区域才接收触摸，其余全部穿透给下层 App。
 // 绝不自建 UIWindow——早期无 scene 的 window 会与 App 主窗口竞争 key 状态导致卡死。
 @interface SIOFPSContainerView : UIView
-@property (nonatomic, weak) UILabel *fpsLabel;
+@property (nonatomic, weak) UIView *chip;
 @end
 @implementation SIOFPSContainerView
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    if (!self.fpsLabel || self.fpsLabel.hidden) return NO;
-    CGRect hot = CGRectInset(self.fpsLabel.frame, -10, -10);  // 10pt 热区，方便拖动
+    if (!self.chip || self.chip.hidden) return NO;
+    CGRect hot = CGRectInset(self.chip.frame, -12, -12);  // 12pt 热区，方便拖动
     return CGRectContainsPoint(hot, point);
 }
 @end
@@ -739,7 +770,9 @@ static NSString *const kHUDPosY = @"SIO_HUD_PosY";
 @end
 
 static SIOFPSContainerView *gHUDContainer = nil;
-static UILabel          *gFPSLabel   = nil;
+static UIView            *gHUDChip    = nil;
+static UILabel           *gFPSLabel   = nil;
+static UILabel           *gDbgLabel   = nil;
 static CADisplayLink    *gFPSLink    = nil;
 static int              gFPSCount    = 0;
 static NSTimeInterval   gFPSLastTs   = 0;
@@ -797,29 +830,44 @@ static void FPS_attachIfNeeded(void) {
         c.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         c.userInteractionEnabled = YES;
 
-        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 66, 26)];
+        UIView *chip = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 158, 34)];
+        chip.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.62];
+        chip.layer.cornerRadius = 8;
+        chip.layer.borderWidth = 0.5;
+        chip.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.25].CGColor;
+        chip.clipsToBounds = YES;
+        chip.userInteractionEnabled = YES;
+
+        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(0, 2, 158, 18)];
         label.font = [UIFont boldSystemFontOfSize:13];
         label.textColor = [UIColor whiteColor];
-        label.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
-        label.layer.cornerRadius = 7;
-        label.layer.borderWidth = 0.5;
-        label.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.25].CGColor;
-        label.clipsToBounds = YES;
         label.textAlignment = NSTextAlignmentCenter;
-        label.userInteractionEnabled = YES;
         label.text = @"-- Hz";
+        [chip addSubview:label];
+
+        UILabel *dbg = [[UILabel alloc] initWithFrame:CGRectMake(2, 19, 154, 13)];
+        dbg.font = [UIFont monospacedSystemFontOfSize:8 weight:UIFontWeightRegular];
+        dbg.textColor = [UIColor colorWithWhite:0.8 alpha:0.95];
+        dbg.textAlignment = NSTextAlignmentCenter;
+        dbg.adjustsFontSizeToFitWidth = YES;
+        dbg.minimumScaleFactor = 0.5;
+        dbg.text = @"...";
+        [chip addSubview:dbg];
+
         double px = [[NSUserDefaults standardUserDefaults] doubleForKey:kHUDPosX];
         double py = [[NSUserDefaults standardUserDefaults] doubleForKey:kHUDPosY];
-        label.center = (px > 0 || py > 0) ? CGPointMake(px, py)
-                                          : CGPointMake(42, kw.bounds.size.height > 500 ? 82 : 40);
+        chip.center = (px > 0 || py > 0) ? CGPointMake(px, py)
+                                          : CGPointMake(90, kw.bounds.size.height > 500 ? 90 : 46);
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
             initWithTarget:gFPSMonitor action:@selector(panHUD:)];
-        [label addGestureRecognizer:pan];
+        [chip addGestureRecognizer:pan];
 
-        c.fpsLabel = label;
-        [c addSubview:label];
+        c.chip = chip;
+        [c addSubview:chip];
         gHUDContainer = c;
+        gHUDChip = chip;
         gFPSLabel = label;
+        gDbgLabel = dbg;
     }
     if (gHUDContainer.superview != kw) {
         [gHUDContainer removeFromSuperview];
@@ -851,6 +899,19 @@ static void FPS_attachIfNeeded(void) {
                 gFPSLabel.textColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.25 alpha:1.0];
             } else {
                 gFPSLabel.textColor = [UIColor colorWithRed:1.0 green:0.4 blue:0.4 alpha:1.0];
+            }
+            // 诊断小字：raw=系统原始屏幕最大；FI/PF/PR=三个DisplayLink hook命中数；
+            // pd/cb=两个Metal呈现hook命中数；末两位=Drawable/CommandBuffer hook是否已安装
+            if (gDbgLabel) {
+                long fi = gDBGCallFI, pf = gDBGCallPFS, pr = gDBGCallPFR;
+                long pd = gDBGCallDur, cb = gDBGCallCmd;
+                // 计数封顶显示，避免字符串变长
+                if (fi > 999) fi = 999; if (pf > 999) pf = 999; if (pr > 999) pr = 999;
+                if (pd > 999) pd = 999; if (cb > 999) cb = 999;
+                gDbgLabel.text = [NSString stringWithFormat:
+                    @"raw%ld t%ld %@ F%ld/%ld/%ld M%ld/%ld %d%d",
+                    (long)gDBGScreenMaxRaw, (long)gHFPTarget, gHFPActive?@"on":@"off",
+                    fi, pf, pr, pd, cb, gDBGHookDrawable?1:0, gDBGHookCmdBuf?1:0];
             }
         });
     }
