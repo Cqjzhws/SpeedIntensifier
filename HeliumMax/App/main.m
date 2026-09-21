@@ -3,13 +3,19 @@
 //  Helium Max — 配置 App
 //
 #import <UIKit/UIKit.h>
+#import <sys/stat.h>
+#import <notify.h>
 #import "HUD/HUDManager.h"
 
 #define kPrefPath  @"/var/Managed Preferences/mobile/com.local.heliummax.plist"
 #define kNotifyKey @"com.local.heliummax.reload"
 
-static NSString *kColors[] = { @"#FFFFFF", @"#00FF00", @"#FF0000", @"#00FFFF",
-                               @"#FFFF00", @"#FF00FF", @"#FFA500", @"#000000" };
+static NSArray *kColors = nil;
+static NSArray *Colors(void) {
+    if (!kColors) kColors = @[ @"#FFFFFF", @"#00FF00", @"#FF0000", @"#00FFFF",
+                               @"#FFFF00", @"#FF00FF", @"#FFA500", @"#000000" ];
+    return kColors;
+}
 
 static NSDictionary *ReadConfig(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
@@ -86,7 +92,7 @@ static void WriteConfig(NSDictionary *cfg) {
     self.colorStack.axis = UILayoutConstraintAxisHorizontal;
     self.colorStack.spacing = 8;
     self.colorStack.distribution = UIStackViewDistributionFillEqually;
-    for (NSString *hex in kColors) {
+    for (NSString *hex in Colors()) {
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
         unsigned int rgb;
         NSScanner *sc = [NSScanner scannerWithString:[hex substringFromIndex:1]];
@@ -211,7 +217,7 @@ static void WriteConfig(NSDictionary *cfg) {
         if ([v isKindOfClass:[UIButton class]]) ((UIButton *)v).layer.borderWidth = 0;
     }
     sender.layer.borderWidth = 3;
-    for (NSString *hex in kColors) {
+    for (NSString *hex in Colors()) {
         if ([hex hash] == sender.tag) { self.selectedColor = hex; break; }
     }
 }
