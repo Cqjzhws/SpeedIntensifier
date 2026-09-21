@@ -550,17 +550,21 @@ static BOOL      gHighFPSMetal = YES;
 static void HFP_reload(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
     if (!d) return;
-    gHighFPSEnabled = [d[@"HighFPSEnabled"] boolValue];
-    gHighFPSRate = [d[@"HighFPSRate"] integerValue];
-    if (gHighFPSRate <= 0) gHighFPSRate = 120;
-    gHighFPSMetal = [d[@"HighFPSMetalTriple"] boolValue];
+    // 键不存在时保持默认值（默认全开 120），避免 [nil boolValue]=NO 误关
+    if (d[@"HighFPSEnabled"]) gHighFPSEnabled = [d[@"HighFPSEnabled"] boolValue];
+    if (d[@"HighFPSRate"]) {
+        gHighFPSRate = [d[@"HighFPSRate"] integerValue];
+        if (gHighFPSRate <= 0) gHighFPSRate = 120;
+    }
+    if (d[@"HighFPSMetalTriple"]) gHighFPSMetal = [d[@"HighFPSMetalTriple"] boolValue];
 }
 
 static BOOL HFP_blocked(void) {
-    if (!gSelfBundle) return NO;
-    NSArray *bl = gBlacklist ?: @[];
-    for (NSString *b in bl) {
-        if ([b isKindOfClass:[NSString class]] && [gSelfBundle isEqualToString:b]) return YES;
+    if (!gSelfBundle) gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    if (gSelfBundle.length == 0 || !gBlacklist) return NO;
+    for (NSString *s in [gBlacklist componentsSeparatedByString:@","]) {
+        if ([gSelfBundle isEqualToString:[s stringByTrimmingCharactersInSet:
+                [NSCharacterSet whitespaceCharacterSet]]]) return YES;
     }
     return NO;
 }
@@ -655,7 +659,7 @@ static int           gFPSCur     = 0;
 static void FPS_reload(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
     if (!d) return;
-    gFPSEnabled = [d[@"FPSEnabled"] boolValue];
+    if (d[@"FPSEnabled"]) gFPSEnabled = [d[@"FPSEnabled"] boolValue];
 }
 
 @implementation SIOFPSMonitor
@@ -698,7 +702,6 @@ __attribute__((constructor))
 static void SIOFPSHUDInit(void) {
     @autoreleasepool {
         FPS_reload();
-        if (!gFPSEnabled) return;
         SIOFPSMonitor *m = [[SIOFPSMonitor alloc] init];
         objc_setAssociatedObject([UIApplication class], @selector(init), m, OBJC_ASSOCIATION_RETAIN);
         gFPSLink = [CADisplayLink displayLinkWithTarget:m selector:@selector(tick:)];

@@ -10,10 +10,6 @@
 #import <string.h>
 #import <sys/sysctl.h>
 
-// iOS SDK 没有 sys/reboot.h，手动声明
-extern int reboot(int);
-#define RB_AUTOBOOT 0
-
 #ifndef POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE
 #define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE 1
 #endif
@@ -28,7 +24,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 static void SpawnRoot(NSString *path, NSArray *args) {
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
-    posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+    posix_spawnattr_set_persona_np(&attr, 0, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
     posix_spawnattr_set_persona_uid_np(&attr, 0);
     posix_spawnattr_set_persona_gid_np(&attr, 0);
     pid_t pid;
@@ -74,6 +70,16 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"Extra"])      d[@"Extra"]      = @YES;
     if (!d[@"ListAccel"])  d[@"ListAccel"]  = @YES;        // 默认全开（微信已在 dylib 内硬保护）
     if (!d[@"Blacklist"])  d[@"Blacklist"]  = @[ @"com.tencent.wework" ];
+    // 高刷 / FPS：默认开启，默认 120Hz
+    if (!d[@"FPSEnabled"])        d[@"FPSEnabled"]        = @YES;
+    if (!d[@"HighFPSEnabled"])    d[@"HighFPSEnabled"]    = @YES;
+    if (!d[@"HighFPSRate"])       d[@"HighFPSRate"]       = @120;
+    if (!d[@"HighFPSMetalTriple"])d[@"HighFPSMetalTriple"]= @YES;
+    // 真后台保活：默认全开
+    if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
+    if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
+    if (!d[@"FUBGAudioKeep"])    d[@"FUBGAudioKeep"]    = @YES;
+    if (!d[@"FUBGFloatingBall"]) d[@"FUBGFloatingBall"] = @YES;
     return d;
 }
 
@@ -84,7 +90,11 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
     NSMutableDictionary *merged = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
     if (!merged) merged = [NSMutableDictionary dictionary];
     NSArray *sioKeys = @[ @"Enabled", @"Mode", @"Speed", @"SlowFactor",
-                          @"Spring", @"Extra", @"ListAccel", @"Blacklist" ];
+                          @"Spring", @"Extra", @"ListAccel", @"Blacklist",
+                          @"FPSEnabled",
+                          @"HighFPSEnabled", @"HighFPSRate", @"HighFPSMetalTriple",
+                          @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
+                          @"FUBGFloatingBall", @"FUBGExcludeApps" ];
     for (NSString *k in sioKeys) {
         if (cfg[k]) merged[k] = cfg[k];
     }
@@ -176,7 +186,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.4.0 · 动画加速 + 高刷 + 实时FPS + 真后台保活" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.4.3 · 默认120Hz+FPS+后台 · 修复保存" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -436,16 +446,11 @@ static void WriteUIKitDrag(BOOL enabled) {
         [self onSave];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            // 方案1：reboot(2) 系统调用（需 root）
-            int rc = reboot(RB_AUTOBOOT);
-            if (rc != 0) {
-                // 方案2：posix_spawn 以 root persona 执行 /sbin/reboot
-                SpawnRoot(@"/sbin/reboot", @[]);
-                // 方案3：kill init (PID 1) 触发内核重启
-                kill(1, SIGKILL);
-                // 方案4：kill -9 -1 杀所有进程
-                kill(-1, SIGKILL);
-            }
+            // App 自身是 mobile uid，reboot() 系统调用必被 EPERM 拒绝；
+            // 只能以 root persona spawn /sbin/reboot
+            SpawnRoot(@"/sbin/reboot", @[]);
+            // fallback：杀 PID 1 触发系统重启
+            SpawnRoot(@"/bin/kill", @[@"-9", @"1"]);
         });
     }]];
     [self presentViewController:a animated:YES completion:nil];
