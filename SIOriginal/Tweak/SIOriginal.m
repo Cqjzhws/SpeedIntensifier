@@ -673,6 +673,15 @@ static void hfp_presentDrawableDur(id self, SEL _cmd, id drawable, CFTimeInterva
     o_hfp_presentDrawableDur(self, _cmd, drawable, duration);
 }
 
+// 普通单类 hook（方法确定存在于该类时）
+static void HFP_hook(Class c, SEL sel, IMP newImp, IMP *out) {
+    if (!c) return;
+    Method m = class_getInstanceMethod(c, sel);
+    if (!m) return;
+    if (out) *out = method_getImplementation(m);
+    method_setImplementation(m, newImp);
+}
+
 // protocol 同名类不一定存在（MTLCommandBuffer 是协议）。遍历 classlist，
 // 对【所有】符合协议且实现了该方法的类挂钩（可能有 AGX/GPU 多个实现类），
 // 用 class_addMethod 兜底处理继承自基类的情况，确保命中真正被调用的实现。
