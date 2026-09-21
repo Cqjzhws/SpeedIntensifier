@@ -162,10 +162,10 @@ static void WriteUIKitDrag(BOOL enabled) {
     int mode = [cfg[@"Mode"] intValue];
     double speed = [cfg[@"Speed"] doubleValue];
 
-    UILabel *title = [self label:@"SI Original · 原版重制" size:24 dim:NO];
+    UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.2.0 · 41 Hooks · 默认瞬切 0.01s" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.2.3 · 41 Hooks · 默认瞬切 0.01s" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
