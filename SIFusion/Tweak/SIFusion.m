@@ -1,41 +1,28 @@
-// SIFusion v1.2.0 — SIClassic × SpeedsterTS 融合增强版（纯 ObjC runtime，无 substrate）
+// SIFusion v2.0.0 Max — 终极融合版（SIClassic × SpeedsterTS × SpeedIntensifier 三方并集）
+// 纯 ObjC runtime，无 substrate。TrollStore / TrollFools 注入任意数据卷 App 即可生效。
 //
-// 由两个实测可用版本的 hook 并集融合而成：
-//   · SpeedsterTS v1.1.1 独立模式 15 hooks（UIView block×4 / CAAnimation /
-//     CALayer addAnimation / CATransaction / Nav push·pop×3 / present·dismiss /
-//     CASpring mass·damping）——微信实测不闪退，覆盖面广
-//   · SIClassic v1.0.2（逆向 pw5a29 原版 Speed Intensifier 10.1-1）独有：
-//     CASpringAnimation -setStiffness: —— SpeedsterTS 没 hook 它
+// 三方 hook 并集（去重后 ~68 hooks）：
+//   · SpeedsterTS v1.1.1 独立模式 15 hooks（UIView block×4 / CAAnimation / CALayer addAnimation /
+//     CATransaction / Nav push·pop×3 / present·dismiss）——微信实测不闪退
+//   · SIClassic v1.0.2 独有 CASpringAnimation 弹簧物理四件套（stiffness/damping/mass/velocity）
+//   · SpeedIntensifier v1.6.1 额外 45+ hooks：UIPA 全族 / UIWindow / 交互式转场 /
+//     上下文菜单 / Tab 直选 / PageVC 翻页 / UISV 缩放 / 三类栏 setItems / 控件 /
+//     CALayer actionForKey 隐式动画瞬时化 / CAPropertyAnimation 二级链 /
+//     TV/CV 列表变异（selectRow/deselect/reloadSections/setEditing/moveRow 等）
 //
-// 融合后的改进（取两家之长）：
-//   1. 弹簧不再用 Speedster 的"盲切 mass/damping 百分比"，改用 SIClassic 的
-//      物理推导：要把弹簧 settle 时间缩短 m 倍且阻尼比 ζ 不变，需
-//      stiffness × m²、damping × m、mass 不动 —— 手感与系统一致、只是更快。
-//      setStiffness: 是两版里唯一没人完整覆盖的参数，本版补齐。
-//   2. 速度档沿用 SpeedsterTS 实测有效的 5 档（微快/快/很快/极快/瞬切），
-//      各 hook 的保底时长（CA 8ms / Nav 16ms / present 30ms / 一帧 16ms）
-//      全部沿用已验证数值。
-//   3. CAAnimation 只 hook 基类 setDuration:；addAnimation 用 associated-object
-//      标记防二次缩放；Nav/present 用 CATransaction 收窄 + gFSTxInternal 自调
-//      标记，不包动画块、不碰 setViewControllers: 状态机敏感接口。
-//   4. 共存检测：进程内已加载 SpeedIntensifier / SpeedsterTS / SIClassic 时，
-//      只安装弹簧物理层 hooks（互补，绝不双重缩放）；独立模式装全部 20 hooks。
-//   5. 刻意不 hook 任何 UITableView/UICollectionView 选择/刷新/移动方法
-//      （已证实是微信点链接闪退的根因类）。
-//   6. v1.1.0 高级模式（对标 Speedy 的程序动画独立倍率）：
-//      Advanced 开启后，持续时间倍数覆盖 5 档档位表，刚性/阻尼/质量/初始速率
-//      按用户倍率直接缩放（1.0 = 不变）；关闭时保持 v1.0.1 物理公式行为。
-//   7. v1.2.0 新增：UIView transitionWithView/FromView 容器转场 ×2、
-//      UINavigationController _setTransitionDuration:（侧滑返回松手完成段，
-//      私有 selector 缺失时安全跳过）、层时钟叠加 LayerSpeed（实验：在
-//      addAnimation 里按档位倍数设置 CALayer.speed，兜底加速未被时长 hook
-//      覆盖的私有动画路径；默认关，与档位叠乘）。
+// 关键安全设计：
+//   · TV/CV 列表类 hook（微信闪退根因族）全部独立由 ListAccel 开关控制，默认 OFF。
+//     微信用户保持关闭即可；其他 App 用户开启后获得完整列表动画加速。
+//   · 其余 49 个 hook 均为非列表类，跟随 Enabled 开关，微信安全。
+//   · CAAnimation 只 hook 基类 setDuration:；addAnimation 用 associated-object 标记防二次缩放。
+//   · 共存检测：进程内已加载其他加速器时只装弹簧层（互补）。
+//   · v1.1.0 高级模式（Speedy 式独立倍率）+ v1.2.0 层时钟叠加 保留。
 //
 // 配置：/var/Managed Preferences/mobile/com.local.sifusion.plist
 //   Enabled / Preset(0-4) / Spring / Blacklist
-//   Advanced / DurMult / VelMult / StiffMult / DampMult / MassMult（高级模式倍率）
-//   LayerSpeed（层时钟叠加，实验）
-// Darwin 通知 com.local.sifusion.settingschanged 热重载（改档杀 App 重开即生效）。
+//   Advanced / DurMult / VelMult / StiffMult / DampMult / MassMult / LayerSpeed
+//   ListAccel（列表类 hook 开关，默认关）
+// Darwin 通知 com.local.sifusion.settingschanged 热重载。
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
@@ -61,6 +48,7 @@ static double  gStiffMult = 1.0;       // 刚性倍数
 static double  gDampMult  = 1.0;       // 阻尼倍数
 static double  gMassMult  = 1.0;       // 质量倍数
 static BOOL    gLayerSpeed = NO;       // 层时钟叠加（实验，默认关）
+static BOOL    gListAccel = NO;        // 列表类 hook（TV/CV 变异，默认关，微信安全）
 
 // 档位 → 时长乘数（SpeedsterTS 实测数值）
 static const double kDurFactors[5] = { 0.50, 0.30, 0.15, 0.05, 0.001 };
@@ -77,6 +65,8 @@ static inline double _mult(void) {
     return f > 0.0 ? 1.0 / f : 10000.0;
 }
 static inline BOOL _on(void) { return gEnabled && !gBlacklisted && !gCompanion; }
+// 列表类 hook（TV/CV 选择/刷新/移动/编辑）：微信闪退根因族，独立开关默认关
+static inline BOOL _listOn(void) { return _on() && gListAccel; }
 
 static inline NSTimeInterval _scale(NSTimeInterval t) {
     if (t <= 0) return t;
@@ -116,6 +106,7 @@ static void _loadPref(void) {
             if ((dv = [d[@"DampMult"] doubleValue])  > 0) gDampMult  = dv;
             if ((dv = [d[@"MassMult"] doubleValue])  > 0) gMassMult  = dv;
             if (d[@"LayerSpeed"]) gLayerSpeed = [d[@"LayerSpeed"] boolValue];
+            if (d[@"ListAccel"])  gListAccel  = [d[@"ListAccel"] boolValue];
             gBlacklist = d[@"Blacklist"];
         }
     } @catch (__unused NSException *e) {}
@@ -393,6 +384,320 @@ static inline BOOL _springPhysicsOn(void) {
     }
 }
 
+#pragma mark ---------- v2.0.0 额外 hook（SpeedIntensifier v1.6.1 并集，非列表类） ----------
+
+// UIView 关键帧动画
++ (void)fu_animateKeyframesWithDuration:(NSTimeInterval)d delay:(NSTimeInterval)dl
+                                options:(UIViewKeyframeAnimationOptions)o
+                             animations:(void (^)(void))a completion:(void (^)(BOOL))c {
+    if (_on()) {
+        [self fu_animateKeyframesWithDuration:_scale(d) delay:dl * _factor()
+                                      options:o animations:a completion:c];
+    } else {
+        [self fu_animateKeyframesWithDuration:d delay:dl options:o animations:a completion:c];
+    }
+}
+// 老式 begin/commit 动画 API 时长
++ (void)fu_UIViewSetAnimationDuration:(NSTimeInterval)d {
+    [self fu_UIViewSetAnimationDuration:_on() ? _scale(d) : d];
+}
+// 老式 beginAnimations 延迟
++ (void)fu_setAnimationDelay:(NSTimeInterval)d {
+    if (_on()) {
+        double f = _factor();
+        [self fu_setAnimationDelay:(f >= 1.0 ? d : d * f)];
+    } else {
+        [self fu_setAnimationDelay:d];
+    }
+}
+// UIView 系统动画（行删除等）
++ (void)fu_performSystemAnimation:(UISystemAnimation)sa onViews:(NSArray<UIView *> *)views
+                          options:(UIViewAnimationOptions)opts
+                       animations:(void (^)(void))a completion:(void (^)(BOOL))c {
+    if (!_on()) {
+        [self fu_performSystemAnimation:sa onViews:views options:opts animations:a completion:c];
+        return;
+    }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scale(0.30)];
+    @try { [self fu_performSystemAnimation:sa onViews:views options:opts animations:a completion:c]; }
+    @finally { [CATransaction commit]; }
+}
+
+// UIViewPropertyAnimator 全族
+- (instancetype)fu_initWithDuration:(NSTimeInterval)d dampingRatio:(CGFloat)r animations:(void (^)(void))a {
+    return [self fu_initWithDuration:_on() ? _scale(d) : d dampingRatio:r animations:a];
+}
+- (instancetype)fu_initWithDuration:(NSTimeInterval)d controlPoint1:(CGPoint)p1
+                        controlPoint2:(CGPoint)p2 animations:(void (^)(void))a {
+    return [self fu_initWithDuration:_on() ? _scale(d) : d controlPoint1:p1 controlPoint2:p2 animations:a];
+}
+- (void)fu_addAnimations:(void (^)(void))a delayFactor:(CGFloat)df {
+    if (_on()) {
+        double f = _factor();
+        CGFloat nd = (f >= 1.0) ? df : (df * f);
+        [self fu_addAnimations:a delayFactor:nd];
+    } else {
+        [self fu_addAnimations:a delayFactor:df];
+    }
+}
++ (instancetype)fu_runningPropertyAnimatorWithDuration:(NSTimeInterval)d delay:(NSTimeInterval)dl
+                                                options:(UIViewAnimationOptions)o
+                                             animations:(void (^)(void))a
+                                             completion:(void (^)(UIViewAnimatingPosition))c {
+    if (_on()) {
+        double f = _factor();
+        return [self fu_runningPropertyAnimatorWithDuration:_scale(d)
+                                                     delay:(f >= 1.0 ? dl : dl * f)
+                                                   options:o animations:a completion:c];
+    }
+    return [self fu_runningPropertyAnimatorWithDuration:d delay:dl options:o animations:a completion:c];
+}
+- (void)fu_startAnimationAfterDelay:(NSTimeInterval)d {
+    if (_on()) {
+        double f = _factor();
+        [self fu_startAnimationAfterDelay:(f >= 1.0 ? d : d * f)];
+    } else {
+        [self fu_startAnimationAfterDelay:d];
+    }
+}
+
+// UIWindow 动画时长
++ (void)fu_windowSetAnimationDuration:(NSTimeInterval)d {
+    [self fu_windowSetAnimationDuration:_on() ? _scale(d) : d];
+}
+
+// CALayer 隐式动画：极速/瞬切档对常用隐式 key 返回 nil（瞬时到位）
+- (id)fu_actionForKey:(NSString *)key {
+    if (_on() && _factor() <= 0.01) {
+        NSString *k = key.lowercaseString ?: @"";
+        if ([k isEqualToString:@"position"] || [k isEqualToString:@"bounds"] ||
+            [k isEqualToString:@"frame"] || [k isEqualToString:@"opacity"] ||
+            [k isEqualToString:@"contents"] || [k isEqualToString:@"contentsrect"] ||
+            [k isEqualToString:@"backgroundcolor"] || [k isEqualToString:@"cornerradius"] ||
+            [k isEqualToString:@"hidden"] || [k isEqualToString:@"sublayers"]) {
+            return nil;
+        }
+    }
+    return [self fu_actionForKey:key];
+}
+
+// CAPropertyAnimation 二级链（仅当 setDuration: 与基类不同才安装，防重复链）
+- (void)fu_propSetDuration:(CFTimeInterval)d {
+    if (_on()) {
+        [self fu_propSetDuration:_scaleMin(d, 8.0)];
+    } else {
+        [self fu_propSetDuration:d];
+    }
+}
+
+// 交互式转场（直接透传，不做延迟——这三个本就不是时长控制点）
+- (void)fu_updateInteractiveTransition:(double)pct {
+    [self fu_updateInteractiveTransition:pct];
+}
+- (void)fu_cancelInteractiveTransition {
+    [self fu_cancelInteractiveTransition];
+}
+- (void)fu_finishInteractiveTransition {
+    [self fu_finishInteractiveTransition];
+}
+
+// UIPresentationController 容器布局（透传占位，保持 hook 链完整）
+- (void)fu_containerViewWillLayoutSubviews {
+    [self fu_containerViewWillLayoutSubviews];
+}
+
+// UIContextMenuInteraction 弹出
+- (void)fu_presentMenuAtLocation:(CGPoint)loc inView:(UIView *)vw {
+    if (!_on()) { [self fu_presentMenuAtLocation:loc inView:vw]; return; }
+    [self fu_presentMenuAtLocation:loc inView:vw];
+}
+
+// 导航整栈替换（激进：包在快速 UIView 动画块内调原 animated:NO）
+- (void)fu_setViewControllers:(NSArray<UIViewController *> *)vcs animated:(BOOL)an {
+    if (!an || !_on()) { [self fu_setViewControllers:vcs animated:an]; return; }
+    [UIView animateWithDuration:_scaleMin(0.35, 16.0)
+                          delay:0 options:UIViewAnimationOptionCurveEaseInOut
+                       animations:^{ [self fu_setViewControllers:vcs animated:NO]; }
+                       completion:nil];
+}
+
+// Tab 直选 index
+- (void)fu_setSelectedIndex:(NSUInteger)idx {
+    if (!_on()) { [self fu_setSelectedIndex:idx]; return; }
+    [UIView animateWithDuration:_scaleMin(0.25, 16.0)
+                          delay:0 options:UIViewAnimationOptionCurveEaseInOut
+                       animations:^{ [self fu_setSelectedIndex:idx]; }
+                       completion:nil];
+}
+// Tab 直选 VC
+- (void)fu_setSelectedViewController:(UIViewController *)vc {
+    if (!_on()) { [self fu_setSelectedViewController:vc]; return; }
+    [UIView animateWithDuration:_scaleMin(0.25, 16.0)
+                          delay:0 options:UIViewAnimationOptionCurveEaseInOut
+                       animations:^{ [self fu_setSelectedViewController:vc]; }
+                       completion:nil];
+}
+
+// PageVC 翻页
+- (void)fu_setViewControllers:(NSArray<UIViewController *> *)vcs
+                    direction:(UIPageViewControllerNavigationDirection)dir
+                     animated:(BOOL)an completion:(void (^)(BOOL))c {
+    if (!an || !_on()) { [self fu_setViewControllers:vcs direction:dir animated:an completion:c]; return; }
+    [self fu_setViewControllers:vcs direction:dir animated:NO completion:c];
+}
+
+// UIScrollView 缩放
+- (void)fu_setZoomScale:(CGFloat)zs animated:(BOOL)an {
+    if (!an || !_on()) { [self fu_setZoomScale:zs animated:an]; return; }
+    [UIView animateWithDuration:_scale(0.25) delay:0 options:UIViewAnimationOptionCurveEaseInOut
+                     animations:^{ [self fu_setZoomScale:zs animated:NO]; } completion:nil];
+}
+- (void)fu_zoomToRect:(CGRect)r animated:(BOOL)an {
+    if (!an || !_on()) { [self fu_zoomToRect:r animated:an]; return; }
+    [UIView animateWithDuration:_scale(0.25) delay:0 options:UIViewAnimationOptionCurveEaseInOut
+                     animations:^{ [self fu_zoomToRect:r animated:NO]; } completion:nil];
+}
+
+// 三类栏 setItems
+- (void)fu_navBarSetItems:(NSArray<UINavigationItem *> *)items animated:(BOOL)an {
+    if (!an || !_on()) { [self fu_navBarSetItems:items animated:an]; return; }
+    [self fu_navBarSetItems:items animated:NO];
+}
+- (void)fu_tabBarSetItems:(NSArray<UITabBarItem *> *)items animated:(BOOL)an {
+    if (!an || !_on()) { [self fu_tabBarSetItems:items animated:an]; return; }
+    [self fu_tabBarSetItems:items animated:NO];
+}
+- (void)fu_toolbarSetItems:(NSArray<UIBarButtonItem *> *)items animated:(BOOL)an {
+    if (!an || !_on()) { [self fu_toolbarSetItems:items animated:an]; return; }
+    [self fu_toolbarSetItems:items animated:NO];
+}
+
+// 控件：进度 / 开关 / 滑杆
+- (void)fu_setProgress:(float)p animated:(BOOL)an {
+    if (!an || !_on()) { [self fu_setProgress:p animated:an]; return; }
+    [self fu_setProgress:p animated:NO];
+}
+- (void)fu_setOn:(BOOL)on animated:(BOOL)an {
+    if (!an || !_on()) { [self fu_setOn:on animated:an]; return; }
+    [self fu_setOn:on animated:NO];
+}
+- (void)fu_setValue:(float)v animated:(BOOL)an {
+    if (!an || !_on()) { [self fu_setValue:v animated:an]; return; }
+    [self fu_setValue:v animated:NO];
+}
+
+#pragma mark ---------- v2.0.0 列表类 hook（_listOn 控制，默认关，微信安全） ----------
+
+// UITableView
+- (void)fu_TV_performBatchUpdates:(void (^)(void))updates completion:(void (^)(BOOL))c {
+    if (!_listOn()) { [self fu_TV_performBatchUpdates:updates completion:c]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scale(0.25)];
+    @try { [self fu_TV_performBatchUpdates:updates completion:c]; }
+    @finally { [CATransaction commit]; }
+}
+- (void)fu_TV_insertRowsAtIndexPaths:(NSArray<NSIndexPath *> *)ip withRowAnimation:(UITableViewRowAnimation)an {
+    if (!_listOn()) { [self fu_TV_insertRowsAtIndexPaths:ip withRowAnimation:an]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scale(0.25)];
+    @try { [self fu_TV_insertRowsAtIndexPaths:ip withRowAnimation:an]; }
+    @finally { [CATransaction commit]; }
+}
+- (void)fu_TV_deleteRowsAtIndexPaths:(NSArray<NSIndexPath *> *)ip withRowAnimation:(UITableViewRowAnimation)an {
+    if (!_listOn()) { [self fu_TV_deleteRowsAtIndexPaths:ip withRowAnimation:an]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scale(0.25)];
+    @try { [self fu_TV_deleteRowsAtIndexPaths:ip withRowAnimation:an]; }
+    @finally { [CATransaction commit]; }
+}
+- (void)fu_TV_reloadRowsAtIndexPaths:(NSArray<NSIndexPath *> *)ip withRowAnimation:(UITableViewRowAnimation)an {
+    if (!_listOn()) { [self fu_TV_reloadRowsAtIndexPaths:ip withRowAnimation:an]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scale(0.25)];
+    @try { [self fu_TV_reloadRowsAtIndexPaths:ip withRowAnimation:an]; }
+    @finally { [CATransaction commit]; }
+}
+- (void)fu_TV_setEditing:(BOOL)ed animated:(BOOL)an {
+    if (!an || !_listOn()) { [self fu_TV_setEditing:ed animated:an]; return; }
+    [self fu_TV_setEditing:ed animated:NO];
+}
+- (void)fu_TV_reloadSections:(NSIndexSet *)sec withRowAnimation:(UITableViewRowAnimation)an {
+    if (!_listOn()) { [self fu_TV_reloadSections:sec withRowAnimation:an]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scale(0.25)];
+    @try { [self fu_TV_reloadSections:sec withRowAnimation:an]; }
+    @finally { [CATransaction commit]; }
+}
+- (void)fu_TV_selectRowAtIndexPath:(NSIndexPath *)ip animated:(BOOL)an
+                    scrollPosition:(UITableViewScrollPosition)sp {
+    if (!an || !_listOn()) { [self fu_TV_selectRowAtIndexPath:ip animated:an scrollPosition:sp]; return; }
+    [self fu_TV_selectRowAtIndexPath:ip animated:NO scrollPosition:sp];
+}
+- (void)fu_TV_deselectRowAtIndexPath:(NSIndexPath *)ip animated:(BOOL)an {
+    if (!an || !_listOn()) { [self fu_TV_deselectRowAtIndexPath:ip animated:an]; return; }
+    [self fu_TV_deselectRowAtIndexPath:ip animated:NO];
+}
+- (void)fu_TV_moveRowAtIndexPath:(NSIndexPath *)src toIndexPath:(NSIndexPath *)dst {
+    if (!_listOn()) { [self fu_TV_moveRowAtIndexPath:src toIndexPath:dst]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scale(0.25)];
+    @try { [self fu_TV_moveRowAtIndexPath:src toIndexPath:dst]; }
+    @finally { [CATransaction commit]; }
+}
+
+// UICollectionView
+- (void)fu_CV_performBatchUpdates:(void (^)(void))updates completion:(void (^)(BOOL))c {
+    if (!_listOn()) { [self fu_CV_performBatchUpdates:updates completion:c]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scale(0.25)];
+    @try { [self fu_CV_performBatchUpdates:updates completion:c]; }
+    @finally { [CATransaction commit]; }
+}
+- (void)fu_CV_insertItemsAtIndexPaths:(NSArray<NSIndexPath *> *)ip {
+    if (!_listOn()) { [self fu_CV_insertItemsAtIndexPaths:ip]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scale(0.25)];
+    @try { [self fu_CV_insertItemsAtIndexPaths:ip]; }
+    @finally { [CATransaction commit]; }
+}
+- (void)fu_CV_deleteItemsAtIndexPaths:(NSArray<NSIndexPath *> *)ip {
+    if (!_listOn()) { [self fu_CV_deleteItemsAtIndexPaths:ip]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scale(0.25)];
+    @try { [self fu_CV_deleteItemsAtIndexPaths:ip]; }
+    @finally { [CATransaction commit]; }
+}
+- (void)fu_CV_reloadItemsAtIndexPaths:(NSArray<NSIndexPath *> *)ip {
+    if (!_listOn()) { [self fu_CV_reloadItemsAtIndexPaths:ip]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scale(0.25)];
+    @try { [self fu_CV_reloadItemsAtIndexPaths:ip]; }
+    @finally { [CATransaction commit]; }
+}
+- (void)fu_CV_setLayout:(UICollectionViewLayout *)nl animated:(BOOL)an {
+    if (!an || !_listOn()) { [self fu_CV_setLayout:nl animated:an]; return; }
+    [self fu_CV_setLayout:nl animated:NO];
+}
+- (void)fu_CV_setLayout:(UICollectionViewLayout *)nl animated:(BOOL)an completion:(void (^)(BOOL))c {
+    if (!an || !_listOn()) { [self fu_CV_setLayout:nl animated:an completion:c]; return; }
+    [self fu_CV_setLayout:nl animated:NO completion:c];
+}
+- (void)fu_CV_moveItemAtIndexPath:(NSIndexPath *)src toIndexPath:(NSIndexPath *)dst {
+    if (!_listOn()) { [self fu_CV_moveItemAtIndexPath:src toIndexPath:dst]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scale(0.25)];
+    @try { [self fu_CV_moveItemAtIndexPath:src toIndexPath:dst]; }
+    @finally { [CATransaction commit]; }
+}
+- (void)fu_CV_reloadSections:(NSIndexSet *)sec {
+    if (!_listOn()) { [self fu_CV_reloadSections:sec]; return; }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:_scale(0.25)];
+    @try { [self fu_CV_reloadSections:sec]; }
+    @finally { [CATransaction commit]; }
+}
+
 @end
 
 // ================================ 共存检测 ================================
@@ -482,11 +787,165 @@ static void _fu_entry(void) {
                         @selector(fu_presentViewController:animated:completion:));
             ok += _swiz(vc, @selector(dismissViewControllerAnimated:completion:),
                         @selector(fu_dismissViewControllerAnimated:completion:));
+
+            // ==================== v2.0.0 额外 hook（非列表类，跟随 Enabled） ====================
+            Class uiv = [UIView class];
+            total += 4;
+            ok += _swizClass(uiv, @selector(animateKeyframesWithDuration:delay:options:animations:completion:),
+                             @selector(fu_animateKeyframesWithDuration:delay:options:animations:completion:));
+            ok += _swizClass(uiv, @selector(setAnimationDuration:),
+                             @selector(fu_UIViewSetAnimationDuration:));
+            ok += _swizClass(uiv, @selector(setAnimationDelay:),
+                             @selector(fu_setAnimationDelay:));
+            ok += _swizClass(uiv, @selector(performSystemAnimation:onViews:options:animations:completion:),
+                             @selector(fu_performSystemAnimation:onViews:options:animations:completion:));
+
+            Class uipa = [UIViewPropertyAnimator class];
+            total += 5;
+            ok += _swiz(uipa, @selector(initWithDuration:dampingRatio:animations:),
+                        @selector(fu_initWithDuration:dampingRatio:animations:));
+            ok += _swiz(uipa, @selector(initWithDuration:controlPoint1:controlPoint2:animations:),
+                        @selector(fu_initWithDuration:controlPoint1:controlPoint2:animations:));
+            ok += _swiz(uipa, @selector(addAnimations:delayFactor:),
+                        @selector(fu_addAnimations:delayFactor:));
+            ok += _swizClass(uipa, @selector(runningPropertyAnimatorWithDuration:delay:options:animations:completion:),
+                             @selector(fu_runningPropertyAnimatorWithDuration:delay:options:animations:completion:));
+            ok += _swiz(uipa, @selector(startAnimationAfterDelay:),
+                        @selector(fu_startAnimationAfterDelay:));
+
+            total += 1;
+            ok += _swizClass([UIWindow class], @selector(setAnimationDuration:),
+                             @selector(fu_windowSetAnimationDuration:));
+
+            total += 1;
+            ok += _swiz([CALayer class], @selector(actionForKey:),
+                        @selector(fu_actionForKey:));
+
+            // CAPropertyAnimation 二级链：仅当 setDuration: 与基类不同才装（防重复链）
+            {
+                Method baseM = class_getInstanceMethod([CAAnimation class], @selector(setDuration:));
+                Method propM = class_getInstanceMethod([CAPropertyAnimation class], @selector(setDuration:));
+                if (propM && baseM != propM) {
+                    total += 1;
+                    ok += _swiz([CAPropertyAnimation class], @selector(setDuration:),
+                                @selector(fu_propSetDuration:));
+                }
+            }
+
+            Class itt = [UIPercentDrivenInteractiveTransition class];
+            total += 3;
+            ok += _swiz(itt, @selector(updateInteractiveTransition:),
+                        @selector(fu_updateInteractiveTransition:));
+            ok += _swiz(itt, @selector(cancelInteractiveTransition),
+                        @selector(fu_cancelInteractiveTransition));
+            ok += _swiz(itt, @selector(finishInteractiveTransition),
+                        @selector(fu_finishInteractiveTransition));
+
+            total += 1;
+            ok += _swiz([UIPresentationController class], @selector(containerViewWillLayoutSubviews),
+                        @selector(fu_containerViewWillLayoutSubviews));
+
+            total += 1;
+            ok += _swiz([UIContextMenuInteraction class], @selector(presentMenuAtLocation:inView:),
+                        @selector(fu_presentMenuAtLocation:inView:));
+
+            // 导航整栈替换
+            total += 1;
+            ok += _swiz(nav, @selector(setViewControllers:animated:),
+                        @selector(fu_setViewControllers:animated:));
+
+            // Tab 直选
+            Class tab = [UITabBarController class];
+            total += 2;
+            ok += _swiz(tab, @selector(setSelectedIndex:),
+                        @selector(fu_setSelectedIndex:));
+            ok += _swiz(tab, @selector(setSelectedViewController:),
+                        @selector(fu_setSelectedViewController:));
+
+            // PageVC 翻页
+            Class pvc = [UIPageViewController class];
+            total += 1;
+            ok += _swiz(pvc, @selector(setViewControllers:direction:animated:completion:),
+                        @selector(fu_setViewControllers:direction:animated:completion:));
+
+            // UIScrollView 缩放
+            Class uisv = [UIScrollView class];
+            total += 2;
+            ok += _swiz(uisv, @selector(setZoomScale:animated:),
+                        @selector(fu_setZoomScale:animated:));
+            ok += _swiz(uisv, @selector(zoomToRect:animated:),
+                        @selector(fu_zoomToRect:animated:));
+
+            // 三类栏 setItems
+            total += 3;
+            ok += _swiz([UINavigationBar class], @selector(setItems:animated:),
+                        @selector(fu_navBarSetItems:animated:));
+            ok += _swiz([UITabBar class], @selector(setItems:animated:),
+                        @selector(fu_tabBarSetItems:animated:));
+            ok += _swiz([UIToolbar class], @selector(setItems:animated:),
+                        @selector(fu_toolbarSetItems:animated:));
+
+            // 控件
+            total += 3;
+            ok += _swiz([UIProgressView class], @selector(setProgress:animated:),
+                        @selector(fu_setProgress:animated:));
+            ok += _swiz([UISwitch class], @selector(setOn:animated:),
+                        @selector(fu_setOn:animated:));
+            ok += _swiz([UISlider class], @selector(setValue:animated:),
+                        @selector(fu_setValue:animated:));
+
+            // ==================== v2.0.0 列表类 hook（ListAccel 开关，默认关） ====================
+            if (_listOn()) {
+                int lok = 0, ltotal = 0;
+                Class tv = [UITableView class];
+                ltotal += 9;
+                lok += _swiz(tv, @selector(performBatchUpdates:completion:),
+                             @selector(fu_TV_performBatchUpdates:completion:));
+                lok += _swiz(tv, @selector(insertRowsAtIndexPaths:withRowAnimation:),
+                             @selector(fu_TV_insertRowsAtIndexPaths:withRowAnimation:));
+                lok += _swiz(tv, @selector(deleteRowsAtIndexPaths:withRowAnimation:),
+                             @selector(fu_TV_deleteRowsAtIndexPaths:withRowAnimation:));
+                lok += _swiz(tv, @selector(reloadRowsAtIndexPaths:withRowAnimation:),
+                             @selector(fu_TV_reloadRowsAtIndexPaths:withRowAnimation:));
+                lok += _swiz(tv, @selector(setEditing:animated:),
+                             @selector(fu_TV_setEditing:animated:));
+                lok += _swiz(tv, @selector(reloadSections:withRowAnimation:),
+                             @selector(fu_TV_reloadSections:withRowAnimation:));
+                lok += _swiz(tv, @selector(selectRowAtIndexPath:animated:scrollPosition:),
+                             @selector(fu_TV_selectRowAtIndexPath:animated:scrollPosition:));
+                lok += _swiz(tv, @selector(deselectRowAtIndexPath:animated:),
+                             @selector(fu_TV_deselectRowAtIndexPath:animated:));
+                lok += _swiz(tv, @selector(moveRowAtIndexPath:toIndexPath:),
+                             @selector(fu_TV_moveRowAtIndexPath:toIndexPath:));
+
+                Class cv = [UICollectionView class];
+                ltotal += 8;
+                lok += _swiz(cv, @selector(performBatchUpdates:completion:),
+                             @selector(fu_CV_performBatchUpdates:completion:));
+                lok += _swiz(cv, @selector(insertItemsAtIndexPaths:),
+                             @selector(fu_CV_insertItemsAtIndexPaths:));
+                lok += _swiz(cv, @selector(deleteItemsAtIndexPaths:),
+                             @selector(fu_CV_deleteItemsAtIndexPaths:));
+                lok += _swiz(cv, @selector(reloadItemsAtIndexPaths:),
+                             @selector(fu_CV_reloadItemsAtIndexPaths:));
+                lok += _swiz(cv, @selector(setCollectionViewLayout:animated:),
+                             @selector(fu_CV_setLayout:animated:));
+                lok += _swiz(cv, @selector(setCollectionViewLayout:animated:completion:),
+                             @selector(fu_CV_setLayout:animated:completion:));
+                lok += _swiz(cv, @selector(moveItemAtIndexPath:toIndexPath:),
+                             @selector(fu_CV_moveItemAtIndexPath:toIndexPath:));
+                lok += _swiz(cv, @selector(reloadSections:),
+                             @selector(fu_CV_reloadSections:));
+
+                total += ltotal;
+                ok += lok;
+                NSLog(@"[SIFusion] list hooks %d/%d (ListAccel=ON)", lok, ltotal);
+            }
         }
 
-        NSLog(@"[SIFusion] v1.2.0 loaded in %@: %@ mode, hooks %d/%d (preset=%d spring=%d adv=%d dur=%.3f lspeed=%d blacklisted=%d)",
+        NSLog(@"[SIFusion] v2.0.0 Max loaded in %@: %@ mode, hooks %d/%d (preset=%d spring=%d adv=%d lspeed=%d list=%d blacklisted=%d)",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
-              gCompanion ? @"COMPANION (stiffness-only)" : @"STANDALONE (full 20)",
-              ok, total, gPreset, gSpring, gAdvanced, gDurMult, gLayerSpeed, gBlacklisted);
+              gCompanion ? @"COMPANION (spring-only)" : @"STANDALONE (full ~68)",
+              ok, total, gPreset, gSpring, gAdvanced, gLayerSpeed, gListAccel, gBlacklisted);
     }
 }

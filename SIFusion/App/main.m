@@ -121,7 +121,7 @@ static NSString *FUReboot(void) {
 #pragma mark ==================== 配置读写 ====================
 static void FUWriteConfig(BOOL enabled, int preset, BOOL spring, NSArray *blacklist,
                           BOOL adv, double dur, double vel, double stiff, double damp, double mass,
-                          BOOL lspeed) {
+                          BOOL lspeed, BOOL list) {
     mkdir("/var/Managed Preferences", 0755);
     mkdir("/var/Managed Preferences/mobile", 0755);
     NSDictionary *d = @{ @"Enabled": @(enabled),
@@ -134,7 +134,8 @@ static void FUWriteConfig(BOOL enabled, int preset, BOOL spring, NSArray *blackl
                          @"StiffMult": @(stiff),
                          @"DampMult": @(damp),
                          @"MassMult": @(mass),
-                         @"LayerSpeed": @(lspeed) };
+                         @"LayerSpeed": @(lspeed),
+                         @"ListAccel": @(list) };
     BOOL ok = [d writeToFile:kPrefPath atomically:YES];
     NSLog(@"[SIFApp] write pref -> %d", ok);
     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
@@ -153,7 +154,8 @@ static NSDictionary *FUReadConfig(void) {
                    @"StiffMult": @1.0,
                    @"DampMult": @1.0,
                    @"MassMult": @1.0,
-                   @"LayerSpeed": @NO };
+                   @"LayerSpeed": @NO,
+                   @"ListAccel": @NO };
     return d;
 }
 
@@ -168,6 +170,7 @@ static NSDictionary *FUReadConfig(void) {
     UILabel *_status;
     UISwitch *_advSwitch;
     UISwitch *_lsSwitch;
+    UISwitch *_listSwitch;
     UISlider *_durSlider, *_velSlider, *_stiffSlider, *_dampSlider, *_massSlider;
     UILabel *_durLbl, *_velLbl, *_stiffLbl, *_dampLbl, *_massLbl;
 }
@@ -183,6 +186,7 @@ static NSDictionary *FUReadConfig(void) {
     if (cfgPreset < 0 || cfgPreset > 4) cfgPreset = 2;
     BOOL cfgAdv     = cfg[@"Advanced"] ? [cfg[@"Advanced"] boolValue] : NO;
     BOOL cfgLS      = cfg[@"LayerSpeed"] ? [cfg[@"LayerSpeed"] boolValue] : NO;
+    BOOL cfgList    = cfg[@"ListAccel"] ? [cfg[@"ListAccel"] boolValue] : NO;
     double cfgDur   = cfg[@"DurMult"]   ? [cfg[@"DurMult"] doubleValue]   : 0.15;
     double cfgVel   = cfg[@"VelMult"]   ? [cfg[@"VelMult"] doubleValue]   : 1.0;
     double cfgStiff = cfg[@"StiffMult"] ? [cfg[@"StiffMult"] doubleValue] : 1.0;
@@ -200,7 +204,7 @@ static NSDictionary *FUReadConfig(void) {
     title.textAlignment = NSTextAlignmentCenter;
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"v1.2.0 · 20 Hooks · 融合增强";
+    sub.text = @"v2.0.0 Max · ~68 Hooks · 终极融合";
     sub.font = [UIFont systemFontOfSize:13];
     sub.textColor = [UIColor secondaryLabelColor];
     sub.textAlignment = NSTextAlignmentCenter;
@@ -251,6 +255,15 @@ static NSDictionary *FUReadConfig(void) {
     lblLS.numberOfLines = 0;
     _lsSwitch = [[UISwitch alloc] init];
     _lsSwitch.on = cfgLS;
+
+    // 列表加速：TV/CV 选择/刷新/移动 hook。微信闪退根因族，默认关。
+    // 微信用户保持关闭；其他 App 开启后获得完整列表动画加速。
+    UILabel *lblList = [[UILabel alloc] init];
+    lblList.text = @"列表加速（TV/CV，微信勿开）";
+    lblList.font = [UIFont systemFontOfSize:15];
+    lblList.numberOfLines = 0;
+    _listSwitch = [[UISwitch alloc] init];
+    _listSwitch.on = cfgList;
 
     UILabel *lbl4 = [[UILabel alloc] init];
     lbl4.text = @"黑名单（每行一个 Bundle ID，命中则不加速）";
@@ -306,6 +319,7 @@ static NSDictionary *FUReadConfig(void) {
         advHint,
         durRow, velRow, stiffRow, dampRow, massRow,
         [self _rowWith:lblLS ctrl:_lsSwitch],
+        [self _rowWith:lblList ctrl:_listSwitch],
         lbl4, _blacklist,
         apply, reboot,
         hint, _status
@@ -403,13 +417,15 @@ static NSDictionary *FUReadConfig(void) {
     NSArray *names = @[ @"微快", @"快", @"很快", @"极快", @"瞬切" ];
     FUWriteConfig(_enableSwitch.on, preset, _springSwitch.on, [self _collectBlacklist],
                   _advSwitch.on, _durSlider.value, _velSlider.value,
-                  _stiffSlider.value, _dampSlider.value, _massSlider.value, _lsSwitch.on);
-    _status.text = [NSString stringWithFormat:@"已保存：%@ · %@ · 弹簧%@ · 高级%@ · 层时钟%@。正在注销…",
+                  _stiffSlider.value, _dampSlider.value, _massSlider.value,
+                  _lsSwitch.on, _listSwitch.on);
+    _status.text = [NSString stringWithFormat:@"已保存：%@ · %@ · 弹簧%@ · 高级%@ · 层时钟%@ · 列表%@。正在注销…",
                     _enableSwitch.on ? @"开" : @"关",
                     names[preset],
                     _springSwitch.on ? @"开" : @"关",
                     _advSwitch.on ? @"开" : @"关",
-                    _lsSwitch.on ? @"开" : @"关"];
+                    _lsSwitch.on ? @"开" : @"关",
+                    _listSwitch.on ? @"开" : @"关"];
     dispatch_after(fu_dwell(0.6), dispatch_get_main_queue(), ^{
         FURespring();
     });
@@ -432,7 +448,8 @@ static NSDictionary *FUReadConfig(void) {
     int preset = _speedSeg.selectedSegmentIndex < 0 ? 2 : (int)_speedSeg.selectedSegmentIndex;
     FUWriteConfig(_enableSwitch.on, preset, _springSwitch.on, [self _collectBlacklist],
                   _advSwitch.on, _durSlider.value, _velSlider.value,
-                  _stiffSlider.value, _dampSlider.value, _massSlider.value, _lsSwitch.on);
+                  _stiffSlider.value, _dampSlider.value, _massSlider.value,
+                  _lsSwitch.on, _listSwitch.on);
     NSString *way = FUReboot();
     _status.text = [NSString stringWithFormat:@"已保存，重启触发方式：%@", way];
     NSLog(@"[SIFApp] reboot via: %@", way);
