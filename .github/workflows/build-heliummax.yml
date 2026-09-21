@@ -1,0 +1,45 @@
+name: Build Helium Max
+on:
+  push:
+    tags: ['heliummax-v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CC=$(xcrun -sdk iphoneos -f clang)
+          mkdir -p build/Payload/HeliumMax.app
+
+          $CC -arch arm64 -isysroot "$SDK" \
+            -fobjc-arc -fmodules \
+            -miphoneos-version-min=14.0 \
+            -framework UIKit -framework Foundation -framework AVFoundation \
+            -framework CoreTelephony -framework IOKit \
+            -framework CoreGraphics -framework QuartzCore \
+            -o build/Payload/HeliumMax.app/HeliumMax \
+            HeliumMax/App/main.m HeliumMax/HUD/HUDWidget.m HeliumMax/HUD/HUDManager.m \
+            || exit 1
+
+          cp HeliumMax/App/Info.plist build/Payload/HeliumMax.app/Info.plist
+
+          # entitlements
+          /usr/libexec/PlistBuddy -c "Delete :CFBundleInfoDictionaryVersion" build/Payload/HeliumMax.app/Info.plist 2>/dev/null || true
+          ldid -SHeliumMax/entitlements.plist build/Payload/HeliumMax.app/HeliumMax || \
+            ldid -S build/Payload/HeliumMax.app/HeliumMax
+
+          # verify arm64
+          file build/Payload/HeliumMax.app/HeliumMax
+
+          cd build && zip -qr ../HeliumMax.ipa Payload && cd ..
+          mkdir -p artifacts
+          cp HeliumMax.ipa artifacts/
+          ls -la artifacts/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HeliumMax-artifacts
+          path: artifacts/
