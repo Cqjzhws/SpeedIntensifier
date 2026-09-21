@@ -32,7 +32,7 @@ jobs:
             -isysroot "$SDK" \
             -miphoneos-version-min=14.0 \
             -undefined dynamic_lookup -fobjc-arc \
-            -framework Foundation -framework UIKit -framework QuartzCore \
+            -framework Foundation -framework UIKit -framework QuartzCore -framework Metal \
             -o artifacts/SIOriginal.dylib SIOriginal/Tweak/SIOriginal.m
           codesign --force --sign - artifacts/SIOriginal.dylib
           lipo -info artifacts/SIOriginal.dylib
