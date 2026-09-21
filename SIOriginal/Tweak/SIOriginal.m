@@ -674,6 +674,23 @@ static void HFP_hook(Class c, SEL sel, IMP newImp, IMP *out) {
     method_setImplementation(m, newImp);
 }
 
+// MTLCommandBuffer 的实现类（AGXMetal 驱动）在 App 首次创建 MTLDevice 时才动态注册，
+// constructor 阶段往往还不存在，必须延迟重试，否则最关键的 presentDrawable hook 装不上。
+static volatile BOOL gHFPMetalHooked = NO;
+static void HFP_installMetalHooks(void) {
+    if (gHFPMetalHooked) return;
+    Class cd = objc_getClass("CAMetalDrawable") ?: HFP_classForProtocol(@protocol(CAMetalDrawable));
+    if (cd && !o_hfp_presentDur)
+        HFP_hook(cd, NSSelectorFromString(@"presentAfterMinimumDuration:"),
+                 (IMP)hfp_presentDur, (IMP *)&o_hfp_presentDur);
+    Class cb = objc_getClass("MTLCommandBuffer") ?: HFP_classForProtocol(@protocol(MTLCommandBuffer));
+    if (cb) {
+        HFP_hook(cb, NSSelectorFromString(@"presentDrawable:afterMinimumDuration:"),
+                 (IMP)hfp_presentDrawableDur, (IMP *)&o_hfp_presentDrawableDur);
+        if (o_hfp_presentDrawableDur) gHFPMetalHooked = YES;
+    }
+}
+
 __attribute__((constructor))
 static void HighFPSInit(void) {
     @autoreleasepool {
@@ -690,15 +707,13 @@ static void HighFPSInit(void) {
         HFP_hook(ml, @selector(maximumDrawableCount), (IMP)hfp_mdcGetter, (IMP *)&o_hfp_mdcGetter);
         HFP_hook(ml, @selector(setMaximumDrawableCount:), (IMP)hfp_mdcSetter, (IMP *)&o_hfp_mdcSetter);
 
-        // CAMetalDrawable：优先同名类，否则按协议找
-        Class cd = objc_getClass("CAMetalDrawable") ?: HFP_classForProtocol(@protocol(CAMetalDrawable));
-        HFP_hook(cd, NSSelectorFromString(@"presentAfterMinimumDuration:"),
-                 (IMP)hfp_presentDur, (IMP *)&o_hfp_presentDur);
-
-        // MTLCommandBuffer：协议实现类（AGXMetal...CommandBuffer 等）
-        Class cb = objc_getClass("MTLCommandBuffer") ?: HFP_classForProtocol(@protocol(MTLCommandBuffer));
-        HFP_hook(cb, NSSelectorFromString(@"presentDrawable:afterMinimumDuration:"),
-                 (IMP)hfp_presentDrawableDur, (IMP *)&o_hfp_presentDrawableDur);
+        // Metal 驱动类懒加载：立即试一次，之后 0.8s / 2.5s / 6s 重试直到装上
+        HFP_installMetalHooks();
+        double delays[3] = {0.8, 2.5, 6.0};
+        for (int i = 0; i < 3; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[i] * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ HFP_installMetalHooks(); });
+        }
     }
 }
 
