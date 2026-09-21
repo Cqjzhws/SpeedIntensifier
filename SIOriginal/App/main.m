@@ -69,7 +69,7 @@ static NSMutableDictionary *ReadConfig(void) {
     return d;
 }
 
-static void WriteConfig(NSMutableDictionary *cfg) {
+static BOOL WriteConfig(NSMutableDictionary *cfg) {
     mkdir("/var/Managed Preferences", 0755);
     mkdir("/var/Managed Preferences/mobile", 0755);
     // 合并写入：保留 com.apple.UIKit.plist 原有系统键（如 UIAnimationDragCoefficient）
@@ -80,9 +80,12 @@ static void WriteConfig(NSMutableDictionary *cfg) {
     for (NSString *k in sioKeys) {
         if (cfg[k]) merged[k] = cfg[k];
     }
-    [merged writeToFile:PrefPath atomically:YES];
-    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                                         (__bridge CFStringRef)NotifyKey, NULL, NULL, YES);
+    BOOL ok = [merged writeToFile:PrefPath atomically:YES];
+    if (ok) {
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                             (__bridge CFStringRef)NotifyKey, NULL, NULL, YES);
+    }
+    return ok;
 }
 
 static NSString *ModeText(int m) {
@@ -235,6 +238,15 @@ static void WriteUIKitDrag(BOOL enabled) {
     [rs.heightAnchor constraintEqualToConstant:40].active = YES;
     [rs addTarget:self action:@selector(onRespring) forControlEvents:UIControlEventTouchUpInside];
 
+    UIButton *rb = [UIButton buttonWithType:UIButtonTypeSystem];
+    [rb setTitle:@"硬重启设备" forState:UIControlStateNormal];
+    [rb setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
+    rb.layer.cornerRadius = 12;
+    rb.layer.borderWidth = 1;
+    rb.layer.borderColor = [UIColor systemRedColor].CGColor;
+    [rb.heightAnchor constraintEqualToConstant:40].active = YES;
+    [rb addTarget:self action:@selector(onReboot) forControlEvents:UIControlEventTouchUpInside];
+
     UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。慢放 = 原版 slowDownFactor 功能，可观察动画细节。瞬切 = 0.01 秒直达。" size:12 dim:YES];
     hint.textAlignment = NSTextAlignmentCenter;
     UILabel *listHint = [self label:@"列表加速含 24 个 TV/CV hook，企业微信/微信已双重保护（黑名单 + 硬编码）。其他重列表 App（淘宝/京东）若出现卡死请关闭此开关。" size:12 dim:YES];
@@ -256,7 +268,7 @@ static void WriteUIKitDrag(BOOL enabled) {
         [self row:lblCF ctrl:_swCF],
         uiKitTitle,
         [self row:lblUIKit ctrl:_swUIKit],
-        lblBL, _blacklist, save, rs, listHint, hint, _status
+        lblBL, _blacklist, save, rs, rb, listHint, hint, _status
     ]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 13;
@@ -307,18 +319,34 @@ static void WriteUIKitDrag(BOOL enabled) {
         if (t.length) [bl addObject:t];
     }
     cfg[@"Blacklist"] = bl;
-    WriteConfig(cfg);
+    BOOL ok = WriteConfig(cfg);
     WriteAx(@"ReduceMotionEnabled", _swRM.on);
     WriteAx(@"PreferCrossFadeTransitions", _swCF.on);
     WriteUIKitDrag(_swUIKit.on);
-    _status.text = [NSString stringWithFormat:@"已保存：%@ · %@ · 弹簧%@ · 转场%@ · 列表%@",
-                    _swEnabled.on ? @"开" : @"关",
-                    ModeText((int)_segMode.selectedSegmentIndex),
-                    _swSpring.on ? @"开" : @"关",
-                    _swExtra.on ? @"开" : @"关",
-                    _swList.on ? @"开" : @"关"];
-    if (_swRM.on || _swCF.on || _swUIKit.on) {
-        _status.text = [_status.text stringByAppendingString:@" · 系统级配置已写入，需注销/重启目标 App"];
+
+    UINotificationFeedbackGenerator *fg = [[UINotificationFeedbackGenerator alloc] init];
+    [fg prepare];
+    if (ok) {
+        [fg notificationOccurred:UINotificationFeedbackTypeSuccess];
+        NSString *msg = [NSString stringWithFormat:@"已保存：%@ · %@ · 弹簧%@ · 转场%@ · 列表%@",
+                        _swEnabled.on ? @"开" : @"关",
+                        ModeText((int)_segMode.selectedSegmentIndex),
+                        _swSpring.on ? @"开" : @"关",
+                        _swExtra.on ? @"开" : @"关",
+                        _swList.on ? @"开" : @"关"];
+        _status.text = msg;
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"✅ 配置已保存"
+                            message:msg preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+    } else {
+        [fg notificationOccurred:UINotificationFeedbackTypeError];
+        _status.text = @"❌ 保存失败，请检查权限";
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"❌ 保存失败"
+                            message:@"无法写入 com.apple.UIKit.plist，请确认 TrollStore 权限正常。"
+                            preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
     }
 }
 
@@ -326,6 +354,21 @@ static void WriteUIKitDrag(BOOL enabled) {
     [self onSave];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ Respring(); });
+}
+
+- (void)onReboot {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"确认硬重启"
+                        message:@"将以 root 权限直接重启设备（不是注销）。所有未保存数据可能丢失。"
+                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"重启" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *x) {
+        [self onSave];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            SpawnRoot(@"/sbin/reboot", @[]);
+        });
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 @end
