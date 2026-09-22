@@ -1,0 +1,63 @@
+name: Build AwemeFull (dylib only)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'awemefull-v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build AwemeFull dylib
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      # dylib — 抖音全屏（纯 runtime，无 Substrate，无配置 App）
+      - name: Build dylib (pure clang)
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          mkdir -p artifacts
+          clang -arch arm64 -dynamiclib -O2 \
+            -install_name @rpath/AwemeFull.dylib \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -undefined dynamic_lookup -fobjc-arc \
+            -framework Foundation -framework UIKit \
+            -o artifacts/AwemeFull.dylib AwemeFull/Tweak/AwemeFull.m
+          codesign --force --sign - artifacts/AwemeFull.dylib
+          lipo -info artifacts/AwemeFull.dylib
+          file artifacts/AwemeFull.dylib
+          echo "dylib size: $(du -h artifacts/AwemeFull.dylib | cut -f1)"
+
+      - name: Verify artifacts
+        run: |
+          set -e
+          ls -lh artifacts/
+          file artifacts/AwemeFull.dylib
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AwemeFull-artifacts
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/awemefull-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: AwemeFull ${{ github.ref_name }}
+          files: |
+            artifacts/AwemeFull.dylib
+          generate_release_notes: true
