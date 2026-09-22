@@ -1,0 +1,86 @@
+name: Build ResSetterMax (dylib + IPA)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'ressetter-v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ResSetterMax App + TSRootBinary
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      # ① TSRootBinary: resset (写 plist + killall SpringBoard)
+      - name: Build resset TSRootBinary
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          mkdir -p build artifacts
+          clang -arch arm64 -O2 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -framework Foundation -framework UIKit \
+            -o build/resset ResSetterMax/Tweak/resset.m
+          codesign --force --sign - --entitlements ResSetterMax/entitlements.plist build/resset
+          echo "resset size: $(du -h build/resset | cut -f1)"
+
+      # ② App: ResSetterMax (ObjC UIKit)
+      - name: Build App & IPA
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          APP="build/ResSetterMax.app"
+          rm -rf "$APP"
+          mkdir -p "$APP"
+
+          clang -arch arm64 -O2 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -framework Foundation -framework UIKit \
+            -o "$APP/ResSetterMax" ResSetterMax/App/main.m
+
+          cp ResSetterMax/App/Info.plist "$APP/Info.plist"
+          cp build/resset "$APP/resset"
+          codesign --force --sign - --entitlements ResSetterMax/entitlements.plist "$APP"
+
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/ResSetterMax.app
+          ( cd build && zip -qry ../artifacts/ResSetterMax.ipa Payload -x "*.DS_Store" )
+          echo "IPA size: $(du -h artifacts/ResSetterMax.ipa | cut -f1)"
+
+      - name: Verify artifacts
+        run: |
+          set -e
+          ls -lh artifacts/
+          file build/resset
+          unzip -l artifacts/ResSetterMax.ipa
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ResSetterMax-artifacts
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/ressetter-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ResSetterMax ${{ github.ref_name }}
+          files: |
+            artifacts/ResSetterMax.ipa
+          generate_release_notes: true
