@@ -12,6 +12,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <UserNotifications/UserNotifications.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <pthread.h>
 #import <dlfcn.h>
 #import <notify.h>
@@ -75,6 +76,8 @@ static void SIO_reload(void) {
     gListAccel = d[@"ListAccel"] ? [d[@"ListAccel"] boolValue] : YES;
     gBlacklist = [d[@"Blacklist"] componentsJoinedByString:@","];
 }
+
+static void SIO_installiOS16Extras(void); // forward declaration
 
 static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
                                 CFNotificationName name, const void *object,
@@ -628,11 +631,13 @@ static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
     if (!SIO_blocked() && anim) {
         // 只对 CAAnimation 子类生效
         if ([anim respondsToSelector:@selector(setDuration:)]) {
-            double origDur = [anim duration];
+            // 用 performSelector 绕过 AVFoundation setDuration: 歧义
+            double origDur = ((CAAnimation *)anim).duration;
             if (origDur > 0) {
                 double newDur = SIO_targetDuration(origDur);
                 if (newDur != origDur) {
-                    [anim setDuration:newDur];
+                    SEL sd = @selector(setDuration:);
+                    ((void (*)(id, SEL, double))objc_msgSend)((CAAnimation *)anim, sd, newDur);
                 }
             }
         }
