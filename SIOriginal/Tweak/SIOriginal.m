@@ -128,6 +128,20 @@ static void   (*o_nav_privDur)(id, SEL, double);
 static void   (*o_vc_present)(id, SEL, UIViewController *, BOOL, void (^)(void));
 static void   (*o_vc_dismiss)(id, SEL, BOOL, void (^)(void));
 
+// ---- iOS 10+ UIViewPropertyAnimator（现代 App 主流动画 API） ----
+static void   (*o_pa_setDuration)(id, SEL, double);
+static id     (*o_pa_initWithDurTP)(id, SEL, double, id, void (^)(void));
+static id     (*o_pa_initWithDurCP)(id, SEL, double, CGPoint, CGPoint, void (^)(void));
+static id     (*o_pa_initWithDurSpring)(id, SEL, double, double, void (^)(void));
+static id     (*o_pa_runningPA)(id, SEL, double, double, UIViewAnimationOptions, void (^)(void), void (^)(BOOL));
+
+// ---- UIScrollView 滚动动画 ----
+static void   (*o_sv_setContentOffset)(id, SEL, CGPoint, BOOL);
+static void   (*o_sv_scrollRect)(id, SEL, CGRect, BOOL);
+
+// ---- CALayer addAnimation 补盲区 ----
+static void   (*o_layer_addAnim)(id, SEL, id, NSString *);
+
 #pragma mark - CAAnimation（核心：仅基类，子类自动继承）
 
 static void sio_CAAnim_setDuration(id self, SEL _cmd, double d) {
@@ -533,6 +547,129 @@ static void SIOriginalInit(void) {
                             (IMP)sio_cv_selectItem, (IMP *)&o_cv_selectItem);
         SIO_swizzleInstance(cv, @selector(deselectItemAtIndexPath:animated:),
                             (IMP)sio_cv_deselectItem, (IMP *)&o_cv_deselectItem);
+    }
+
+    // iOS 16 优化增强：UIViewPropertyAnimator + UIScrollView + CALayer
+    SIO_installiOS16Extras();
+}
+
+#pragma mark - UIViewPropertyAnimator（iOS 10+ 现代 App 主流动画 API）
+
+// duration setter — 拦截已创建 animator 的时长修改
+static void sio_PA_setDuration(id self, SEL _cmd, double d) {
+    if (SIO_blocked()) { o_pa_setDuration(self, _cmd, d); return; }
+    o_pa_setDuration(self, _cmd, SIO_targetDuration(d));
+}
+
+// initWithDuration:timingParameters:animations: — CA/CubicTimingParameters init
+static id sio_PA_initWithDurTP(id self, SEL _cmd, double d, id tp, void (^a)(void)) {
+    if (!SIO_blocked()) d = SIO_targetDuration(d);
+    return o_pa_initWithDurTP(self, _cmd, d, tp, a);
+}
+
+// initWithDuration:controlPoint1:controlPoint2:animations: — Bezier init
+static id sio_PA_initWithDurCP(id self, SEL _cmd, double d, CGPoint p1, CGPoint p2, void (^a)(void)) {
+    if (!SIO_blocked()) d = SIO_targetDuration(d);
+    return o_pa_initWithDurCP(self, _cmd, d, p1, p2, a);
+}
+
+// initWithDuration:springDampingRatio:animations: — Spring init
+static id sio_PA_initWithDurSpring(id self, SEL _cmd, double d, double dr, void (^a)(void)) {
+    if (!SIO_blocked()) d = SIO_targetDuration(d);
+    return o_pa_initWithDurSpring(self, _cmd, d, dr, a);
+}
+
+// runningPropertyAnimatorWithDuration:delay:options:animations:completion: — 类方法
+static id sio_PA_runningPA(id self, SEL _cmd, double d, double delay, UIViewAnimationOptions opt, void (^a)(void), void (^c)(BOOL)) {
+    if (!SIO_blocked()) d = SIO_targetDuration(d);
+    return o_pa_runningPA(self, _cmd, d, delay, opt, a, c);
+}
+
+#pragma mark - UIScrollView 滚动动画
+
+static void sio_SV_setContentOffset(id self, SEL _cmd, CGPoint p, BOOL animated) {
+    if (SIO_blocked() || !animated) { o_sv_setContentOffset(self, _cmd, p, animated); return; }
+    // 瞬切模式下直接跳过动画（性能最优）
+    if (gEnabled && gMode == 2) {
+        [CATransaction begin];
+        [CATransaction setValue:(id)kCFBooleanTrue forKey:kCATransactionDisableActions];
+        o_sv_setContentOffset(self, _cmd, p, NO);
+        [CATransaction commit];
+        return;
+    }
+    // 加速/慢放：用 CATransaction 包裹改 duration
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:SIO_targetDuration(0.35)];
+    o_sv_setContentOffset(self, _cmd, p, YES);
+    [CATransaction commit];
+}
+
+static void sio_SV_scrollRect(id self, SEL _cmd, CGRect r, BOOL animated) {
+    if (SIO_blocked() || !animated) { o_sv_scrollRect(self, _cmd, r, animated); return; }
+    if (gEnabled && gMode == 2) {
+        [CATransaction begin];
+        [CATransaction setValue:(id)kCFBooleanTrue forKey:kCATransactionDisableActions];
+        o_sv_scrollRect(self, _cmd, r, NO);
+        [CATransaction commit];
+        return;
+    }
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:SIO_targetDuration(0.35)];
+    o_sv_scrollRect(self, _cmd, r, YES);
+    [CATransaction commit];
+}
+
+#pragma mark - CALayer addAnimation:forKey:（补 CAAnimation setDuration 盲区）
+
+static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
+    // CAAnimation setDuration 基类 hook 已经覆盖了绝大多数情况，
+    // 但少数 app 在 addAnimation 后才设置 duration（顺序问题），
+    // 这里二次兜底：直接修改传入 anim 的 duration 属性
+    if (!SIO_blocked() && anim) {
+        // 只对 CAAnimation 子类生效
+        if ([anim respondsToSelector:@selector(setDuration:)]) {
+            double origDur = [anim duration];
+            if (origDur > 0) {
+                double newDur = SIO_targetDuration(origDur);
+                if (newDur != origDur) {
+                    [anim setDuration:newDur];
+                }
+            }
+        }
+    }
+    o_layer_addAnim(self, _cmd, anim, key);
+}
+
+#pragma mark - SIO_install 新 hook 注册（iOS 16 优化增强）
+
+static void SIO_installiOS16Extras(void) {
+    Class pa = objc_getClass("UIViewPropertyAnimator");
+    Class sv = objc_getClass("UIScrollView");
+    Class layer = objc_getClass("CALayer");
+
+    if (pa) {
+        SIO_swizzleInstance(pa, @selector(setDuration:),
+                            (IMP)sio_PA_setDuration, (IMP *)&o_pa_setDuration);
+        SIO_swizzleInstance(pa, @selector(initWithDuration:timingParameters:animations:),
+                            (IMP)sio_PA_initWithDurTP, (IMP *)&o_pa_initWithDurTP);
+        SIO_swizzleInstance(pa, @selector(initWithDuration:controlPoint1:controlPoint2:animations:),
+                            (IMP)sio_PA_initWithDurCP, (IMP *)&o_pa_initWithDurCP);
+        SIO_swizzleInstance(pa, @selector(initWithDuration:springDampingRatio:animations:),
+                            (IMP)sio_PA_initWithDurSpring, (IMP *)&o_pa_initWithDurSpring);
+        SIO_swizzleClass(object_getClass(pa), @selector(runningPropertyAnimatorWithDuration:delay:options:animations:completion:),
+                         (IMP)sio_PA_runningPA, (IMP *)&o_pa_runningPA);
+    }
+
+    if (sv) {
+        SIO_swizzleInstance(sv, @selector(setContentOffset:animated:),
+                            (IMP)sio_SV_setContentOffset, (IMP *)&o_sv_setContentOffset);
+        SIO_swizzleInstance(sv, @selector(scrollRectToVisible:animated:),
+                            (IMP)sio_SV_scrollRect, (IMP *)&o_sv_scrollRect);
+    }
+
+    if (layer) {
+        SIO_swizzleInstance(layer, @selector(addAnimation:forKey:),
+                            (IMP)sio_layer_addAnim, (IMP *)&o_layer_addAnim);
     }
 }
 
