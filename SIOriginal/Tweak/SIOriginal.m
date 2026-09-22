@@ -9,7 +9,6 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
-#import <Metal/Metal.h>
 #import <AVFoundation/AVFoundation.h>
 #import <UserNotifications/UserNotifications.h>
 #import <objc/runtime.h>
@@ -77,13 +76,10 @@ static void SIO_reload(void) {
     gBlacklist = [d[@"Blacklist"] componentsJoinedByString:@","];
 }
 
-static void FPS_reload(void);
-
 static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
                                 CFNotificationName name, const void *object,
                                 CFDictionaryRef userInfo) {
     SIO_reload();
-    FPS_reload();
 }
 
 static inline BOOL SIO_blocked(void) {
@@ -537,163 +533,6 @@ static void SIOriginalInit(void) {
                             (IMP)sio_cv_selectItem, (IMP *)&o_cv_selectItem);
         SIO_swizzleInstance(cv, @selector(deselectItemAtIndexPath:animated:),
                             (IMP)sio_cv_deselectItem, (IMP *)&o_cv_deselectItem);
-    }
-}
-
-#pragma mark - 实时 FPS HUD（挂在 keyWindow 上，点击穿透，可拖动）
-
-static NSString *const kHUDPosX = @"SIO_HUD_PosX";
-static NSString *const kHUDPosY = @"SIO_HUD_PosY";
-
-// 全屏透明容器：只有点中标签区域才接收触摸，其余全部穿透给下层 App。
-// 绝不自建 UIWindow——早期无 scene 的 window 会与 App 主窗口竞争 key 状态导致卡死。
-@interface SIOFPSContainerView : UIView
-@property (nonatomic, weak) UIView *chip;
-@end
-@implementation SIOFPSContainerView
-- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    if (!self.chip || self.chip.hidden) return NO;
-    CGRect hot = CGRectInset(self.chip.frame, -12, -12);  // 12pt 热区，方便拖动
-    return CGRectContainsPoint(hot, point);
-}
-@end
-
-@interface SIOFPSMonitor : NSObject
-@end
-
-static SIOFPSContainerView *gHUDContainer = nil;
-static UIView            *gHUDChip    = nil;
-static UILabel           *gFPSLabel   = nil;
-static CADisplayLink    *gFPSLink    = nil;
-static int              gFPSCount    = 0;
-static NSTimeInterval   gFPSLastTs   = 0;
-static BOOL             gFPSEnabled  = YES;
-static int              gFPSCur      = 0;
-static SIOFPSMonitor    *gFPSMonitor = nil;
-
-static void FPS_reload(void) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
-    if (!d) return;
-    if (d[@"FPSEnabled"]) gFPSEnabled = [d[@"FPSEnabled"] boolValue];
-}
-
-static UIWindow *FPS_keyWindow(void) {
-    UIWindow *kw = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (scene.activationState != UISceneActivationStateForegroundActive) continue;
-        UIWindowScene *ws = (UIWindowScene *)scene;
-        if (![ws isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in ws.windows) if (w.isKeyWindow) { kw = w; break; }
-        if (kw) break;
-    }
-    if (!kw) {
-        for (UIWindow *w in [UIApplication sharedApplication].windows)
-            if (w.isKeyWindow) { kw = w; break; }
-    }
-    return kw;
-}
-
-static void FPS_onPan(UIPanGestureRecognizer *g) {
-    UIView *v = g.view;
-    CGPoint t = [g translationInView:v.superview];
-    CGPoint c = v.center;
-    c.x += t.x; c.y += t.y;
-    [g setTranslation:CGPointZero inView:v.superview];
-    CGRect b = v.superview.bounds;
-    c.x = MAX(v.bounds.size.width/2.0,  MIN(b.size.width  - v.bounds.size.width/2.0,  c.x));
-    c.y = MAX(v.bounds.size.height/2.0 + 10, MIN(b.size.height - v.bounds.size.height/2.0 - 10, c.y));
-    v.center = c;
-    if (g.state == UIGestureRecognizerStateEnded ||
-        g.state == UIGestureRecognizerStateCancelled) {
-        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        [ud setDouble:c.x forKey:kHUDPosX];
-        [ud setDouble:c.y forKey:kHUDPosY];
-    }
-}
-
-// 只在 App 已运行、keyWindow 已存在后调用（首个 tick）
-static void FPS_attachIfNeeded(void) {
-    UIWindow *kw = FPS_keyWindow();
-    if (!kw) return;
-    if (!gHUDContainer) {
-        SIOFPSContainerView *c = [[SIOFPSContainerView alloc] initWithFrame:kw.bounds];
-        c.backgroundColor = [UIColor clearColor];
-        c.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        c.userInteractionEnabled = YES;
-
-        UIView *chip = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 70, 26)];
-        chip.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.62];
-        chip.layer.cornerRadius = 8;
-        chip.layer.borderWidth = 0.5;
-        chip.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.25].CGColor;
-        chip.clipsToBounds = YES;
-        chip.userInteractionEnabled = YES;
-
-        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 70, 26)];
-        label.font = [UIFont boldSystemFontOfSize:14];
-        label.textColor = [UIColor whiteColor];
-        label.textAlignment = NSTextAlignmentCenter;
-        label.text = @"-- Hz";
-        [chip addSubview:label];
-
-        double px = [[NSUserDefaults standardUserDefaults] doubleForKey:kHUDPosX];
-        double py = [[NSUserDefaults standardUserDefaults] doubleForKey:kHUDPosY];
-        chip.center = (px > 0 || py > 0) ? CGPointMake(px, py)
-                                          : CGPointMake(46, kw.bounds.size.height > 500 ? 86 : 44);
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
-            initWithTarget:gFPSMonitor action:@selector(panHUD:)];
-        [chip addGestureRecognizer:pan];
-
-        c.chip = chip;
-        [c addSubview:chip];
-        gHUDContainer = c;
-        gHUDChip = chip;
-        gFPSLabel = label;
-    }
-    if (gHUDContainer.superview != kw) {
-        [gHUDContainer removeFromSuperview];
-        gHUDContainer.frame = kw.bounds;
-        [kw addSubview:gHUDContainer];
-    }
-    [kw bringSubviewToFront:gHUDContainer];
-    gHUDContainer.hidden = !gFPSEnabled;
-}
-
-@implementation SIOFPSMonitor
-- (void)panHUD:(UIPanGestureRecognizer *)g { FPS_onPan(g); }
-- (void)tick:(CADisplayLink *)link {
-    if (gFPSLastTs == 0) { gFPSLastTs = link.timestamp; return; }
-    gFPSCount++;
-    NSTimeInterval delta = link.timestamp - gFPSLastTs;
-    if (delta >= 0.5) {
-        gFPSCur = (int)(gFPSCount / delta + 0.5);
-        gFPSCount = 0;
-        gFPSLastTs = link.timestamp;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            FPS_attachIfNeeded();
-            if (!gFPSEnabled || !gFPSLabel) return;
-            gFPSLabel.text = [NSString stringWithFormat:@"%d Hz", gFPSCur];
-            // 纯被动监测（高刷改由配置 App 的全局 PiP 悬浮窗负责）：120=绿，55~116=橙，更低=红
-            if (gFPSCur >= 117) {
-                gFPSLabel.textColor = [UIColor colorWithRed:0.35 green:1.0 blue:0.45 alpha:1.0];
-            } else if (gFPSCur >= 55) {
-                gFPSLabel.textColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.25 alpha:1.0];
-            } else {
-                gFPSLabel.textColor = [UIColor colorWithRed:1.0 green:0.4 blue:0.4 alpha:1.0];
-            }
-        });
-    }
-}
-@end
-
-__attribute__((constructor))
-static void SIOFPSHUDInit(void) {
-    @autoreleasepool {
-        FPS_reload();
-        gFPSMonitor = [[SIOFPSMonitor alloc] init];
-        // 只建 displaylink，不碰任何 UI/window；UI 在首个 tick（App 已运行）后惰性创建
-        gFPSLink = [CADisplayLink displayLinkWithTarget:gFPSMonitor selector:@selector(tick:)];
-        [gFPSLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     }
 }
 

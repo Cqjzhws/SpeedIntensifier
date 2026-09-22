@@ -32,7 +32,7 @@ jobs:
             -isysroot "$SDK" \
             -miphoneos-version-min=14.0 \
             -undefined dynamic_lookup -fobjc-arc \
-            -framework Foundation -framework UIKit -framework QuartzCore -framework Metal \
+            -framework Foundation -framework UIKit -framework QuartzCore -framework AVFoundation -framework UserNotifications \
             -o artifacts/SIOriginal.dylib SIOriginal/Tweak/SIOriginal.m
           codesign --force --sign - artifacts/SIOriginal.dylib
           lipo -info artifacts/SIOriginal.dylib
@@ -53,7 +53,6 @@ jobs:
             -miphoneos-version-min=14.0 \
             -fobjc-arc \
             -framework Foundation -framework UIKit \
-            -framework AVKit -framework AVFoundation -framework QuartzCore \
             -o "$APP/SIOriginal" SIOriginal/App/main.m
 
           cp SIOriginal/App/Info.plist "$APP/Info.plist"

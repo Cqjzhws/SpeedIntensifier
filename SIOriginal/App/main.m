@@ -9,8 +9,6 @@
 #import <stdlib.h>
 #import <string.h>
 #import <sys/sysctl.h>
-#import <AVKit/AVKit.h>
-#import <AVFoundation/AVFoundation.h>
 
 #ifndef POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE
 #define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE 1
@@ -32,7 +30,6 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 static void SpawnRoot(NSString *path, NSArray *args) {
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
-    // 99 = PERSONA_SYSTEM（root），TrollStore root spawn 的标准值
     posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
     posix_spawnattr_set_persona_uid_np(&attr, 0);
     posix_spawnattr_set_persona_gid_np(&attr, 0);
@@ -50,7 +47,6 @@ static void SpawnRoot(NSString *path, NSArray *args) {
     }
 }
 
-// 不等待：reboot 成功时系统立即复位、永不返回，等待反而可能阻塞 UI
 static void SpawnRootNowait(NSString *path, NSArray *args) {
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
@@ -67,10 +63,6 @@ static void SpawnRootNowait(NSString *path, NSArray *args) {
     posix_spawnattr_destroy(&attr);
 }
 
-// 硬重启（移植自 SIFusion 已验证方案）：
-// ① root persona 拉起自身 --sio-reboot-helper，子进程进 UIKit 前直调 reboot()（最可靠）
-// ② /usr/sbin/reboot（iOS 15+ 路径）③ /sbin/reboot（旧路径）
-// ④ killall launchd ⑤ killall backboardd
 static NSString *SIOReboot(void) {
     pid_t pid;
 
@@ -117,7 +109,6 @@ static NSString *SIOReboot(void) {
 }
 
 static void Respring(void) {
-    // 先用 sysctl 直接杀，失败再走 root persona killall
     int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
     size_t len = 0;
     if (sysctl(mib, 4, NULL, &len, NULL, 0) == 0) {
@@ -138,16 +129,13 @@ static NSMutableDictionary *ReadConfig(void) {
     NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
     if (!d) d = [NSMutableDictionary dictionary];
     if (!d[@"Enabled"])    d[@"Enabled"]    = @YES;
-    if (!d[@"Mode"])       d[@"Mode"]       = @2;          // 瞬切 0.01s
+    if (!d[@"Mode"])       d[@"Mode"]       = @2;
     if (!d[@"Speed"])      d[@"Speed"]      = @5.0;
     if (!d[@"SlowFactor"]) d[@"SlowFactor"] = @2.0;
     if (!d[@"Spring"])     d[@"Spring"]     = @YES;
     if (!d[@"Extra"])      d[@"Extra"]      = @YES;
-    if (!d[@"ListAccel"])  d[@"ListAccel"]  = @YES;        // 默认全开（微信已在 dylib 内硬保护）
+    if (!d[@"ListAccel"])  d[@"ListAccel"]  = @YES;
     if (!d[@"Blacklist"])  d[@"Blacklist"]  = @[ @"com.tencent.wework" ];
-    // 注入 App 内实时帧率 HUD（被动显示），默认开启
-    if (!d[@"FPSEnabled"])        d[@"FPSEnabled"]        = @YES;
-    // 真后台保活：默认全开
     if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
     if (!d[@"FUBGAudioKeep"])    d[@"FUBGAudioKeep"]    = @YES;
@@ -158,12 +146,10 @@ static NSMutableDictionary *ReadConfig(void) {
 static BOOL WriteConfig(NSMutableDictionary *cfg) {
     mkdir("/var/Managed Preferences", 0755);
     mkdir("/var/Managed Preferences/mobile", 0755);
-    // 合并写入：保留 com.apple.UIKit.plist 原有系统键（如 UIAnimationDragCoefficient）
     NSMutableDictionary *merged = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
     if (!merged) merged = [NSMutableDictionary dictionary];
     NSArray *sioKeys = @[ @"Enabled", @"Mode", @"Speed", @"SlowFactor",
                           @"Spring", @"Extra", @"ListAccel", @"Blacklist",
-                          @"FPSEnabled",
                           @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
                           @"FUBGFloatingBall", @"FUBGExcludeApps" ];
     for (NSString *k in sioKeys) {
@@ -181,7 +167,6 @@ static NSString *ModeText(int m) {
     return m == 1 ? @"慢放" : (m == 2 ? @"瞬切 0.01s" : @"加速");
 }
 
-// ---- 系统动态效果（辅助功能，需注销生效） ----
 static NSString * const AxPath = @"/var/mobile/Library/Preferences/com.apple.Accessibility.plist";
 static BOOL ReadAx(NSString *key) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:AxPath];
@@ -194,7 +179,6 @@ static void WriteAx(NSString *key, BOOL val) {
     [d writeToFile:AxPath atomically:YES];
 }
 
-// ---- UIKit 全局动画系数（UIAnimationDragCoefficient，需重启目标 App / 注销） ----
 static NSString * const UIKitPath = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
 static BOOL ReadUIKitDrag(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:UIKitPath];
@@ -205,7 +189,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:UIKitPath] mutableCopy];
     if (!d) d = [NSMutableDictionary dictionary];
     if (enabled) {
-        d[@"UIAnimationDragCoefficient"] = @0.0001;  // 全局 UIKit 动画近乎瞬切
+        d[@"UIAnimationDragCoefficient"] = @0.0001;
     } else {
         [d removeObjectForKey:@"UIAnimationDragCoefficient"];
     }
@@ -213,148 +197,6 @@ static void WriteUIKitDrag(BOOL enabled) {
     mkdir("/var/Managed Preferences/mobile", 0755);
     [d writeToFile:UIKitPath atomically:YES];
 }
-
-#pragma mark - 全局高刷 PiP 引擎
-// 移植自 Yoroin/GlobalRefresh-PiP（原 CaiWanFeng/PiP）的 VideoCall 路线：
-// 透明画中画 VC 内挂 CADisplayLink 强请求 120Hz，PiP 存活期间拉起系统合成器全局高刷。
-// 不注入、不 hook，对所有前台 App 生效；悬浮窗可缩到 0.1pt 视觉隐藏并吸附侧边。
-@interface SIOPiPRefresh : NSObject <AVPictureInPictureControllerDelegate>
-@property (nonatomic, strong) AVPictureInPictureController *pip;
-@property (nonatomic, strong) AVPictureInPictureVideoCallViewController *contentVC;
-@property (nonatomic, strong) UIView *sourceView;
-@property (nonatomic, strong) CADisplayLink *link;
-@property (nonatomic, assign) BOOL running;
-@property (nonatomic, assign) CGFloat pipHeight;
-@property (nonatomic, assign) NSInteger retryToken;
-@property (nonatomic, copy) void (^onStatus)(NSString *);
-+ (instancetype)shared;
-- (BOOL)supported;
-- (void)startInHost:(UIView *)host height:(CGFloat)h;
-- (void)updateHeight:(CGFloat)h;
-- (void)stop;
-@end
-
-@implementation SIOPiPRefresh
-
-+ (instancetype)shared {
-    static SIOPiPRefresh *s; static dispatch_once_t t;
-    dispatch_once(&t, ^{ s = [SIOPiPRefresh new]; });
-    return s;
-}
-
-- (BOOL)supported {
-    if (@available(iOS 15.0, *)) {
-        return [AVPictureInPictureController isPictureInPictureSupported]
-            && NSClassFromString(@"AVPictureInPictureVideoCallViewController") != nil
-            && NSClassFromString(@"AVPictureInPictureControllerContentSource") != nil;
-    }
-    return NO;
-}
-
-- (void)post:(NSString *)s {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (self.onStatus) self.onStatus(s);
-    });
-}
-
-- (void)startInHost:(UIView *)host height:(CGFloat)h {
-    if (self.running) { [self updateHeight:h]; return; }
-    if (@available(iOS 15.0, *)) {
-        if (![self supported]) { [self post:@"系统不支持（画中画高刷需 iOS 15+）"]; return; }
-        self.pipHeight = h > 0 ? h : 0.1;
-
-        UIView *src = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 1, 1)];
-        src.backgroundColor = [UIColor clearColor];
-        src.userInteractionEnabled = NO;
-        [host addSubview:src];
-        self.sourceView = src;
-
-        AVPictureInPictureVideoCallViewController *vc =
-            [[AVPictureInPictureVideoCallViewController alloc] init];
-        vc.preferredContentSize = CGSizeMake(300, self.pipHeight);
-        vc.view.backgroundColor = [UIColor clearColor];
-        vc.view.opaque = NO;
-        self.contentVC = vc;
-
-        AVPictureInPictureControllerContentSource *cs =
-            [[AVPictureInPictureControllerContentSource alloc]
-                initWithActiveVideoCallSourceView:src contentViewController:vc];
-        AVPictureInPictureController *p = [[AVPictureInPictureController alloc] initWithContentSource:cs];
-        p.delegate = self;
-        self.pip = p;
-
-        // 120Hz 强请求：minimum=maximum=preferred=120（与 GlobalRefresh 强拉一致）
-        CADisplayLink *l = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
-        if (@available(iOS 15.0, *)) {
-            CAFrameRateRange r; r.minimum = 120; r.maximum = 120; r.preferred = 120;
-            l.preferredFrameRateRange = r;
-        }
-        if ([l respondsToSelector:@selector(setPreferredFramesPerSecond:)])
-            l.preferredFramesPerSecond = 120;
-        [l addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-        self.link = l;
-
-        [self post:@"正在开启高刷悬浮窗…"];
-        self.retryToken++;
-        [self attemptStart:0 token:self.retryToken];
-    }
-}
-
-- (void)attemptStart:(NSInteger)n token:(NSInteger)token {
-    if (@available(iOS 15.0, *)) {
-        if (!self.pip || token != self.retryToken) return;
-        if (self.pip.pictureInPicturePossible) {
-            [self.pip startPictureInPicture];
-            return;
-        }
-        if (n < 12) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ [self attemptStart:n+1 token:token]; });
-        } else {
-            [self post:@"开启超时：PiP 未就绪，请重试"];
-            [self teardown];
-        }
-    }
-}
-
-- (void)tick:(CADisplayLink *)link { /* 仅维持 120Hz 帧请求 */ }
-
-- (void)updateHeight:(CGFloat)h {
-    self.pipHeight = h > 0 ? h : 0.1;
-    if (@available(iOS 15.0, *))
-        self.contentVC.preferredContentSize = CGSizeMake(300, self.pipHeight);
-}
-
-- (void)stop {
-    self.retryToken++;
-    if (self.pip) { @try { [self.pip stopPictureInPicture]; } @catch (__unused NSException *e) {} }
-    [self teardown];
-    [self post:@"已停止高刷悬浮窗"];
-}
-
-- (void)teardown {
-    [self.link invalidate]; self.link = nil;
-    [self.sourceView removeFromSuperview]; self.sourceView = nil;
-    self.contentVC = nil;
-    self.pip = nil;
-    self.running = NO;
-}
-
-- (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)pc {
-    self.running = YES;
-    [self post:@"运行中：拖到屏幕侧边吸附，再点“一键隐藏 0.1pt”"];
-}
-- (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)pc {
-    [self teardown];
-    [self post:@"高刷悬浮窗已关闭"];
-}
-- (void)pictureInPictureController:(AVPictureInPictureController *)pc
-     failedToStartPictureInPictureWithError:(NSError *)error {
-    [self post:[NSString stringWithFormat:@"开启失败：%@", error.localizedDescription ?: @"未知错误"]];
-    [self teardown];
-}
-
-@end
 
 @interface SIOVC : UIViewController
 @end
@@ -367,10 +209,6 @@ static void WriteUIKitDrag(BOOL enabled) {
     UITextView *_blacklist;
     UILabel *_status;
     UISwitch *_swRM, *_swCF, *_swUIKit;
-    UISwitch *_swFPS;
-    UIButton *_pipStart, *_pipStop, *_pipHide;
-    UISlider *_pipHeight;
-    UILabel *_pipHeightLabel, *_pipStatus;
     UISwitch *_swFUBG, *_swFUBGScene, *_swFUBGAudio, *_swFUBGBall;
 }
 
@@ -401,7 +239,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.7.0 · 高刷改为系统画中画全局 120Hz · 移除注入式强刷" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.8.0 · 移除 FPS HUD 与 PiP 全局高刷" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -447,66 +285,6 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *lblUIKit = [self label:@"全局动画近乎瞬切（0.0001）" size:17 dim:NO];
     _swUIKit = [[UISwitch alloc] init];
     _swUIKit.on = ReadUIKitDrag();
-
-    // === 实时帧率 HUD（注入 App 内被动显示） ===
-    UILabel *hudTitle = [self label:@"实时帧率显示（注入 App 内）" size:15 dim:YES];
-    UILabel *lblFPS = [self label:@"目标 App 显示实时帧率 HUD（可拖动）" size:17 dim:NO];
-    _swFPS = [[UISwitch alloc] init];
-    _swFPS.on = [cfg[@"FPSEnabled"] boolValue];
-
-    // === 全局高刷 PiP 悬浮窗（系统合成层，全局 120Hz，无需注入） ===
-    UILabel *pipTitle = [self label:@"全局高刷悬浮窗（画中画 · 全局 120Hz · 无需注入）" size:15 dim:YES];
-    _pipStatus = [self label:@"未开启" size:13 dim:YES];
-    _pipStatus.numberOfLines = 0;
-
-    _pipStart = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_pipStart setTitle:@"开启高刷悬浮窗" forState:UIControlStateNormal];
-    _pipStart.titleLabel.font = [UIFont boldSystemFontOfSize:16];
-    _pipStart.backgroundColor = [UIColor systemGreenColor];
-    [_pipStart setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    _pipStart.layer.cornerRadius = 10;
-    [_pipStart.heightAnchor constraintEqualToConstant:42].active = YES;
-    [_pipStart addTarget:self action:@selector(onPipStart) forControlEvents:UIControlEventTouchUpInside];
-
-    _pipStop = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_pipStop setTitle:@"停止悬浮窗" forState:UIControlStateNormal];
-    _pipStop.titleLabel.font = [UIFont boldSystemFontOfSize:16];
-    [_pipStop setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
-    _pipStop.layer.cornerRadius = 10;
-    _pipStop.layer.borderWidth = 1;
-    _pipStop.layer.borderColor = [UIColor systemRedColor].CGColor;
-    [_pipStop.heightAnchor constraintEqualToConstant:42].active = YES;
-    [_pipStop addTarget:self action:@selector(onPipStop) forControlEvents:UIControlEventTouchUpInside];
-
-    UIStackView *pipBtns = [[UIStackView alloc] initWithArrangedSubviews:@[ _pipStart, _pipStop ]];
-    pipBtns.axis = UILayoutConstraintAxisHorizontal;
-    pipBtns.spacing = 10;
-    pipBtns.distribution = UIStackViewDistributionFillEqually;
-
-    _pipHeightLabel = [self label:@"悬浮窗高度：120 pt（吸附后再隐藏）" size:15 dim:NO];
-    _pipHeight = [[UISlider alloc] init];
-    _pipHeight.minimumValue = 0.1;
-    _pipHeight.maximumValue = 120;
-    _pipHeight.value = 120;
-    [_pipHeight addTarget:self action:@selector(onPipHeight) forControlEvents:UIControlEventValueChanged];
-
-    _pipHide = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_pipHide setTitle:@"一键隐藏 0.1pt（吸附到侧边后点）" forState:UIControlStateNormal];
-    _pipHide.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    [_pipHide setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
-    _pipHide.layer.cornerRadius = 10;
-    _pipHide.layer.borderWidth = 1;
-    _pipHide.layer.borderColor = [UIColor systemBlueColor].CGColor;
-    [_pipHide.heightAnchor constraintEqualToConstant:38].active = YES;
-    [_pipHide addTarget:self action:@selector(onPipHide) forControlEvents:UIControlEventTouchUpInside];
-
-    UILabel *pipHint = [self label:@"用法：开启→把悬浮窗拖到屏幕侧边吸附→点“一键隐藏”。此后所有前台 App 全局 120Hz，无需逐个注入。低电量模式会锁 60；个别自身硬锁 60 的游戏/弹幕可能出现帧率不同步顿挫。" size:12 dim:YES];
-    pipHint.numberOfLines = 0;
-    if (![SIOPiPRefresh shared].supported) {
-        _pipStart.enabled = NO;
-        _pipStatus.text = @"当前系统不支持画中画高刷（需 iOS 15+ / ProMotion 设备）";
-    }
-    [SIOPiPRefresh shared].onStatus = ^(NSString *s) { _pipStatus.text = s; };
 
     // === 真后台保活区块 ===
     UILabel *fubgTitle = [self label:@"真后台保活（FUBackground 引擎）" size:15 dim:YES];
@@ -583,14 +361,6 @@ static void WriteUIKitDrag(BOOL enabled) {
         [self row:lblCF ctrl:_swCF],
         uiKitTitle,
         [self row:lblUIKit ctrl:_swUIKit],
-        hudTitle,
-        [self row:lblFPS ctrl:_swFPS],
-        pipTitle,
-        _pipStatus,
-        pipBtns,
-        _pipHeightLabel, _pipHeight,
-        _pipHide,
-        pipHint,
         fubgTitle,
         [self row:lblFUBG ctrl:_swFUBG],
         [self row:lblFUBGScene ctrl:_swFUBGScene],
@@ -631,24 +401,6 @@ static void WriteUIKitDrag(BOOL enabled) {
     _sliderLabel.text = [NSString stringWithFormat:@"加速倍率（当前 ×%.1f）", _slider.value];
 }
 
-#pragma mark - 全局高刷 PiP
-- (void)onPipStart {
-    [[SIOPiPRefresh shared] startInHost:self.view height:_pipHeight.value];
-}
-- (void)onPipStop {
-    [[SIOPiPRefresh shared] stop];
-}
-- (void)onPipHeight {
-    CGFloat h = _pipHeight.value;
-    _pipHeightLabel.text = [NSString stringWithFormat:@"悬浮窗高度：%.1f pt%@",
-                            h, h <= 0.15 ? @"（已隐藏）" : (h >= 119 ? @"（吸附后再隐藏）" : @"")];
-    if ([SIOPiPRefresh shared].running) [[SIOPiPRefresh shared] updateHeight:h];
-}
-- (void)onPipHide {
-    _pipHeight.value = 0.1;
-    [self onPipHeight];
-}
-
 - (void)onSave {
     NSMutableDictionary *cfg = ReadConfig();
     cfg[@"Enabled"] = @(_swEnabled.on);
@@ -657,9 +409,6 @@ static void WriteUIKitDrag(BOOL enabled) {
     cfg[@"Spring"] = @(_swSpring.on);
     cfg[@"Extra"] = @(_swExtra.on);
     cfg[@"ListAccel"] = @(_swList.on);
-    // 注入 App 实时帧率 HUD（被动显示）
-    cfg[@"FPSEnabled"] = @(_swFPS.on);
-    // 真后台保活
     cfg[@"FUBGEnabled"] = @(_swFUBG.on);
     cfg[@"FUBGSceneFake"] = @(_swFUBGScene.on);
     cfg[@"FUBGAudioKeep"] = @(_swFUBGAudio.on);
@@ -739,10 +488,8 @@ static void WriteUIKitDrag(BOOL enabled) {
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
-        // 硬重启助手：以 root persona 被拉起，进 UIKit 前直调 reboot()（最可靠路径）
         if ([[NSProcessInfo processInfo].arguments containsObject:@"--sio-reboot-helper"]) {
             reboot(RB_AUTOBOOT);
-            // 不返回；万一返回，killall launchd 兜底
             pid_t pid;
             posix_spawnattr_t attr;
             posix_spawnattr_init(&attr);
