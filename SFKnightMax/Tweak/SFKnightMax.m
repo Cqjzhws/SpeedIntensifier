@@ -1,203 +1,141 @@
-// SFKnightMax — 顺丰同城骑士 升级弹窗屏蔽 v1.0.1
+// SFKnightMax — 顺丰同城骑士 升级弹窗屏蔽 v1.0.2
 // 目标进程: com.sfic.knight (顺丰同城骑士, 仅该 App 激活)
 //
-// v1.0.1 说明:
-//   - 保留 v1.0.0 已验证有效的 NSURLProtocol 层 (关键! 顺丰骑士走 AFNetworking,
-//     AF 的 completionHandler 内部实际是 delegate 模式, block swizzle 拦不到,
-//     只有 NSURLProtocol 能拦)
-//   - 安装期全部 @try 防御, 任何 hook 失败都不影响 App 启动
-//   - 转发回调显式串行化, 避免与其它注入 dylib (动画类) 共存时的时序问题
+// v1.0.2 方案彻底变更 (v1.0.0/v1.0.1 的 NSURLProtocol 网络拦截在该 App 启动期
+//   会导致卡死, 已废弃):
+//   完全不碰网络栈 —— 不注册 NSURLProtocol, 不 swizzle NSURLSession, 不转发请求。
+//   改为在 UI 层 hook -[UIViewController presentViewController:animated:completion:],
+//   当被呈现的是"升级弹窗"时直接拦掉 (不调原实现, 仅执行 completion)。
 //
-// 原理: App 启动 POST getappupdateinfo, 服务端"有更新"时 data 为对象,
-//   "无更新"时 data = []。本 dylib 把 data 字典改写为 [] —— 与服务端真实
-//   "无更新"响应语义一致, 普通弹窗 + is_force=1 强更弹窗都不出现。
+//   弹窗识别 (双重):
+//     1. 类名启发: presented VC 类名含 update/upgrade
+//     2. 文本特征: UIAlertController 的 title/message/按钮标题,
+//        或自定义弹窗视图树内 UILabel/UIButton 含强特征词
+//        (立即更新/立即升级/发现新版本/新版本发布/升级啦/强制更新...)
+//
+//   安全性: 全程 @try, 任何异常默认放行; 不命中特征绝不影响正常 present。
+//   与动画类 dylib (SIOriginal/SpeedsterTS 也 hook present) 共存时是天然链式
+//   调用, 拦截只终止本次 present, 无网络/线程/启动时序风险。
 //
 // 纯 ObjC runtime, 无 CydiaSubstrate, TrollFools 友好.
-#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
-static NSString *const kURLMarker    = @"getappupdateinfo";
-static NSString *const kHandledKey   = @"SFKnightMaxHandled";
 static NSString *const kTargetBundle = @"com.sfic.knight";
 
-#pragma mark - 响应改写核心
+#pragma mark - 弹窗识别
 
-static NSData *SFKPatchData(NSData *data) {
-    if (!data || data.length < 2) return data;
-    NSError *err = nil;
-    id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
-    if (err || ![json isKindOfClass:[NSDictionary class]]) return data;
+// 强特征词: 命中任意一个即判定为升级弹窗 (均为升级弹窗专有语料)
+static NSArray<NSString *> *SFKStrongWords(void) {
+    static NSArray *w;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        w = @[
+            @"立即更新", @"立即升级", @"马上更新", @"前去更新", @"去更新",
+            @"发现新版本", @"检测到新版本", @"新版本发布", @"有新版本",
+            @"版本更新", @"升级啦", @"更新啦", @"强制更新",
+            @"请更新到最新版本", @"请升级", @"立即体验新版本"
+        ];
+    });
+    return w;
+}
 
-    NSMutableDictionary *root = [json mutableCopy];
-    id d = root[@"data"];
-    if ([d isKindOfClass:[NSDictionary class]]) {
-        NSLog(@"[SFKnightMax] 拦截升级信息: version=%@ is_force=%ld → 已屏蔽",
-              d[@"version"], (long)[d[@"is_force"] integerValue]);
-        root[@"data"] = @[];
-        NSData *out = [NSJSONSerialization dataWithJSONObject:root options:0 error:nil];
-        return out ?: data;
+static BOOL SFKTextHit(NSString *s) {
+    if (!s || s.length < 2) return NO;
+    for (NSString *w in SFKStrongWords()) {
+        if ([s rangeOfString:w].location != NSNotFound) return YES;
     }
-    return data;
+    return NO;
 }
 
-static BOOL SFKIsTargetURL(NSURL *url) {
-    if (!url) return NO;
-    return [url.absoluteString.lowercaseString containsString:kURLMarker];
+static BOOL SFKClassNameHit(NSString *name) {
+    if (!name) return NO;
+    NSString *n = name.lowercaseString;
+    // update/upgrade 类名的 modal VC 基本就是升级弹窗
+    return [n containsString:@"update"] || [n containsString:@"upgrade"];
 }
 
-#pragma mark - Layer A: NSURLProtocol (核心, AFNetworking 必需)
+#define SFK_MAX_DEPTH 6
+#define SFK_MAX_VIEWS 300
 
-@interface SFKnightURLProtocol : NSURLProtocol
-@property (nonatomic, strong) NSURLSessionDataTask *task;
-@property (nonatomic, strong) NSURLSession *session;
-@end
+static BOOL SFKScanView(UIView *v, int depth, int *count) {
+    if (!v || depth > SFK_MAX_DEPTH || (*count)++ > SFK_MAX_VIEWS) return NO;
 
-@implementation SFKnightURLProtocol
+    if ([v isKindOfClass:[UILabel class]]) {
+        UILabel *l = (UILabel *)v;
+        if (SFKTextHit(l.text)) return YES;
+        if (l.attributedText.length && SFKTextHit(l.attributedText.string)) return YES;
+    } else if ([v isKindOfClass:[UIButton class]]) {
+        UIButton *b = (UIButton *)v;
+        if (SFKTextHit(b.titleLabel.text)) return YES;
+        NSAttributedString *as = [b attributedTitleForState:UIControlStateNormal];
+        if (as.length && SFKTextHit(as.string)) return YES;
+    }
 
-+ (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    @try {
-        if (!SFKIsTargetURL(request.URL)) return NO;
-        if ([NSURLProtocol propertyForKey:kHandledKey inRequest:request]) return NO;
-        return YES;
-    } @catch (__unused NSException *e) {
+    for (UIView *sub in v.subviews) {
+        if (SFKScanView(sub, depth + 1, count)) return YES;
+    }
+    return NO;
+}
+
+static BOOL SFKIsUpdatePopup(UIViewController *vc) {
+    if (!vc) return NO;
+
+    // 1. 类名
+    if (SFKClassNameHit(NSStringFromClass(vc.class))) return YES;
+
+    // 2a. UIAlertController: 直接读 title/message/actions, 不触碰 view
+    if ([vc isKindOfClass:[UIAlertController class]]) {
+        UIAlertController *a = (UIAlertController *)vc;
+        if (SFKTextHit(a.title) || SFKTextHit(a.message)) return YES;
+        for (UIAlertAction *act in a.actions) {
+            if (SFKTextHit(act.title)) return YES;
+        }
         return NO;
     }
-}
 
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
-    return request;
-}
-
-- (void)startLoading {
-    NSMutableURLRequest *forward = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:kHandledKey inRequest:forward];
-
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    // 转发 session 不注册任何自定义 protocol, 走系统默认 HTTP/HTTPS 处理器
-    cfg.protocolClasses = nil;
-
-    // 专用串行队列, 保证 client 回调顺序与网络层一致
-    NSOperationQueue *q = [[NSOperationQueue alloc] init];
-    q.maxConcurrentOperationCount = 1;
-    q.qualityOfService = NSQualityOfServiceUserInitiated;
-
-    self.session = [NSURLSession sessionWithConfiguration:cfg
-                                                 delegate:nil
-                                            delegateQueue:q];
-    __weak typeof(self) weakSelf = self;
-    self.task = [self.session dataTaskWithRequest:forward
-                                completionHandler:^(NSData *data, NSURLResponse *resp, NSError *error) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return;
-        @try {
-            if (error) {
-                [strongSelf.client URLProtocol:strongSelf didFailWithError:error];
-                return;
-            }
-            NSData *patched = SFKPatchData(data);
-            if ([resp isKindOfClass:[NSHTTPURLResponse class]]) {
-                NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
-                NSMutableDictionary *headers = [http.allHeaderFields mutableCopy]
-                    ?: [NSMutableDictionary dictionary];
-                [headers removeObjectForKey:@"Content-Encoding"];
-                [headers removeObjectForKey:@"Content-Length"];
-                headers[@"Content-Length"] = [NSString stringWithFormat:@"%lu",
-                                              (unsigned long)patched.length];
-                headers[@"Content-Type"] = @"application/json;charset=UTF-8";
-                NSHTTPURLResponse *newResp =
-                    [[NSHTTPURLResponse alloc] initWithURL:resp.URL
-                                                statusCode:http.statusCode
-                                               HTTPVersion:@"HTTP/1.1"
-                                              headerFields:headers];
-                [strongSelf.client URLProtocol:strongSelf
-                            didReceiveResponse:newResp
-                            cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-            } else {
-                [strongSelf.client URLProtocol:strongSelf
-                            didReceiveResponse:resp
-                            cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-            }
-            [strongSelf.client URLProtocol:strongSelf didLoadData:patched];
-            [strongSelf.client URLProtocolDidFinishLoading:strongSelf];
-        } @catch (__unused NSException *e) {
-            // 回调链异常时退回原始数据, 保证 App 不卡死
-            @try {
-                if (error) {
-                    [strongSelf.client URLProtocol:strongSelf didFailWithError:error];
-                } else {
-                    [strongSelf.client URLProtocol:strongSelf didLoadData:data ?: [NSData data]];
-                    [strongSelf.client URLProtocolDidFinishLoading:strongSelf];
-                }
-            } @catch (__unused NSException *e2) {}
-        }
-    }];
-    [self.task resume];
-}
-
-- (void)stopLoading {
+    // 2b. 自定义弹窗: 访问 view 触发 loadView/viewDidLoad 后扫描文本
     @try {
-        [self.task cancel];
-        [self.session invalidateAndCancel];
+        UIView *root = vc.view;
+        if (root) {
+            int count = 0;
+            if (SFKScanView(root, 0, &count)) return YES;
+        }
+        // 弹窗可能包在 UINavigationController/容器里, 补扫子 VC
+        for (UIViewController *child in vc.childViewControllers) {
+            @try {
+                UIView *cv = child.view;
+                if (cv) {
+                    int c2 = 0;
+                    if (SFKScanView(cv, 0, &c2)) return YES;
+                }
+            } @catch (__unused NSException *e) {}
+        }
     } @catch (__unused NSException *e) {}
-    self.task = nil;
-    self.session = nil;
+
+    return NO;
 }
 
-@end
+#pragma mark - hook present
 
-#pragma mark - Layer B: block 模式兜底 (不走 AF 的少数直连场景)
+typedef void (*SFKPresentIMP)(id, SEL, UIViewController *, BOOL, void (^)(void));
+static SFKPresentIMP s_origPresent = NULL;
 
-typedef NSURLSessionDataTask *(*SFKDataTaskReqIMP)(id, SEL, NSURLRequest *, id);
-typedef NSURLSessionDataTask *(*SFKDataTaskURLIMP)(id, SEL, NSURL *, id);
-typedef NSURLSessionUploadTask *(*SFKUploadDataIMP)(id, SEL, NSURLRequest *, NSData *, id);
+static void SFKPresent(id self, SEL _cmd,
+                       UIViewController *vc, BOOL animated,
+                       void (^completion)(void)) {
+    BOOL hit = NO;
+    @try { hit = SFKIsUpdatePopup(vc); }
+    @catch (__unused NSException *e) { hit = NO; }
 
-static SFKDataTaskReqIMP s_origDataTaskRequest = NULL;
-static SFKDataTaskURLIMP s_origDataTaskURL = NULL;
-static SFKUploadDataIMP  s_origUploadData = NULL;
-
-static void (^SFKWrapHandler(void (^handler)(NSData *, NSURLResponse *, NSError *)))
-    (NSData *, NSURLResponse *, NSError *) {
-    return ^(NSData *data, NSURLResponse *resp, NSError *error) {
-        @try { data = SFKPatchData(data); } @catch (__unused NSException *e) {}
-        handler(data, resp, error);
-    };
-}
-
-static NSURLSessionDataTask *SFKDataTaskWithRequest(id self, SEL _cmd,
-                                                    NSURLRequest *request,
-                                                    void (^handler)(NSData *, NSURLResponse *, NSError *)) {
-    if (!s_origDataTaskRequest) return nil;
-    if (handler && SFKIsTargetURL(request.URL)) {
-        return s_origDataTaskRequest(self, _cmd, request, SFKWrapHandler(handler));
+    if (hit) {
+        NSLog(@"[SFKnightMax] 已拦截升级弹窗: %@", NSStringFromClass(vc.class));
+        if (completion) completion();   // 不呈现, 但放行 completion 防调用方等待
+        return;
     }
-    return s_origDataTaskRequest(self, _cmd, request, handler);
-}
 
-static NSURLSessionDataTask *SFKDataTaskWithURL(id self, SEL _cmd,
-                                                NSURL *url,
-                                                void (^handler)(NSData *, NSURLResponse *, NSError *)) {
-    if (!s_origDataTaskURL) return nil;
-    if (handler && SFKIsTargetURL(url)) {
-        return s_origDataTaskURL(self, _cmd, url, SFKWrapHandler(handler));
-    }
-    return s_origDataTaskURL(self, _cmd, url, handler);
-}
-
-static NSURLSessionUploadTask *SFKUploadTaskWithData(id self, SEL _cmd,
-                                                     NSURLRequest *request,
-                                                     NSData *bodyData,
-                                                     void (^handler)(NSData *, NSURLResponse *, NSError *)) {
-    if (!s_origUploadData) return nil;
-    if (handler && SFKIsTargetURL(request.URL)) {
-        return s_origUploadData(self, _cmd, request, bodyData, SFKWrapHandler(handler));
-    }
-    return s_origUploadData(self, _cmd, request, bodyData, handler);
-}
-
-static void SFKSwizzle(Class cls, SEL sel, IMP newImp, void **origImp) {
-    Method m = class_getInstanceMethod(cls, sel);
-    if (m) {
-        *origImp = (void *)method_setImplementation(m, newImp);
+    if (s_origPresent) {
+        s_origPresent(self, _cmd, vc, animated, completion);
     }
 }
 
@@ -210,17 +148,14 @@ static void SFKnightMaxInit(void) {
             NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
             if (![bid isEqualToString:kTargetBundle]) return;
 
-            [NSURLProtocol registerClass:[SFKnightURLProtocol class]];
+            Class cls = [UIViewController class];
+            Method m = class_getInstanceMethod(cls,
+                            @selector(presentViewController:animated:completion:));
+            if (m) {
+                s_origPresent = (SFKPresentIMP)method_setImplementation(m, (IMP)SFKPresent);
+            }
 
-            Class cls = [NSURLSession class];
-            SFKSwizzle(cls, @selector(dataTaskWithRequest:completionHandler:),
-                       (IMP)SFKDataTaskWithRequest, (void **)&s_origDataTaskRequest);
-            SFKSwizzle(cls, @selector(dataTaskWithURL:completionHandler:),
-                       (IMP)SFKDataTaskWithURL, (void **)&s_origDataTaskURL);
-            SFKSwizzle(cls, @selector(uploadTaskWithRequest:fromData:completionHandler:),
-                       (IMP)SFKUploadTaskWithData, (void **)&s_origUploadData);
-
-            NSLog(@"[SFKnightMax] v1.0.1 已激活 (屏蔽升级弹窗)");
+            NSLog(@"[SFKnightMax] v1.0.2 已激活 (UI 层拦截升级弹窗, 不碰网络)");
         } @catch (NSException *e) {
             NSLog(@"[SFKnightMax] 初始化异常(已忽略): %@", e);
         }

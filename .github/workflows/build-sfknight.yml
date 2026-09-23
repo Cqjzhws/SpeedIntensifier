@@ -32,7 +32,7 @@ jobs:
             -isysroot "$SDK" \
             -miphoneos-version-min=14.0 \
             -undefined dynamic_lookup -fobjc-arc \
-            -framework Foundation \
+            -framework Foundation -framework UIKit \
             -o artifacts/SFKnightMax.dylib SFKnightMax/Tweak/SFKnightMax.m
           codesign --force --sign - artifacts/SFKnightMax.dylib
           lipo -info artifacts/SFKnightMax.dylib
