@@ -12,7 +12,9 @@
 #import <UIKit/UIKit.h>
 #import <spawn.h>
 #import <sys/stat.h>
+#import <sys/wait.h>
 #import <fcntl.h>
+#import <unistd.h>
 
 extern char **environ;
 
@@ -512,9 +514,9 @@ static NSString *mobileConfigForProvider(NSDictionary *p) {
 
 - (void)handleAboutRow:(NSInteger)row {
     if (row == 1) {
-        [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://github.com/DevelopCubeLab/EnableQUIC"] options:{} completionHandler:nil];
+        [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://github.com/DevelopCubeLab/EnableQUIC"] options:@{} completionHandler:nil];
     } else if (row == 2) {
-        [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://www.feng.com/post/13873305"] options:{} completionHandler:nil];
+        [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://www.feng.com/post/13873305"] options:@{} completionHandler:nil];
     }
 }
 
