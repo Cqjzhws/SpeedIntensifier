@@ -1,0 +1,86 @@
+name: Build QUICMax (App + Helper)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'quicmax-v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build QUICMax App + TSRootHelper
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      # ① TSRootBinary: quicmaxhelper (replace/lock/backup/install-profile/respring)
+      - name: Build quicmaxhelper TSRootBinary
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          mkdir -p build artifacts
+          clang -arch arm64 -O2 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -framework Foundation \
+            -o build/quicmaxhelper QUICMax/Tweak/quicmaxhelper.m
+          codesign --force --sign - --entitlements QUICMax/entitlements.plist build/quicmaxhelper
+          echo "quicmaxhelper size: $(du -h build/quicmaxhelper | cut -f1)"
+
+      # ② App: QUICMax (ObjC UIKit)
+      - name: Build App & IPA
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          APP="build/QUICMax.app"
+          rm -rf "$APP"
+          mkdir -p "$APP"
+
+          clang -arch arm64 -O2 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -framework Foundation -framework UIKit \
+            -o "$APP/QUICMax" QUICMax/App/main.m
+
+          cp QUICMax/App/Info.plist "$APP/Info.plist"
+          cp build/quicmaxhelper "$APP/quicmaxhelper"
+          codesign --force --sign - --entitlements QUICMax/entitlements.plist "$APP"
+
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/QUICMax.app
+          ( cd build && zip -qry ../artifacts/QUICMax.tipa Payload -x "*.DS_Store" )
+          echo "IPA size: $(du -h artifacts/QUICMax.tipa | cut -f1)"
+
+      - name: Verify artifacts
+        run: |
+          set -e
+          ls -lh artifacts/
+          file build/quicmaxhelper
+          unzip -l artifacts/QUICMax.tipa
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: QUICMax-artifacts
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/quicmax-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: QUICMax ${{ github.ref_name }}
+          files: |
+            artifacts/QUICMax.tipa
+          generate_release_notes: true
