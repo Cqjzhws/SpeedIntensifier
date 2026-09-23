@@ -24,10 +24,6 @@
 	<true/>
 	<key>MinimumOSVersion</key>
 	<string>14.0</string>
-	<key>TSRootBinaries</key>
-	<array>
-		<string>quicmaxhelper</string>
-	</array>
 	<key>UIDeviceFamily</key>
 	<array>
 		<integer>1</integer>

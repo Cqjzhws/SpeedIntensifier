@@ -36,18 +36,24 @@ static NSArray<NSDictionary *> *dohProviders(void) {
     ];
 }
 
-// QUIC 配置键 (含实验性)
+// QUIC 配置键 (含实验性). 元素: [plist 键(英文,不可改), 详细说明, 简短中文名]
 static NSArray<NSArray *> *quicKeys(void) {
     return @[
-        @[@"enable_quic",        @"启用 QUIC (HTTP/3 底层)"],
-        @[@"disable_quic_race",  @"禁用 IPv4 QUIC/TCP 竞速 (开=稳定, 关=激进)"],
-        @[@"disable_quic_race5", @"禁用 IPv6 QUIC/TCP 竞速"],
-        @[@"enable_tfo",         @"TCP Fast Open (实验性)"],
-        @[@"enable_multipath",   @"MPTCP 多路径 (实验性)"],
+        @[@"enable_quic",        @"启用 QUIC (HTTP/3 底层传输)",              @"启用 QUIC"],
+        @[@"disable_quic_race",  @"开=稳定 关=激进 (IPv4 QUIC/TCP 竞速)",     @"禁用 IPv4 竞速"],
+        @[@"disable_quic_race5", @"开=稳定 关=激进 (IPv6 QUIC/TCP 竞速)",     @"禁用 IPv6 竞速"],
+        @[@"enable_tfo",         @"TCP 快速打开, 减少握手延迟 (实验性)",       @"TCP 快速打开"],
+        @[@"enable_multipath",   @"多路径 TCP, Wi-Fi/蜂窝同时使用 (实验性)",   @"MPTCP 多路径"],
     ];
 }
 
 #pragma mark - spawnHelper (TSRootBinary, runs as root)
+
+// posix_spawn persona (以 root 运行 helper, 同 DevelopCubeLab/EnableQUIC DeviceController.m)
+#define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE 1
+extern int posix_spawnattr_set_persona_np(const posix_spawnattr_t * __restrict, uid_t, uint32_t);
+extern int posix_spawnattr_set_persona_uid_np(const posix_spawnattr_t * __restrict, uid_t);
+extern int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t * __restrict, uid_t);
 
 static int spawnHelper(NSArray<NSString *> *args, NSString **outStr, NSString **errStr) {
     NSString *helperPath = [[NSBundle mainBundle] pathForResource:HELPER_NAME ofType:@""];
@@ -71,8 +77,16 @@ static int spawnHelper(NSArray<NSString *> *args, NSString **outStr, NSString **
     posix_spawn_file_actions_addopen(&action, STDOUT_FILENO, outPath.UTF8String, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     posix_spawn_file_actions_addopen(&action, STDERR_FILENO, errPath.UTF8String, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 
+    // persona: 以 root (UID 0 / GID 0) 运行 helper
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+    posix_spawnattr_set_persona_uid_np(&attr, 0);
+    posix_spawnattr_set_persona_gid_np(&attr, 0);
+
     pid_t pid = 0;
-    int err = posix_spawn(&pid, helperPath.UTF8String, &action, NULL, cargv, environ);
+    int err = posix_spawn(&pid, helperPath.UTF8String, &action, &attr, cargv, environ);
+    posix_spawnattr_destroy(&attr);
     posix_spawn_file_actions_destroy(&action);
     free(cargv);
     if (err != 0) {
@@ -262,14 +276,14 @@ static NSString *mobileConfigForProvider(NSDictionary *p) {
         case 0: { // 状态
             if (ip.row < quicKeys().count) {
                 NSArray *kv = quicKeys()[ip.row];
-                c.textLabel.text = kv[0];
+                c.textLabel.text = kv[2];
                 NSNumber *v = self.curState[kv[0]];
-                c.detailTextLabel.text = [v boolValue] ? @"true" : @"false";
+                c.detailTextLabel.text = [v boolValue] ? @"已启用" : @"已禁用";
                 c.detailTextLabel.textColor = [v boolValue] ? [UIColor systemGreenColor] : [UIColor systemGrayColor];
                 c.selectionStyle = UITableViewCellSelectionStyleNone;
             } else {
                 c.textLabel.text = @"配置文件锁定";
-                c.detailTextLabel.text = self.fileLocked ? @"已锁定 (SF_IMMUTABLE)" : @"未锁定";
+                c.detailTextLabel.text = self.fileLocked ? @"已锁定 (系统不可变)" : @"未锁定";
                 c.detailTextLabel.textColor = self.fileLocked ? [UIColor systemOrangeColor] : [UIColor systemGrayColor];
                 c.selectionStyle = UITableViewCellSelectionStyleNone;
             }
@@ -277,7 +291,7 @@ static NSString *mobileConfigForProvider(NSDictionary *p) {
         }
         case 1: { // QUIC 开关
             NSArray *kv = quicKeys()[ip.row];
-            c.textLabel.text = kv[0];
+            c.textLabel.text = kv[2];
             c.detailTextLabel.text = kv[1];
             c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
             UISwitch *sw = [UISwitch new];
@@ -351,11 +365,13 @@ static NSString *mobileConfigForProvider(NSDictionary *p) {
     NSString *key = kv[0];
     BOOL newVal = sw.on;
     // 写入流程: 读 networkd.plist → 改 key → 写 tmp → helper replace
-    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:NETWORKD_PLIST] ?: [NSMutableDictionary dictionary];
+    // 注意: dictionaryWithContentsOfFile: 可能返回不可变对象, 必须 mutableCopy
+    NSDictionary *raw = [NSDictionary dictionaryWithContentsOfFile:NETWORKD_PLIST];
+    NSMutableDictionary *d = raw ? [raw mutableCopy] : [NSMutableDictionary dictionary];
     d[key] = @(newVal);
     NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"qm_networkd.plist"];
     if (![d writeToFile:tmpPath atomically:YES]) {
-        [self alert:@"写入临时文件失败"];
+        [self alert:[NSString stringWithFormat:@"写入临时文件失败\n路径: %@\n键数: %lu", tmpPath, (unsigned long)d.count]];
         sw.on = !newVal;
         return;
     }
