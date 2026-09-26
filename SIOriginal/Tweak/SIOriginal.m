@@ -1101,6 +1101,7 @@ static NSTimer *gWXBannerScanTimer = nil;
 static NSMutableSet *gWXSeenBanners = nil;
 static void (*gOrigViewDidMove)(id, SEL);  // v1.9.9：UIView didMoveToWindow 原实现
 static void (*gOrigSetHidden)(id, SEL, BOOL);  // v1.9.17：UIView setHidden: 原实现
+static void (*gOrigSetAlpha)(id, SEL, CGFloat);  // v1.9.18：UIView setAlpha: 原实现
 static NSMutableDictionary *gWXBannerDedup = nil;  // v1.9.13：内容去重（key=内容，value=时间戳）
 static NSTimeInterval gWXLastBannerTime = 0;       // v1.9.13：上次弹窗时间
 static __weak UIView *gWXTrackedBanner = nil;       // v1.9.16：追踪的横幅 view
@@ -1218,17 +1219,6 @@ static void _wx_tryDetectBanner(UIView *v) {
         parent = parent.superview;
     }
 
-    // 必须含 UIImageView（头像）
-    BOOL hasAvatar = NO;
-    for (UIView *sub in v.subviews) {
-        if ([sub isKindOfClass:[UIImageView class]]) { hasAvatar = YES; break; }
-        for (UIView *ss in sub.subviews) {
-            if ([ss isKindOfClass:[UIImageView class]]) { hasAvatar = YES; break; }
-        }
-        if (hasAvatar) break;
-    }
-    if (!hasAvatar) return;
-
     // 提取文字
     NSMutableArray *labels = [NSMutableArray array];
     for (UIView *sub in v.subviews) {
@@ -1244,6 +1234,17 @@ static void _wx_tryDetectBanner(UIView *v) {
         }
     }
     if (labels.count < 1) return;
+
+    // 必须含 UIImageView（头像），或有 2 个以上文字 label（文件传输助手等无头像场景）
+    BOOL hasAvatar = NO;
+    for (UIView *sub in v.subviews) {
+        if ([sub isKindOfClass:[UIImageView class]]) { hasAvatar = YES; break; }
+        for (UIView *ss in sub.subviews) {
+            if ([ss isKindOfClass:[UIImageView class]]) { hasAvatar = YES; break; }
+        }
+        if (hasAvatar) break;
+    }
+    if (!hasAvatar && labels.count < 2) return;
 
     NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
         return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
@@ -1303,6 +1304,21 @@ static void _wx_setHidden(id self, SEL _cmd, BOOL hidden) {
     if (!gWXBigNotif) return;
     if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
     if (hidden) return;  // 只处理从隐藏变显示
+
+    UIView *view = (UIView *)self;
+    __weak UIView *weakView = view;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        _wx_tryDetectBanner(weakView);
+    });
+}
+
+// v1.9.18：hook setAlpha:——微信可能用 alpha 控制显隐
+static void _wx_setAlpha(id self, SEL _cmd, CGFloat alpha) {
+    if (gOrigSetAlpha) gOrigSetAlpha(self, _cmd, alpha);
+
+    if (!gWXBigNotif) return;
+    if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
+    if (alpha <= 0.01) return;  // 只处理变可见
 
     UIView *view = (UIView *)self;
     __weak UIView *weakView = view;
@@ -1557,7 +1573,17 @@ static void _fbg_installNotifHooks(void) {
                 method_setImplementation(sh, (IMP)_wx_setHidden);
             }
         }
-        NSLog(@"[WXNotif] hooked didMoveToWindow + setHidden:");
+        // v1.9.18：hook setAlpha:，微信可能用 alpha 控制显隐
+        SEL saSel = @selector(setAlpha:);
+        Method sa = class_getInstanceMethod(uv, saSel);
+        if (sa) {
+            IMP cur3 = method_getImplementation(sa);
+            if (cur3 != (IMP)_wx_setAlpha) {
+                gOrigSetAlpha = (void *)cur3;
+                method_setImplementation(sa, (IMP)_wx_setAlpha);
+            }
+        }
+        NSLog(@"[WXNotif] hooked didMoveToWindow + setHidden: + setAlpha:");
     }
 
     // v1.9.2：启动微信自定义横幅扫描器（前台横幅是微信自定义 UIView，不走 UNNotification）
