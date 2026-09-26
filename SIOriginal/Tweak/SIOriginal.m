@@ -147,8 +147,9 @@ static BOOL SIO_wechatZoomPreviewActive(void) {
 
 static inline BOOL SIO_blocked(void) {
     if (!gEnabled) return YES;
-    if (gIsWeChat) return YES;   // v1.8.5：微信全局透传所有动画 hook（安全策略）
-    if (SIO_wechatZoomPreviewActive()) return YES;   // 微信预览放大态旁路（v1.8.4 保留，当前被上一行覆盖）
+    // v1.8.9：微信动画加速恢复（实验）——预览 bug 真凶已确认为悬浮球（v1.8.7 永久禁用），
+    // 动画 hook 恢复生效；v1.8.4 放大态探测器首次真正启用作为安全网
+    if (SIO_wechatZoomPreviewActive()) return YES;   // 微信预览放大态旁路
     if (!gSelfBundle) gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     if (gSelfBundle.length == 0) return NO;
     if (!gBlacklist) return NO;
@@ -351,7 +352,8 @@ static void sio_vc_dismiss(id self, SEL _cmd, BOOL anim, void (^c)(void)) {
 
 #pragma mark - TV/CV 列表全家桶（ListAccel 控制；com.tencent.xin / com.sfic.knight 硬保护）
 
-static BOOL SIO_listOK(void) { return gListAccel && !gIsWeChat && !gIsSFKnight && !SIO_blocked(); }
+// v1.8.9：微信列表 hook 恢复（实验）；顺丰骑士保持硬保护
+static BOOL SIO_listOK(void) { return gListAccel && !gIsSFKnight && !SIO_blocked(); }
 
 static void SIO_listWrap(void (^block)(void)) {
     [CATransaction begin];

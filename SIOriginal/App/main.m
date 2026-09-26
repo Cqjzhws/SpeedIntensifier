@@ -239,7 +239,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.8.8 · 修微信保活开关残留" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.8.9 · 微信动画加速恢复（实验）" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -340,9 +340,9 @@ static void WriteUIKitDrag(BOOL enabled) {
     [rb.heightAnchor constraintEqualToConstant:40].active = YES;
     [rb addTarget:self action:@selector(onReboot) forControlEvents:UIControlEventTouchUpInside];
 
-    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。慢放 = 原版 slowDownFactor 功能，可观察动画细节。瞬切 = 0.01 秒直达。\n\n⚠️ 微信为硬保护对象：动画调速/弹簧/转场/列表加速在微信内全部不生效（为避免破坏预览/手势），仅真后台保活对微信生效。" size:12 dim:YES];
+    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。慢放 = 原版 slowDownFactor 功能，可观察动画细节。瞬切 = 0.01 秒直达。\n\n⚠️ v1.8.9 起微信动画加速已恢复（实验性）：预览 bug 真凶为悬浮球（已永久移除），放大预览时动画 hook 会自动旁路保护。若预览/手势再出现异常请立即反馈。" size:12 dim:YES];
     hint.textAlignment = NSTextAlignmentCenter;
-    UILabel *listHint = [self label:@"列表加速含 24 个 TV/CV hook，企业微信/微信已双重保护（黑名单 + 硬编码）。其他重列表 App（淘宝/京东）若出现卡死请关闭此开关。" size:12 dim:YES];
+    UILabel *listHint = [self label:@"列表加速含 24 个 TV/CV hook。v1.8.9 起微信列表加速已恢复（实验）；顺丰骑士保持硬保护。重列表 App（淘宝/京东）若出现卡死请关闭此开关或加黑名单。" size:12 dim:YES];
     listHint.textColor = [UIColor systemOrangeColor];
     listHint.numberOfLines = 0;
     _status = [self label:@"" size:13 dim:YES];
