@@ -1105,7 +1105,9 @@ static void _wx_show_banner(NSString *title, NSString *body);  // 前向声明
 static void _wx_checkView(UIView *view, UIWindow *win);          // 前向声明
 
 static void _wx_scanCustomBanner(void) {
-    // v1.9.8：微信内无条件运行（诊断 gWXBigNotif 是否被正确读取）
+    // v1.9.9：禁用定时器扫描——会误杀聊天列表头像 cell
+    // 只保留 didMoveToWindow 事件驱动（新视图添加时才检测）
+    return;
     if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
 
     // 遍历所有 window
@@ -1200,11 +1202,17 @@ static void _wx_viewDidMoveToWindow(id self, SEL _cmd) {
 
     // 快速过滤：只看顶部区域
     CGRect f = [view convertRect:view.bounds toView:nil];
-    CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
-    if (f.origin.y > screenH * 0.15) return;
+    if (f.origin.y > 30) return;       // v1.9.10：必须非常接近顶部
     if (f.origin.y < -200) return;
     if (f.size.height < 50 || f.size.height > 95) return;
     if (f.size.width < 200) return;
+
+    // v1.9.10：不能在 UIScrollView 内（排除聊天列表/网页等滚动内容）
+    UIView *parent = view.superview;
+    while (parent) {
+        if ([parent isKindOfClass:[UIScrollView class]]) return;
+        parent = parent.superview;
+    }
 
     // 必须包含头像 UIImageView（导航栏/状态栏没有这个）
     BOOL hasAvatar = NO;
@@ -1249,9 +1257,10 @@ static void _wx_viewDidMoveToWindow(id self, SEL _cmd) {
     NSLog(@"[WXNotif] didMoveToWindow banner: class=%@ frame=%@ \"%@\" - \"%@\"",
           NSStringFromClass([view class]), NSStringFromCGRect(f), title, body);
 
+    // v1.9.10：不隐藏原视图，只弹我们的大窗（避免误杀正常 UI）
     // 强制隐藏微信横幅
-    view.hidden = YES;
-    view.alpha = 0;
+    // view.hidden = YES;
+    // view.alpha = 0;
 
     // 弹我们的大窗
     _wx_show_banner(title.length ? title : @"微信", body);
