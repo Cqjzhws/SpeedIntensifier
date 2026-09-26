@@ -1100,6 +1100,8 @@ static NSMutableArray *gWXNotifQueue = nil;
 static NSTimer *gWXBannerScanTimer = nil;
 static NSMutableSet *gWXSeenBanners = nil;
 static void (*gOrigViewDidMove)(id, SEL);  // v1.9.9：UIView didMoveToWindow 原实现
+static NSMutableDictionary *gWXBannerDedup = nil;  // v1.9.13：内容去重（key=内容，value=时间戳）
+static NSTimeInterval gWXLastBannerTime = 0;       // v1.9.13：上次弹窗时间
 
 static void _wx_show_banner(NSString *title, NSString *body);  // 前向声明
 static void _wx_checkView(UIView *view, UIWindow *win);          // 前向声明
@@ -1266,6 +1268,18 @@ static void _wx_viewDidMoveToWindow(id self, SEL _cmd) {
 
         NSLog(@"[WXNotif] banner detected: class=%@ frame=%@ \"%@\" - \"%@\"",
               NSStringFromClass([v class]), NSStringFromCGRect(f), title, body);
+
+        // v1.9.13：频率限制——全局 2 秒内最多弹一次
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (now - gWXLastBannerTime < 2.0) return;
+
+        // v1.9.13：内容去重——同一内容 10 秒内只弹一次
+        NSString *dedupKey = [NSString stringWithFormat:@"%@|%@", title, body];
+        if (!gWXBannerDedup) gWXBannerDedup = [NSMutableDictionary dictionary];
+        NSNumber *lastTime = gWXBannerDedup[dedupKey];
+        if (lastTime && now - [lastTime doubleValue] < 10.0) return;
+        gWXBannerDedup[dedupKey] = @(now);
+        gWXLastBannerTime = now;
 
         _wx_show_banner(title.length ? title : @"微信", body);
     });
