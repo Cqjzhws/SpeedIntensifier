@@ -147,7 +147,8 @@ static BOOL SIO_wechatZoomPreviewActive(void) {
 
 static inline BOOL SIO_blocked(void) {
     if (!gEnabled) return YES;
-    if (SIO_wechatZoomPreviewActive()) return YES;   // 微信预览放大态：全部动画 hook 透传
+    if (gIsWeChat) return YES;   // v1.8.5：微信全局透传所有动画 hook（安全策略）
+    if (SIO_wechatZoomPreviewActive()) return YES;   // 微信预览放大态旁路（v1.8.4 保留，当前被上一行覆盖）
     if (!gSelfBundle) gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     if (gSelfBundle.length == 0) return NO;
     if (!gBlacklist) return NO;
