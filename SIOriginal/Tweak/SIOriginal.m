@@ -1096,6 +1096,76 @@ static UIWindow *gWXNotifWindow = nil;
 static WXNotifBanner *gWXCurrentBanner = nil;
 static NSMutableArray *gWXNotifQueue = nil;
 
+// v1.9.2：微信自定义横幅拦截（微信前台横幅不走 UNNotification，是自定义 UIView）
+static NSTimer *gWXBannerScanTimer = nil;
+static NSMutableSet *gWXSeenBanners = nil;
+
+static void _wx_show_banner(NSString *title, NSString *body);  // 前向声明
+
+static void _wx_scanCustomBanner(void) {
+    if (!gWXBigNotif) return;
+    if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
+
+    // 遍历所有 window
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *win in ((UIWindowScene *)sc).windows) {
+            if (win.hidden || win.alpha < 0.1) continue;
+            for (UIView *sub in win.subviews) {
+                _wx_checkView(sub, win);
+            }
+        }
+    }
+}
+
+static void _wx_checkView(UIView *view, UIWindow *win) {
+    if (!view || view.hidden || view.alpha < 0.1) return;
+
+    // 横幅特征：位于顶部、高度 50-130、宽度接近屏宽、含 2+ UILabel
+    CGRect f = view.frame;
+    if (f.origin.y > 5) return;           // 必须贴顶
+    if (f.origin.y < -200) return;         // 完全在屏幕外的跳过
+    if (f.size.height < 45 || f.size.height > 140) return;
+    if (f.size.width < 200) return;
+
+    // 收集所有 UILabel（递归一层）
+    NSMutableArray *labels = [NSMutableArray array];
+    for (UIView *v in view.subviews) {
+        if ([v isKindOfClass:[UILabel class]]) {
+            UILabel *l = (UILabel *)v;
+            if (l.text.length > 0) [labels addObject:l];
+        }
+    }
+    if (labels.count < 2) return;
+
+    // 去重：用 view 指针地址
+    NSValue *key = [NSValue valueWithNonretainedObject:view];
+    if (!gWXSeenBanners) gWXSeenBanners = [NSMutableSet set];
+    if ([gWXSeenBanners containsObject:key]) return;
+    [gWXSeenBanners addObject:key];
+
+    // 提取文字：第一个 label 通常是昵称，第二个是内容
+    NSString *title = @"";
+    NSString *body = @"";
+    // 按 y 坐标排序
+    NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
+        return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
+    }];
+    for (UILabel *l in sorted) {
+        if (!title.length) title = l.text;
+        else if (!body.length) { body = l.text; break; }
+    }
+    if (!title.length && !body.length) return;
+
+    NSLog(@"[WXNotif] custom banner intercepted: %@ - %@", title, body);
+
+    // 隐藏微信横幅
+    view.hidden = YES;
+
+    // 弹我们的大窗
+    _wx_show_banner(title.length ? title : @"微信", body);
+}
+
 // 获取当前活跃的 UIWindowScene（v1.9.1：修复无 scene 导致窗口间歇性不显示）
 static UIWindowScene *_wx_activeScene(void) {
     for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
@@ -1192,6 +1262,7 @@ static void _fbg_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center
         UNNotificationContent *c = note.request.content;
         NSString *title = c.title.length ? c.title : (c.subtitle.length ? c.subtitle : @"微信");
         NSString *body = c.body;
+        NSLog(@"[WXNotif] willPresent fired: title=%@ body=%@", title, body);
         _wx_show_banner(title, body);
         // 抑制系统横幅，但保留声音和角标
         handler(UNNotificationPresentationOptionSound | UNNotificationPresentationOptionBadge);
@@ -1257,6 +1328,14 @@ static void _fbg_installNotifHooks(void) {
 
     // hook 后台远程推送（willPresent 在后台不触发，需要从这里兜底）
     _fbg_installRemoteNotifHook();
+
+    // v1.9.2：启动微信自定义横幅扫描器（前台横幅是微信自定义 UIView，不走 UNNotification）
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gWXBannerScanTimer) return;
+        gWXBannerScanTimer = [NSTimer scheduledTimerWithTimeInterval:0.3 repeats:YES
+            block:^(NSTimer *t){ _wx_scanCustomBanner(); }];
+        [[NSRunLoop mainRunLoop] addTimer:gWXBannerScanTimer forMode:NSRunLoopCommonModes];
+    });
 }
 
 static void _fbg_installSceneHooks(void) {
