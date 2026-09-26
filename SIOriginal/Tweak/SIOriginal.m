@@ -1107,9 +1107,9 @@ static void _wx_show_banner(NSString *title, NSString *body);  // 前向声明
 static void _wx_checkView(UIView *view, UIWindow *win);          // 前向声明
 
 static void _wx_scanCustomBanner(void) {
-    // v1.9.9：禁用定时器扫描——会误杀聊天列表头像 cell
-    // 只保留 didMoveToWindow 事件驱动（新视图添加时才检测）
+    // v1.9.15：定时器扫描已禁用（会误杀聊天列表），保留 didMoveToWindow 事件驱动
     return;
+    if (!gWXBigNotif) return;
     if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
 
     // 遍历所有 window
@@ -1198,6 +1198,10 @@ static void _wx_checkView(UIView *view, UIWindow *win) {
 // 微信横幅独特特征：顶部 + 含头像 UIImageView + 含文字 + 高度 50-90
 static void _wx_viewDidMoveToWindow(id self, SEL _cmd) {
     if (gOrigViewDidMove) gOrigViewDidMove(self, _cmd);
+
+    // v1.9.15：受配置开关控制
+    if (!gWXBigNotif) return;
+    if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
 
     UIView *view = (UIView *)self;
     if (!view.window) return;
@@ -1380,8 +1384,8 @@ static void _wx_show_banner(NSString *title, NSString *body) {
 static void _fbg_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center,
                              UNNotification *note,
                              void (^handler)(UNNotificationPresentationOptions)) {
-    // v1.9.8：微信通知大弹窗接管（无条件，诊断用）
-    if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
+    // v1.9.15：恢复 gWXBigNotif 配置检查
+    if (gWXBigNotif && [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
         UNNotificationContent *c = note.request.content;
         NSString *title = c.title.length ? c.title : (c.subtitle.length ? c.subtitle : @"微信");
         NSString *body = c.body;
@@ -1502,8 +1506,8 @@ static void (*gOrigDidReceiveRemote)(id, SEL, UIApplication *, NSDictionary *, v
 static void _fbg_didReceiveRemote(id self, SEL _cmd, UIApplication *app,
                                    NSDictionary *userInfo,
                                    void (^handler)(UIBackgroundFetchResult)) {
-    // v1.9.8：微信通知大弹窗（无条件，诊断用）
-    if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
+    // v1.9.15：恢复 gWXBigNotif 配置检查
+    if (gWXBigNotif && [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
         NSDictionary *aps = userInfo[@"aps"];
         if ([aps isKindOfClass:[NSDictionary class]]) {
             id alert = aps[@"alert"];
