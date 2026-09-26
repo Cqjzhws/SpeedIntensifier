@@ -1108,6 +1108,7 @@ static NSTimer *gWXTrackTimer = nil;                // v1.9.16：内容变化监
 
 static void _wx_show_banner(NSString *title, NSString *body);  // 前向声明
 static void _wx_checkView(UIView *view, UIWindow *win);          // 前向声明
+static void _wx_checkTrackedBanner(void);                         // 前向声明
 
 static void _wx_scanCustomBanner(void) {
     // v1.9.15：定时器扫描已禁用（会误杀聊天列表），保留 didMoveToWindow 事件驱动
@@ -1257,18 +1258,6 @@ static void _wx_viewDidMoveToWindow(id self, SEL _cmd) {
         }
         if (labels.count < 1) return;
 
-        // v1.9.14：去掉 view 指针去重——微信复用同一个横幅 view，只更新内容
-        // 只靠内容去重即可防止同一消息反复弹
-
-        // v1.9.16：追踪这个横幅 view，监控内容变化
-        gWXTrackedBanner = v;
-        gWXTrackedText = [NSString stringWithFormat:@"%@|%@", title, body];
-        if (!gWXTrackTimer) {
-            gWXTrackTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES
-                block:^(NSTimer *t){ _wx_checkTrackedBanner(); }];
-            [[NSRunLoop mainRunLoop] addTimer:gWXTrackTimer forMode:NSRunLoopCommonModes];
-        }
-
         NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
             return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
         }];
@@ -1277,6 +1266,15 @@ static void _wx_viewDidMoveToWindow(id self, SEL _cmd) {
         for (UILabel *l in sorted) {
             if (!title.length) title = l.text;
             else if (!body.length) { body = l.text; break; }
+        }
+
+        // v1.9.16：追踪这个横幅 view，监控内容变化（微信复用同一 view 更新文字）
+        gWXTrackedBanner = v;
+        gWXTrackedText = [NSString stringWithFormat:@"%@|%@", title, body];
+        if (!gWXTrackTimer) {
+            gWXTrackTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES
+                block:^(NSTimer *t){ _wx_checkTrackedBanner(); }];
+            [[NSRunLoop mainRunLoop] addTimer:gWXTrackTimer forMode:NSRunLoopCommonModes];
         }
 
         NSLog(@"[WXNotif] banner detected: class=%@ frame=%@ \"%@\" - \"%@\"",
