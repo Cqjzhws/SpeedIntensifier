@@ -1203,15 +1203,16 @@ static void _wx_checkView(UIView *view, UIWindow *win) {
     _wx_show_banner(title.length ? title : @"微信", body);
 }
 
-// v1.9.17：横幅检测核心逻辑（供 didMoveToWindow 和 setHidden: 共用）
+// v1.9.17：横幅检测核心逻辑（供 didMoveToWindow/setHidden:/setAlpha:/layoutSubviews 共用）
+// v1.9.20：去掉 gWXBigNotif 检查（微信进程内无条件运行），完全递归扫描子视图
 static void _wx_tryDetectBanner(UIView *v) {
     if (!v || !v.window || v.hidden) return;
 
     CGRect f = [v convertRect:v.bounds toView:nil];
     CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
-    if (f.origin.y > screenH * 0.2) return;
-    if (f.origin.y < -200) return;
-    if (f.size.height < 40 || f.size.height > 120) return;
+    if (f.origin.y > screenH * 0.25) return;  // 顶部 25%
+    if (f.origin.y < -300) return;
+    if (f.size.height < 40 || f.size.height > 130) return;
     if (f.size.width < 150) return;
 
     // 不能在 UIScrollView 内
@@ -1221,32 +1222,23 @@ static void _wx_tryDetectBanner(UIView *v) {
         parent = parent.superview;
     }
 
-    // 提取文字
+    // 完全递归收集文字和头像
     NSMutableArray *labels = [NSMutableArray array];
-    for (UIView *sub in v.subviews) {
-        if ([sub isKindOfClass:[UILabel class]]) {
-            UILabel *l = (UILabel *)sub;
-            if (l.text.length > 0) [labels addObject:l];
-        }
-        for (UIView *ss in sub.subviews) {
-            if ([ss isKindOfClass:[UILabel class]]) {
-                UILabel *l = (UILabel *)ss;
+    BOOL hasAvatar = NO;
+    void (^scan)(UIView *) = ^(UIView *node) {
+        for (UIView *sub in node.subviews) {
+            if ([sub isKindOfClass:[UIImageView class]]) hasAvatar = YES;
+            if ([sub isKindOfClass:[UILabel class]]) {
+                UILabel *l = (UILabel *)sub;
                 if (l.text.length > 0) [labels addObject:l];
             }
+            scan(sub);  // 递归
         }
-    }
-    if (labels.count < 1) return;
+    };
+    scan(v);
 
-    // 必须含 UIImageView（头像），或有 2 个以上文字 label（文件传输助手等无头像场景）
-    BOOL hasAvatar = NO;
-    for (UIView *sub in v.subviews) {
-        if ([sub isKindOfClass:[UIImageView class]]) { hasAvatar = YES; break; }
-        for (UIView *ss in sub.subviews) {
-            if ([ss isKindOfClass:[UIImageView class]]) { hasAvatar = YES; break; }
-        }
-        if (hasAvatar) break;
-    }
-    if (!hasAvatar && labels.count < 2) return;
+    if (labels.count < 1) return;
+    if (!hasAvatar && labels.count < 2) return;  // 有头像或2个以上label
 
     NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
         return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
@@ -1271,7 +1263,7 @@ static void _wx_tryDetectBanner(UIView *v) {
           NSStringFromClass([v class]), NSStringFromCGRect(f), title, body);
 
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - gWXLastBannerTime < 2.0) return;
+    if (now - gWXLastBannerTime < 1.5) return;
 
     NSString *dedupKey = [NSString stringWithFormat:@"%@|%@", title, body];
     if (!gWXBannerDedup) gWXBannerDedup = [NSMutableDictionary dictionary];
@@ -1287,7 +1279,7 @@ static void _wx_tryDetectBanner(UIView *v) {
 static void _wx_viewDidMoveToWindow(id self, SEL _cmd) {
     if (gOrigViewDidMove) gOrigViewDidMove(self, _cmd);
 
-    if (!gWXBigNotif) return;
+    // v1.9.20：去掉 gWXBigNotif 检查，微信进程内无条件运行
     if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
 
     UIView *view = (UIView *)self;
@@ -1303,7 +1295,6 @@ static void _wx_viewDidMoveToWindow(id self, SEL _cmd) {
 static void _wx_setHidden(id self, SEL _cmd, BOOL hidden) {
     if (gOrigSetHidden) gOrigSetHidden(self, _cmd, hidden);
 
-    if (!gWXBigNotif) return;
     if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
     if (hidden) return;  // 只处理从隐藏变显示
 
@@ -1318,7 +1309,6 @@ static void _wx_setHidden(id self, SEL _cmd, BOOL hidden) {
 static void _wx_setAlpha(id self, SEL _cmd, CGFloat alpha) {
     if (gOrigSetAlpha) gOrigSetAlpha(self, _cmd, alpha);
 
-    if (!gWXBigNotif) return;
     if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
     if (alpha <= 0.01) return;  // 只处理变可见
 
@@ -1333,12 +1323,11 @@ static void _wx_setAlpha(id self, SEL _cmd, CGFloat alpha) {
 static void _wx_layoutSubviews(id self, SEL _cmd) {
     if (gOrigLayoutSubviews) gOrigLayoutSubviews(self, _cmd);
 
-    if (!gWXBigNotif) return;
     if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
 
-    // 节流：layoutSubviews 调用极频繁，0.3 秒内最多检测一次
+    // 节流：layoutSubviews 调用极频繁，0.15 秒内最多检测一次
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - gWXLastLayoutCheck < 0.3) return;
+    if (now - gWXLastLayoutCheck < 0.15) return;
     gWXLastLayoutCheck = now;
 
     UIView *view = (UIView *)self;
@@ -1350,7 +1339,7 @@ static void _wx_layoutSubviews(id self, SEL _cmd) {
 
 // v1.9.16：监控追踪的横幅 view 内容变化（微信复用同一 view 更新文字）
 static void _wx_checkTrackedBanner(void) {
-    if (!gWXBigNotif) return;
+    if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
     UIView *v = gWXTrackedBanner;
     if (!v || !v.window) {
         gWXTrackedBanner = nil;
