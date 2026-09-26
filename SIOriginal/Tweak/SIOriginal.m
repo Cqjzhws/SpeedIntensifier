@@ -1198,72 +1198,77 @@ static void _wx_viewDidMoveToWindow(id self, SEL _cmd) {
     if (gOrigViewDidMove) gOrigViewDidMove(self, _cmd);
 
     UIView *view = (UIView *)self;
-    if (!view.window) return;  // 只处理被加到 window 的
+    if (!view.window) return;
 
-    // 快速过滤：只看顶部区域
-    CGRect f = [view convertRect:view.bounds toView:nil];
-    if (f.origin.y > 30) return;       // v1.9.10：必须非常接近顶部
-    if (f.origin.y < -200) return;
-    if (f.size.height < 50 || f.size.height > 95) return;
-    if (f.size.width < 200) return;
+    // v1.9.12：延迟到下一帧检查，等 frame 布局完成
+    __weak UIView *weakView = view;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIView *v = weakView;
+        if (!v || !v.window) return;
 
-    // v1.9.10：不能在 UIScrollView 内（排除聊天列表/网页等滚动内容）
-    UIView *parent = view.superview;
-    while (parent) {
-        if ([parent isKindOfClass:[UIScrollView class]]) return;
-        parent = parent.superview;
-    }
+        CGRect f = [v convertRect:v.bounds toView:nil];
+        // 放宽：顶部 20% 区域
+        CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
+        if (f.origin.y > screenH * 0.2) return;
+        if (f.origin.y < -200) return;
+        if (f.size.height < 40 || f.size.height > 120) return;
+        if (f.size.width < 150) return;
 
-    // 必须包含头像 UIImageView（导航栏/状态栏没有这个）
-    BOOL hasAvatar = NO;
-    for (UIView *sub in view.subviews) {
-        if ([sub isKindOfClass:[UIImageView class]]) { hasAvatar = YES; break; }
-    }
-    if (!hasAvatar) return;
-
-    // 提取文字（递归找 UILabel）
-    NSMutableArray *labels = [NSMutableArray array];
-    for (UIView *sub in view.subviews) {
-        if ([sub isKindOfClass:[UILabel class]]) {
-            UILabel *l = (UILabel *)sub;
-            if (l.text.length > 0) [labels addObject:l];
+        // 不能在 UIScrollView 内
+        UIView *parent = v.superview;
+        while (parent) {
+            if ([parent isKindOfClass:[UIScrollView class]]) return;
+            parent = parent.superview;
         }
-        for (UIView *ss in sub.subviews) {
-            if ([ss isKindOfClass:[UILabel class]]) {
-                UILabel *l = (UILabel *)ss;
+
+        // 必须含 UIImageView（头像）
+        BOOL hasAvatar = NO;
+        for (UIView *sub in v.subviews) {
+            if ([sub isKindOfClass:[UIImageView class]]) { hasAvatar = YES; break; }
+            for (UIView *ss in sub.subviews) {
+                if ([ss isKindOfClass:[UIImageView class]]) { hasAvatar = YES; break; }
+            }
+            if (hasAvatar) break;
+        }
+        if (!hasAvatar) return;
+
+        // 提取文字（递归两层）
+        NSMutableArray *labels = [NSMutableArray array];
+        for (UIView *sub in v.subviews) {
+            if ([sub isKindOfClass:[UILabel class]]) {
+                UILabel *l = (UILabel *)sub;
                 if (l.text.length > 0) [labels addObject:l];
             }
+            for (UIView *ss in sub.subviews) {
+                if ([ss isKindOfClass:[UILabel class]]) {
+                    UILabel *l = (UILabel *)ss;
+                    if (l.text.length > 0) [labels addObject:l];
+                }
+            }
         }
-    }
-    if (labels.count < 1) return;
+        if (labels.count < 1) return;
 
-    // 去重
-    NSValue *key = [NSValue valueWithNonretainedObject:view];
-    if (!gWXSeenBanners) gWXSeenBanners = [NSMutableSet set];
-    if ([gWXSeenBanners containsObject:key]) return;
-    [gWXSeenBanners addObject:key];
+        // 去重
+        NSValue *key = [NSValue valueWithNonretainedObject:v];
+        if (!gWXSeenBanners) gWXSeenBanners = [NSMutableSet set];
+        if ([gWXSeenBanners containsObject:key]) return;
+        [gWXSeenBanners addObject:key];
 
-    // 提取前两段文字
-    NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
-        return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
-    }];
-    NSString *title = @"";
-    NSString *body = @"";
-    for (UILabel *l in sorted) {
-        if (!title.length) title = l.text;
-        else if (!body.length) { body = l.text; break; }
-    }
+        NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
+            return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
+        }];
+        NSString *title = @"";
+        NSString *body = @"";
+        for (UILabel *l in sorted) {
+            if (!title.length) title = l.text;
+            else if (!body.length) { body = l.text; break; }
+        }
 
-    NSLog(@"[WXNotif] didMoveToWindow banner: class=%@ frame=%@ \"%@\" - \"%@\"",
-          NSStringFromClass([view class]), NSStringFromCGRect(f), title, body);
+        NSLog(@"[WXNotif] banner detected: class=%@ frame=%@ \"%@\" - \"%@\"",
+              NSStringFromClass([v class]), NSStringFromCGRect(f), title, body);
 
-    // v1.9.10：不隐藏原视图，只弹我们的大窗（避免误杀正常 UI）
-    // 强制隐藏微信横幅
-    // view.hidden = YES;
-    // view.alpha = 0;
-
-    // 弹我们的大窗
-    _wx_show_banner(title.length ? title : @"微信", body);
+        _wx_show_banner(title.length ? title : @"微信", body);
+    });
 }
 
 // 获取当前活跃的 UIWindowScene（v1.9.1：修复无 scene 导致窗口间歇性不显示）
