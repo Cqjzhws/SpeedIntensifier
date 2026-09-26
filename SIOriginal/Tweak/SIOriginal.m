@@ -1342,10 +1342,34 @@ static void _fbg_installNotifHooks(void) {
     // hook 后台远程推送（willPresent 在后台不触发，需要从这里兜底）
     _fbg_installRemoteNotifHook();
 
-    // v1.9.4：启动 5 秒后弹测试大窗，确认大窗机制本身正常
-    if (gWXBigNotif && [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
+    // v1.9.5：启动 5 秒后无条件弹测试大窗（不依赖 gWXBigNotif），诊断窗口机制
+    if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
+            // 先试最简单的：往 keyWindow 加红色块，确认能往屏幕上画东西
+            UIWindow *kw = nil;
+            for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+                if ([sc isKindOfClass:[UIWindowScene class]]) {
+                    for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+                        if (w.isKeyWindow) { kw = w; break; }
+                    }
+                }
+            }
+            if (kw) {
+                UIView *test = [[UIView alloc] initWithFrame:CGRectMake(20, 100, 200, 60)];
+                test.backgroundColor = [UIColor redColor];
+                test.layer.cornerRadius = 8;
+                UILabel *lbl = [[UILabel alloc] initWithFrame:test.bounds];
+                lbl.text = @"SIOriginal 测试";
+                lbl.textColor = [UIColor whiteColor];
+                lbl.textAlignment = NSTextAlignmentCenter;
+                lbl.font = [UIFont boldSystemFontOfSize:14];
+                [test addSubview:lbl];
+                [kw addSubview:test];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{ [test removeFromSuperview]; });
+            }
+            // 同时弹我们的大窗
             _wx_show_banner(@"SIOriginal 测试", @"如果你看到这条，说明大窗机制正常");
         });
     }
