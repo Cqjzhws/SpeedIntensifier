@@ -86,8 +86,68 @@ static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
     SIO_reload();
 }
 
+// ---------- 微信图片预览「放大态」全局旁路（v1.8.4） ----------
+// v1.8.3 只保护了缩放相关的两个 UIScrollView hook，但用户实测仍有残留故障：
+// 放大后顶/底工具栏自动隐藏，单击屏幕再也唤不出，返回/完成按钮跟着消失，
+// 只能杀微信。微信图片浏览器（发图预览、聊天大图）的工具栏隐显走的是
+// UIView 块动画 / UIViewPropertyAnimator / CAAnimation，瞬切模式把时长压到
+// 0.01s、加速模式整体缩短，会破坏浏览器「隐显动画完成 → 清 isAnimating 锁 →
+// 接受下一次单击切换」的状态配对，导致单击被丢弃，工具栏永远停在隐藏态。
+// 该故障只在「放大态」出现（未放大时单击切换正常），因此：只要微信前台
+// 存在一个启用了缩放且当前 zoomScale > minimumZoomScale 的 UIScrollView，
+// 就令所有动画 hook 整体旁路（SIO_blocked 返回 YES），缩放/工具栏/手势全走
+// 原生路径；缩回最小倍率后 0.25s 内自动恢复加速。探测限主线程、0.25s 节流，
+// 对性能无实际影响。
+static NSTimeInterval gZoomProbeAt = 0;
+static BOOL           gZoomPreviewCached = NO;
+
+static BOOL SIO_wechatZoomPreviewActive(void) {
+    if (!gIsWeChat) return NO;
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - gZoomProbeAt < 0.25) return gZoomPreviewCached;
+    gZoomProbeAt = now;
+    // 视图树只能在主线程碰；非主线程直接沿用上一次结果（最多滞后 0.25s）
+    if (![NSThread isMainThread]) return gZoomPreviewCached;
+
+    BOOL found = NO;
+    @autoreleasepool {
+        @try {
+            NSMutableArray<UIView *> *roots = [NSMutableArray array];
+            for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+                if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+                UIWindowScene *ws = (UIWindowScene *)sc;
+                if (ws.activationState != UISceneActivationStateForegroundActive) continue;
+                for (UIWindow *w in ws.windows) {
+                    if (!w.hidden && w.alpha > 0.01 && w.rootViewController.view) {
+                        [roots addObject:w];
+                    }
+                }
+            }
+            // 迭代 DFS，扫描整个前台视图树
+            NSMutableArray<UIView *> *stack = roots;
+            while (stack.count) {
+                UIView *v = stack.lastObject;
+                [stack removeLastObject];
+                if ([v isKindOfClass:[UIScrollView class]]) {
+                    UIScrollView *sv = (UIScrollView *)v;
+                    if (sv.maximumZoomScale > sv.minimumZoomScale + 0.001 &&
+                        sv.zoomScale > sv.minimumZoomScale + 0.001) {
+                        found = YES;
+                        break;
+                    }
+                }
+                NSArray *subs = v.subviews;
+                if (subs.count) [stack addObjectsFromArray:subs];
+            }
+        } @catch (__unused NSException *e) {}
+    }
+    gZoomPreviewCached = found;
+    return found;
+}
+
 static inline BOOL SIO_blocked(void) {
     if (!gEnabled) return YES;
+    if (SIO_wechatZoomPreviewActive()) return YES;   // 微信预览放大态：全部动画 hook 透传
     if (!gSelfBundle) gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     if (gSelfBundle.length == 0) return NO;
     if (!gBlacklist) return NO;
