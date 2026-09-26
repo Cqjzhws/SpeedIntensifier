@@ -1211,6 +1211,7 @@ static void (*gOrigUNSetDelegate)(id, SEL, id);
 
 // v1.9.1 前向声明
 static void _fbg_installRemoteNotifHook(void);
+static void _fbg_installNotifHooks(void);
 
 // v1.9.1：统一的 delegate hook 逻辑，供 setDelegate 和初始化时主动调用
 static void _fbg_hookNotifDelegate(id<UNUserNotificationCenterDelegate> delegate) {
@@ -1233,6 +1234,31 @@ static void _fbg_unSetDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDel
     _fbg_hookNotifDelegate(delegate);
 }
 
+static void _fbg_installNotifHooks(void) {
+    Class unClass = [UNUserNotificationCenter class];
+    Method delM = class_getInstanceMethod(unClass, @selector(setDelegate:));
+    if (delM) {
+        gOrigUNSetDelegate = (void (*)(id, SEL, id))method_getImplementation(delM);
+        method_setImplementation(delM, (IMP)_fbg_unSetDelegate);
+    }
+
+    // 主动 hook 当前已设置的 delegate（修复竞态：微信可能在我们 swizzle 前就设好了 delegate）
+    UNUserNotificationCenter *unc = [UNUserNotificationCenter currentNotificationCenter];
+    if (unc.delegate) {
+        _fbg_hookNotifDelegate(unc.delegate);
+        NSLog(@"[FUBG] proactively hooked existing notif delegate");
+    }
+    // 延迟重试：有些 App 会在启动后期才设 delegate
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        UNUserNotificationCenter *c = [UNUserNotificationCenter currentNotificationCenter];
+        if (c.delegate) _fbg_hookNotifDelegate(c.delegate);
+    });
+
+    // hook 后台远程推送（willPresent 在后台不触发，需要从这里兜底）
+    _fbg_installRemoteNotifHook();
+}
+
 static void _fbg_installSceneHooks(void) {
     Class wsClass = objc_getClass("FBSWorkspaceScenesClient");
     Method sceneM = wsClass ? class_getInstanceMethod(
@@ -1250,28 +1276,6 @@ static void _fbg_installSceneHooks(void) {
         gOrigAppState = (UIApplicationState (*)(id, SEL))method_getImplementation(stateM);
         method_setImplementation(stateM, (IMP)_fbg_appState);
     }
-
-    Class unClass = [UNUserNotificationCenter class];
-    Method delM = class_getInstanceMethod(unClass, @selector(setDelegate:));
-    if (delM) {
-        gOrigUNSetDelegate = (void (*)(id, SEL, id))method_getImplementation(delM);
-        method_setImplementation(delM, (IMP)_fbg_unSetDelegate);
-    }
-
-    // v1.9.1：主动 hook 当前已设置的 delegate（修复竞态：微信可能在我们 swizzle 前就设好了 delegate）
-    UNUserNotificationCenter *unc = [UNUserNotificationCenter currentNotificationCenter];
-    if (unc.delegate) {
-        _fbg_hookNotifDelegate(unc.delegate);
-    } else {
-        // 延迟重试，有些 App 会在启动后期才设 delegate
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (unc.delegate) _fbg_hookNotifDelegate(unc.delegate);
-        });
-    }
-
-    // v1.9.1：hook 后台远程推送（willPresent 在后台不触发，需要从这里兜底）
-    _fbg_installRemoteNotifHook();
 }
 
 #pragma mark - 后台远程推送 hook（v1.9.1）
@@ -1758,6 +1762,9 @@ static void FUBGEntry(void) {
         NSString *_bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
         BOOL _isWC = [_bid isEqualToString:@"com.tencent.xin"];
         _fbg_loadPref();
+
+        // v1.9.1：通知 hook 同步安装（修复竞态：dispatch_async 可能晚于微信设置 delegate）
+        _fbg_installNotifHooks();
 
         // hook 一次性安装，内部按全局开关决定行为
         dispatch_async(dispatch_get_main_queue(), ^{
