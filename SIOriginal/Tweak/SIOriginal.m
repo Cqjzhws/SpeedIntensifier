@@ -1091,10 +1091,25 @@ static UIApplicationState _fbg_appState(id self, SEL _cmd) {
 static void (*gOrigWillPresent)(id, SEL, UNUserNotificationCenter *, UNNotification *,
                                 void (^)(UNNotificationPresentationOptions));
 
-// 微信通知大弹窗窗口管理（v1.9.0）
+// 微信通知大弹窗窗口管理（v1.9.1）
 static UIWindow *gWXNotifWindow = nil;
 static WXNotifBanner *gWXCurrentBanner = nil;
 static NSMutableArray *gWXNotifQueue = nil;
+
+// 获取当前活跃的 UIWindowScene（v1.9.1：修复无 scene 导致窗口间歇性不显示）
+static UIWindowScene *_wx_activeScene(void) {
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if (sc.activationState == UISceneActivationStateForegroundActive &&
+            [sc isKindOfClass:[UIWindowScene class]]) {
+            return (UIWindowScene *)sc;
+        }
+    }
+    // 退而求其次：取第一个 window scene
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if ([sc isKindOfClass:[UIWindowScene class]]) return (UIWindowScene *)sc;
+    }
+    return nil;
+}
 
 static UIWindow *_wx_notif_window(void) {
     if (!gWXNotifWindow) {
@@ -1104,6 +1119,12 @@ static UIWindow *_wx_notif_window(void) {
         gWXNotifWindow.userInteractionEnabled = YES;
         gWXNotifWindow.hidden = NO;
     }
+    // v1.9.1：每次显示前确保绑定到活跃 scene（多 App 并发时 scene 可能变化）
+    UIWindowScene *sc = _wx_activeScene();
+    if (sc && gWXNotifWindow.windowScene != sc) {
+        gWXNotifWindow.windowScene = sc;
+    }
+    gWXNotifWindow.hidden = NO;
     return gWXNotifWindow;
 }
 
@@ -1188,20 +1209,25 @@ static void _fbg_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center
 
 static void (*gOrigUNSetDelegate)(id, SEL, id);
 
-static void _fbg_unSetDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDelegate> delegate) {
-    if (gOrigUNSetDelegate) gOrigUNSetDelegate(self, _cmd, delegate);
-    if (delegate) {
-        Class dc = [delegate class];
-        SEL sel = @selector(userNotificationCenter:willPresentNotification:withCompletionHandler:);
-        Method m = class_getInstanceMethod(dc, sel);
-        if (m) {
-            IMP cur = method_getImplementation(m);
-            if (cur != (IMP)_fbg_willPresent) {
-                gOrigWillPresent = (void *)cur;
-                method_setImplementation(m, (IMP)_fbg_willPresent);
-            }
+// v1.9.1：统一的 delegate hook 逻辑，供 setDelegate 和初始化时主动调用
+static void _fbg_hookNotifDelegate(id<UNUserNotificationCenterDelegate> delegate) {
+    if (!delegate) return;
+    Class dc = [delegate class];
+    SEL sel = @selector(userNotificationCenter:willPresentNotification:withCompletionHandler:);
+    Method m = class_getInstanceMethod(dc, sel);
+    if (m) {
+        IMP cur = method_getImplementation(m);
+        if (cur != (IMP)_fbg_willPresent) {
+            gOrigWillPresent = (void *)cur;
+            method_setImplementation(m, (IMP)_fbg_willPresent);
+            NSLog(@"[FUBG] hooked willPresentNotification on %@", NSStringFromClass(dc));
         }
     }
+}
+
+static void _fbg_unSetDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDelegate> delegate) {
+    if (gOrigUNSetDelegate) gOrigUNSetDelegate(self, _cmd, delegate);
+    _fbg_hookNotifDelegate(delegate);
 }
 
 static void _fbg_installSceneHooks(void) {
@@ -1228,6 +1254,87 @@ static void _fbg_installSceneHooks(void) {
         gOrigUNSetDelegate = (void (*)(id, SEL, id))method_getImplementation(delM);
         method_setImplementation(delM, (IMP)_fbg_unSetDelegate);
     }
+
+    // v1.9.1：主动 hook 当前已设置的 delegate（修复竞态：微信可能在我们 swizzle 前就设好了 delegate）
+    UNUserNotificationCenter *unc = [UNUserNotificationCenter currentNotificationCenter];
+    if (unc.delegate) {
+        _fbg_hookNotifDelegate(unc.delegate);
+    } else {
+        // 延迟重试，有些 App 会在启动后期才设 delegate
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (unc.delegate) _fbg_hookNotifDelegate(unc.delegate);
+        });
+    }
+
+    // v1.9.1：hook 后台远程推送（willPresent 在后台不触发，需要从这里兜底）
+    _fbg_installRemoteNotifHook();
+}
+
+#pragma mark - 后台远程推送 hook（v1.9.1）
+
+static void (*gOrigDidReceiveRemote)(id, SEL, UIApplication *, NSDictionary *, void (^)(UIBackgroundFetchResult));
+
+static void _fbg_didReceiveRemote(id self, SEL _cmd, UIApplication *app,
+                                   NSDictionary *userInfo,
+                                   void (^handler)(UIBackgroundFetchResult)) {
+    // 微信通知大弹窗：后台推送时也弹自定义窗
+    if (gWXBigNotif && [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
+        NSDictionary *aps = userInfo[@"aps"];
+        if ([aps isKindOfClass:[NSDictionary class]]) {
+            id alert = aps[@"alert"];
+            NSString *title = nil, *body = nil;
+            if ([alert isKindOfClass:[NSDictionary class]]) {
+                title = alert[@"title"];
+                body = alert[@"body"];
+            } else if ([alert isKindOfClass:[NSString class]]) {
+                body = alert;
+            }
+            if (title.length || body.length) {
+                _wx_show_banner(title.length ? title : @"微信", body);
+            }
+        }
+    }
+    if (gOrigDidReceiveRemote) {
+        gOrigDidReceiveRemote(self, _cmd, app, userInfo, handler);
+    } else if (handler) {
+        handler(UIBackgroundFetchResultNoData);
+    }
+}
+
+static void _fbg_installRemoteNotifHook(void) {
+    // 微信的 AppDelegate 可能不实现 didReceiveRemoteNotification，需要动态添加
+    // 先尝试 hook UIApplication 的 delegate 方法
+    Class appClass = [UIApplication class];
+    SEL sel = @selector(application:didReceiveRemoteNotification:fetchCompletionHandler:);
+    Method m = class_getInstanceMethod(appClass, sel);
+    // 这个方法实际在 delegate 上，不在 UIApplication 上
+    // 我们通过 method exchange 在 AppDelegate 上添加
+    // 由于无法预知 delegate 类名，采用另一种方式：hook UIApplication sendAction 或直接监听
+    // 更可靠的方式：hook UIApplicationDelegate 协议方法的实现
+    // 这里使用 +load 时机太晚，改用动态方式：遍历 window 的 delegate
+
+    // 方案：hook UIApplication 的 _setDelegate: 或在 delegate 设置时拦截
+    // 简化方案：直接 hook AppDelegate 的方法（通过 class_getInstanceMethod on delegate class）
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id<UIApplicationDelegate> del = [UIApplication sharedApplication].delegate;
+        if (del) {
+            Class dc = [del class];
+            Method rm = class_getInstanceMethod(dc, sel);
+            if (rm) {
+                IMP cur = method_getImplementation(rm);
+                if (cur != (IMP)_fbg_didReceiveRemote) {
+                    gOrigDidReceiveRemote = (void *)cur;
+                    method_setImplementation(rm, (IMP)_fbg_didReceiveRemote);
+                    NSLog(@"[FUBG] hooked didReceiveRemoteNotification on %@", NSStringFromClass(dc));
+                }
+            } else {
+                // delegate 没实现这个方法，动态添加
+                class_addMethod(dc, sel, (IMP)_fbg_didReceiveRemote, "v@:@@?");
+                NSLog(@"[FUBG] added didReceiveRemoteNotification to %@", NSStringFromClass(dc));
+            }
+        }
+    });
 }
 
 #pragma mark - 引擎二：音频断言
