@@ -1222,23 +1222,32 @@ static void _wx_tryDetectBanner(UIView *v) {
         parent = parent.superview;
     }
 
-    // 完全递归收集文字和头像
+    // 两层递归收集文字和头像（避免完全递归栈溢出）
     NSMutableArray *labels = [NSMutableArray array];
-    __block BOOL hasAvatar = NO;
-    void (^scan)(UIView *) = ^(UIView *node) {
-        for (UIView *sub in node.subviews) {
-            if ([sub isKindOfClass:[UIImageView class]]) hasAvatar = YES;
-            if ([sub isKindOfClass:[UILabel class]]) {
-                UILabel *l = (UILabel *)sub;
+    BOOL hasAvatar = NO;
+    for (UIView *sub in v.subviews) {
+        if ([sub isKindOfClass:[UIImageView class]]) hasAvatar = YES;
+        if ([sub isKindOfClass:[UILabel class]]) {
+            UILabel *l = (UILabel *)sub;
+            if (l.text.length > 0) [labels addObject:l];
+        }
+        for (UIView *ss in sub.subviews) {
+            if ([ss isKindOfClass:[UIImageView class]]) hasAvatar = YES;
+            if ([ss isKindOfClass:[UILabel class]]) {
+                UILabel *l = (UILabel *)ss;
                 if (l.text.length > 0) [labels addObject:l];
             }
-            scan(sub);  // 递归
+            for (UIView *sss in ss.subviews) {
+                if ([sss isKindOfClass:[UIImageView class]]) hasAvatar = YES;
+                if ([sss isKindOfClass:[UILabel class]]) {
+                    UILabel *l = (UILabel *)sss;
+                    if (l.text.length > 0) [labels addObject:l];
+                }
+            }
         }
-    };
-    scan(v);
-
+    }
     if (labels.count < 1) return;
-    if (!hasAvatar && labels.count < 2) return;  // 有头像或2个以上label
+    if (!hasAvatar && labels.count < 2) return;
 
     NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
         return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
@@ -1319,23 +1328,7 @@ static void _wx_setAlpha(id self, SEL _cmd, CGFloat alpha) {
     });
 }
 
-// v1.9.19：hook layoutSubviews——兜底，覆盖所有布局变更触发的横幅显示
-static void _wx_layoutSubviews(id self, SEL _cmd) {
-    if (gOrigLayoutSubviews) gOrigLayoutSubviews(self, _cmd);
-
-    if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
-
-    // 节流：layoutSubviews 调用极频繁，0.15 秒内最多检测一次
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - gWXLastLayoutCheck < 0.15) return;
-    gWXLastLayoutCheck = now;
-
-    UIView *view = (UIView *)self;
-    __weak UIView *weakView = view;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        _wx_tryDetectBanner(weakView);
-    });
-}
+// v1.9.21：移除 layoutSubviews hook（高频调用导致闪退），保留三个事件驱动 hook
 
 // v1.9.16：监控追踪的横幅 view 内容变化（微信复用同一 view 更新文字）
 static void _wx_checkTrackedBanner(void) {
@@ -1593,17 +1586,8 @@ static void _fbg_installNotifHooks(void) {
                 method_setImplementation(sa, (IMP)_wx_setAlpha);
             }
         }
-        // v1.9.19：hook layoutSubviews，兜底覆盖所有布局变更
-        SEL lsSel = @selector(layoutSubviews);
-        Method ls = class_getInstanceMethod(uv, lsSel);
-        if (ls) {
-            IMP cur4 = method_getImplementation(ls);
-            if (cur4 != (IMP)_wx_layoutSubviews) {
-                gOrigLayoutSubviews = (void *)cur4;
-                method_setImplementation(ls, (IMP)_wx_layoutSubviews);
-            }
-        }
-        NSLog(@"[WXNotif] hooked didMoveToWindow + setHidden: + setAlpha: + layoutSubviews");
+        // v1.9.21：移除 layoutSubviews hook
+        NSLog(@"[WXNotif] hooked didMoveToWindow + setHidden: + setAlpha:");
     }
 
     // v1.9.2：启动微信自定义横幅扫描器（前台横幅是微信自定义 UIView，不走 UNNotification）
