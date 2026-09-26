@@ -819,9 +819,13 @@ static void _fbg_loadPref(void) {
             if (d[@"FUBGFloatingBall"]) gShowBall  = [d[@"FUBGFloatingBall"] boolValue];
             id ex = d[@"FUBGExcludeApps"];
             if ([ex isKindOfClass:[NSArray class]]) gExclude = ex;
-            // 复用 SIOriginal 黑名单
+            // 复用 SIOriginal 黑名单（v1.8.6：兼容字符串格式，原来只认 NSArray 导致黑名单对 FUBG 永远无效）
             id bl = d[@"Blacklist"];
-            if ([bl isKindOfClass:[NSArray class]]) gExclude = bl;
+            if ([bl isKindOfClass:[NSArray class]]) {
+                gExclude = bl;
+            } else if ([bl isKindOfClass:[NSString class]] && [(NSString *)bl length]) {
+                gExclude = [(NSString *)bl componentsSeparatedByString:@","];
+            }
         }
     } @catch (__unused NSException *e) {}
     if (!gExclude) gExclude = @[];
@@ -1359,6 +1363,14 @@ static void _fbg_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n,
 __attribute__((constructor))
 static void FUBGEntry(void) {
     @autoreleasepool {
+        // v1.8.6：微信进程完全跳过 FUBG 引擎（场景伪装/音频/悬浮窗/通知hook全不装）。
+        // 微信预览页单击唤不出工具栏的元凶就是 FUBG 引擎默认在微信活跃，
+        // 且黑名单字符串格式不匹配导致排除无效。微信不需要保活，直接整体跳过。
+        NSString *_bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+        if ([_bid isEqualToString:@"com.tencent.xin"]) {
+            NSLog(@"[FUBG] WeChat detected, FUBG engine skipped entirely (v1.8.6)");
+            return;
+        }
         _fbg_loadPref();
 
         // hook 一次性安装，内部按全局开关决定行为
