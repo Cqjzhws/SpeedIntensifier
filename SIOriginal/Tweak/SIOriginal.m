@@ -1099,6 +1099,7 @@ static NSMutableArray *gWXNotifQueue = nil;
 // v1.9.2：微信自定义横幅拦截（微信前台横幅不走 UNNotification，是自定义 UIView）
 static NSTimer *gWXBannerScanTimer = nil;
 static NSMutableSet *gWXSeenBanners = nil;
+static void (*gOrigViewDidMove)(id, SEL);  // v1.9.9：UIView didMoveToWindow 原实现
 
 static void _wx_show_banner(NSString *title, NSString *body);  // 前向声明
 static void _wx_checkView(UIView *view, UIWindow *win);          // 前向声明
@@ -1147,17 +1148,17 @@ static void _wx_checkView(UIView *view, UIWindow *win) {
     if (f.size.height < 50 || f.size.height > 140) return;
     if (f.size.width < 200) return;
 
+    // v1.9.9：必须包含头像 UIImageView（排除导航栏/状态栏等正常 UI）
+    BOOL hasAvatar = NO;
+    for (UIView *sub in view.subviews) {
+        if ([sub isKindOfClass:[UIImageView class]]) { hasAvatar = YES; break; }
+    }
+    if (!hasAvatar) return;
+
     // 递归收集所有 UILabel
     NSMutableArray *labels = [NSMutableArray array];
     _wx_collectLabels(view, labels);
 
-    // v1.9.8：打印所有顶部视图，诊断微信横幅结构
-    if (labels.count >= 1) {
-        NSLog(@"[WXNotif] top view: class=%@ frame=%@ labels=%lu",
-              NSStringFromClass([view class]), NSStringFromCGRect(f), (unsigned long)labels.count);
-    }
-
-    // v1.9.8：放宽到 1 个 label（微信横幅可能用一个 label 显示全部文字）
     if (labels.count < 1) return;
 
     // 去重：用 view 指针地址
@@ -1182,6 +1183,73 @@ static void _wx_checkView(UIView *view, UIWindow *win) {
           NSStringFromClass([view class]), NSStringFromCGRect(f), (unsigned long)labels.count, title, body);
 
     // v1.9.8：强制隐藏微信横幅（hidden + alpha 双保险）
+    view.hidden = YES;
+    view.alpha = 0;
+
+    // 弹我们的大窗
+    _wx_show_banner(title.length ? title : @"微信", body);
+}
+
+// v1.9.9：事件驱动——UIView 被加到 window 时检查是否是微信横幅
+// 微信横幅独特特征：顶部 + 含头像 UIImageView + 含文字 + 高度 50-90
+static void _wx_viewDidMoveToWindow(id self, SEL _cmd) {
+    if (gOrigViewDidMove) gOrigViewDidMove(self, _cmd);
+
+    UIView *view = (UIView *)self;
+    if (!view.window) return;  // 只处理被加到 window 的
+
+    // 快速过滤：只看顶部区域
+    CGRect f = [view convertRect:view.bounds toView:nil];
+    CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
+    if (f.origin.y > screenH * 0.15) return;
+    if (f.origin.y < -200) return;
+    if (f.size.height < 50 || f.size.height > 95) return;
+    if (f.size.width < 200) return;
+
+    // 必须包含头像 UIImageView（导航栏/状态栏没有这个）
+    BOOL hasAvatar = NO;
+    for (UIView *sub in view.subviews) {
+        if ([sub isKindOfClass:[UIImageView class]]) { hasAvatar = YES; break; }
+    }
+    if (!hasAvatar) return;
+
+    // 提取文字（递归找 UILabel）
+    NSMutableArray *labels = [NSMutableArray array];
+    for (UIView *sub in view.subviews) {
+        if ([sub isKindOfClass:[UILabel class]]) {
+            UILabel *l = (UILabel *)sub;
+            if (l.text.length > 0) [labels addObject:l];
+        }
+        for (UIView *ss in sub.subviews) {
+            if ([ss isKindOfClass:[UILabel class]]) {
+                UILabel *l = (UILabel *)ss;
+                if (l.text.length > 0) [labels addObject:l];
+            }
+        }
+    }
+    if (labels.count < 1) return;
+
+    // 去重
+    NSValue *key = [NSValue valueWithNonretainedObject:view];
+    if (!gWXSeenBanners) gWXSeenBanners = [NSMutableSet set];
+    if ([gWXSeenBanners containsObject:key]) return;
+    [gWXSeenBanners addObject:key];
+
+    // 提取前两段文字
+    NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
+        return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
+    }];
+    NSString *title = @"";
+    NSString *body = @"";
+    for (UILabel *l in sorted) {
+        if (!title.length) title = l.text;
+        else if (!body.length) { body = l.text; break; }
+    }
+
+    NSLog(@"[WXNotif] didMoveToWindow banner: class=%@ frame=%@ \"%@\" - \"%@\"",
+          NSStringFromClass([view class]), NSStringFromCGRect(f), title, body);
+
+    // 强制隐藏微信横幅
     view.hidden = YES;
     view.alpha = 0;
 
@@ -1358,6 +1426,21 @@ static void _fbg_installNotifHooks(void) {
 
     // hook 后台远程推送（willPresent 在后台不触发，需要从这里兜底）
     _fbg_installRemoteNotifHook();
+
+    // v1.9.9：hook UIView didMoveToWindow，事件驱动拦截微信横幅（不依赖 UILabel）
+    if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
+        Class uv = [UIView class];
+        SEL dmSel = @selector(didMoveToWindow);
+        Method dm = class_getInstanceMethod(uv, dmSel);
+        if (dm) {
+            IMP cur = method_getImplementation(dm);
+            if (cur != (IMP)_wx_viewDidMoveToWindow) {
+                gOrigViewDidMove = (void *)cur;
+                method_setImplementation(dm, (IMP)_wx_viewDidMoveToWindow);
+                NSLog(@"[WXNotif] hooked UIView didMoveToWindow");
+            }
+        }
+    }
 
     // v1.9.2：启动微信自定义横幅扫描器（前台横幅是微信自定义 UIView，不走 UNNotification）
     dispatch_async(dispatch_get_main_queue(), ^{
