@@ -1349,14 +1349,6 @@ static void _fbg_installNotifHooks(void) {
     // hook 后台远程推送（willPresent 在后台不触发，需要从这里兜底）
     _fbg_installRemoteNotifHook();
 
-    // v1.9.6：启动 5 秒后弹测试大窗，验证不卡死
-    if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            _wx_show_banner(@"SIOriginal 测试", @"如果你看到这条且屏幕没卡死，说明修复成功");
-        });
-    }
-
     // v1.9.2：启动微信自定义横幅扫描器（前台横幅是微信自定义 UIView，不走 UNNotification）
     dispatch_async(dispatch_get_main_queue(), ^{
         if (gWXBannerScanTimer) return;
