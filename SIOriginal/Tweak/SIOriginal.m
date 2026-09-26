@@ -1250,11 +1250,8 @@ static void _wx_viewDidMoveToWindow(id self, SEL _cmd) {
         }
         if (labels.count < 1) return;
 
-        // 去重
-        NSValue *key = [NSValue valueWithNonretainedObject:v];
-        if (!gWXSeenBanners) gWXSeenBanners = [NSMutableSet set];
-        if ([gWXSeenBanners containsObject:key]) return;
-        [gWXSeenBanners addObject:key];
+        // v1.9.14：去掉 view 指针去重——微信复用同一个横幅 view，只更新内容
+        // 只靠内容去重即可防止同一消息反复弹
 
         NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
             return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
