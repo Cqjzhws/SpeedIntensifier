@@ -1102,6 +1102,8 @@ static NSMutableSet *gWXSeenBanners = nil;
 static void (*gOrigViewDidMove)(id, SEL);  // v1.9.9：UIView didMoveToWindow 原实现
 static void (*gOrigSetHidden)(id, SEL, BOOL);  // v1.9.17：UIView setHidden: 原实现
 static void (*gOrigSetAlpha)(id, SEL, CGFloat);  // v1.9.18：UIView setAlpha: 原实现
+static void (*gOrigLayoutSubviews)(id, SEL);  // v1.9.19：UIView layoutSubviews 原实现
+static NSTimeInterval gWXLastLayoutCheck = 0;  // v1.9.19：layoutSubviews 检测节流
 static NSMutableDictionary *gWXBannerDedup = nil;  // v1.9.13：内容去重（key=内容，value=时间戳）
 static NSTimeInterval gWXLastBannerTime = 0;       // v1.9.13：上次弹窗时间
 static __weak UIView *gWXTrackedBanner = nil;       // v1.9.16：追踪的横幅 view
@@ -1319,6 +1321,25 @@ static void _wx_setAlpha(id self, SEL _cmd, CGFloat alpha) {
     if (!gWXBigNotif) return;
     if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
     if (alpha <= 0.01) return;  // 只处理变可见
+
+    UIView *view = (UIView *)self;
+    __weak UIView *weakView = view;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        _wx_tryDetectBanner(weakView);
+    });
+}
+
+// v1.9.19：hook layoutSubviews——兜底，覆盖所有布局变更触发的横幅显示
+static void _wx_layoutSubviews(id self, SEL _cmd) {
+    if (gOrigLayoutSubviews) gOrigLayoutSubviews(self, _cmd);
+
+    if (!gWXBigNotif) return;
+    if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
+
+    // 节流：layoutSubviews 调用极频繁，0.3 秒内最多检测一次
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - gWXLastLayoutCheck < 0.3) return;
+    gWXLastLayoutCheck = now;
 
     UIView *view = (UIView *)self;
     __weak UIView *weakView = view;
@@ -1583,7 +1604,17 @@ static void _fbg_installNotifHooks(void) {
                 method_setImplementation(sa, (IMP)_wx_setAlpha);
             }
         }
-        NSLog(@"[WXNotif] hooked didMoveToWindow + setHidden: + setAlpha:");
+        // v1.9.19：hook layoutSubviews，兜底覆盖所有布局变更
+        SEL lsSel = @selector(layoutSubviews);
+        Method ls = class_getInstanceMethod(uv, lsSel);
+        if (ls) {
+            IMP cur4 = method_getImplementation(ls);
+            if (cur4 != (IMP)_wx_layoutSubviews) {
+                gOrigLayoutSubviews = (void *)cur4;
+                method_setImplementation(ls, (IMP)_wx_layoutSubviews);
+            }
+        }
+        NSLog(@"[WXNotif] hooked didMoveToWindow + setHidden: + setAlpha: + layoutSubviews");
     }
 
     // v1.9.2：启动微信自定义横幅扫描器（前台横幅是微信自定义 UIView，不走 UNNotification）
