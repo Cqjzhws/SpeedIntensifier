@@ -1102,6 +1102,9 @@ static NSMutableSet *gWXSeenBanners = nil;
 static void (*gOrigViewDidMove)(id, SEL);  // v1.9.9：UIView didMoveToWindow 原实现
 static NSMutableDictionary *gWXBannerDedup = nil;  // v1.9.13：内容去重（key=内容，value=时间戳）
 static NSTimeInterval gWXLastBannerTime = 0;       // v1.9.13：上次弹窗时间
+static __weak UIView *gWXTrackedBanner = nil;       // v1.9.16：追踪的横幅 view
+static NSString *gWXTrackedText = nil;              // v1.9.16：上次追踪的文字
+static NSTimer *gWXTrackTimer = nil;                // v1.9.16：内容变化监控定时器
 
 static void _wx_show_banner(NSString *title, NSString *body);  // 前向声明
 static void _wx_checkView(UIView *view, UIWindow *win);          // 前向声明
@@ -1257,6 +1260,15 @@ static void _wx_viewDidMoveToWindow(id self, SEL _cmd) {
         // v1.9.14：去掉 view 指针去重——微信复用同一个横幅 view，只更新内容
         // 只靠内容去重即可防止同一消息反复弹
 
+        // v1.9.16：追踪这个横幅 view，监控内容变化
+        gWXTrackedBanner = v;
+        gWXTrackedText = [NSString stringWithFormat:@"%@|%@", title, body];
+        if (!gWXTrackTimer) {
+            gWXTrackTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES
+                block:^(NSTimer *t){ _wx_checkTrackedBanner(); }];
+            [[NSRunLoop mainRunLoop] addTimer:gWXTrackTimer forMode:NSRunLoopCommonModes];
+        }
+
         NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
             return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
         }];
@@ -1284,6 +1296,60 @@ static void _wx_viewDidMoveToWindow(id self, SEL _cmd) {
 
         _wx_show_banner(title.length ? title : @"微信", body);
     });
+}
+
+// v1.9.16：监控追踪的横幅 view 内容变化（微信复用同一 view 更新文字）
+static void _wx_checkTrackedBanner(void) {
+    if (!gWXBigNotif) return;
+    UIView *v = gWXTrackedBanner;
+    if (!v || !v.window) {
+        gWXTrackedBanner = nil;
+        return;
+    }
+
+    // 提取当前文字
+    NSMutableArray *labels = [NSMutableArray array];
+    for (UIView *sub in v.subviews) {
+        if ([sub isKindOfClass:[UILabel class]]) {
+            UILabel *l = (UILabel *)sub;
+            if (l.text.length > 0) [labels addObject:l];
+        }
+        for (UIView *ss in sub.subviews) {
+            if ([ss isKindOfClass:[UILabel class]]) {
+                UILabel *l = (UILabel *)ss;
+                if (l.text.length > 0) [labels addObject:l];
+            }
+        }
+    }
+    if (labels.count < 1) return;
+
+    NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
+        return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
+    }];
+    NSString *title = @"";
+    NSString *body = @"";
+    for (UILabel *l in sorted) {
+        if (!title.length) title = l.text;
+        else if (!body.length) { body = l.text; break; }
+    }
+
+    NSString *curText = [NSString stringWithFormat:@"%@|%@", title, body];
+    if ([curText isEqualToString:gWXTrackedText]) return;  // 内容没变
+    gWXTrackedText = curText;
+
+    // 内容变了，弹新窗（复用去重逻辑）
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - gWXLastBannerTime < 2.0) return;
+
+    NSString *dedupKey = curText;
+    if (!gWXBannerDedup) gWXBannerDedup = [NSMutableDictionary dictionary];
+    NSNumber *lastTime = gWXBannerDedup[dedupKey];
+    if (lastTime && now - [lastTime doubleValue] < 10.0) return;
+    gWXBannerDedup[dedupKey] = @(now);
+    gWXLastBannerTime = now;
+
+    NSLog(@"[WXNotif] tracked banner changed: \"%@\" - \"%@\"", title, body);
+    _wx_show_banner(title.length ? title : @"微信", body);
 }
 
 // 获取当前活跃的 UIWindowScene（v1.9.1：修复无 scene 导致窗口间歇性不显示）
