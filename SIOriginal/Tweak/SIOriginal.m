@@ -1209,6 +1209,9 @@ static void _fbg_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center
 
 static void (*gOrigUNSetDelegate)(id, SEL, id);
 
+// v1.9.1 前向声明
+static void _fbg_installRemoteNotifHook(void);
+
 // v1.9.1：统一的 delegate hook 逻辑，供 setDelegate 和初始化时主动调用
 static void _fbg_hookNotifDelegate(id<UNUserNotificationCenterDelegate> delegate) {
     if (!delegate) return;
