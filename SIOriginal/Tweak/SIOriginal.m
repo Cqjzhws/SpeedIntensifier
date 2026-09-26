@@ -594,8 +594,34 @@ static id sio_PA_runningPA(id self, SEL _cmd, double d, double delay, UIViewAnim
 
 #pragma mark - UIScrollView 滚动动画
 
+// 图片预览缩放保护（v1.8.3 修复微信发图预览放大后无法返回）：
+// 微信图片预览浏览器基于 UIScrollView zooming 构建，双击/捏合缩放及回弹期间，
+// UIKit 与浏览器自身会以 setContentOffset:animated:/scrollRectToVisible:animated:
+// 驱动缩放复位与重新居中。此时：
+//   · 瞬切模式把 animated:YES 改成 animated:NO 并 kCATransactionDisableActions，
+//     会取消 UIKit 缩放动画事务——isZooming/isZoomBouncing 状态无法靠动画完成
+//     回调收尾，浏览器的手势仲裁停在「缩放中」：返回按钮、单击工具栏、下拉/
+//     侧滑退出全部失灵，卡在预览页回不到微信；
+//   · 加速模式用外层 CATransaction 覆盖时长，同样可能打乱缩放事务内部时序。
+// 因此只要该 scrollView 正处于缩放活动期（缩放动画中/回弹中/当前仍放大），
+// 两个 hook 一律原样透传，不做任何时长/动画改写。普通滚动（非动画、未放大）
+// 不受影响，滚动加速照常生效。
+static BOOL SIO_svZoomEngaged(UIScrollView *sv) {
+    if (![sv isKindOfClass:[UIScrollView class]]) return NO;
+    @try {
+        if (sv.isZooming || sv.isZoomBouncing) return YES;
+        if (sv.maximumZoomScale > sv.minimumZoomScale + 0.001 &&
+            sv.zoomScale > sv.minimumZoomScale + 0.001) {
+            return YES;
+        }
+    } @catch (__unused NSException *e) {}
+    return NO;
+}
+
 static void sio_SV_setContentOffset(id self, SEL _cmd, CGPoint p, BOOL animated) {
-    if (SIO_blocked() || !animated) { o_sv_setContentOffset(self, _cmd, p, animated); return; }
+    if (SIO_blocked() || !animated || SIO_svZoomEngaged((UIScrollView *)self)) {
+        o_sv_setContentOffset(self, _cmd, p, animated); return;
+    }
     // 瞬切模式下直接跳过动画（性能最优）
     if (gEnabled && gMode == 2) {
         [CATransaction begin];
@@ -612,7 +638,9 @@ static void sio_SV_setContentOffset(id self, SEL _cmd, CGPoint p, BOOL animated)
 }
 
 static void sio_SV_scrollRect(id self, SEL _cmd, CGRect r, BOOL animated) {
-    if (SIO_blocked() || !animated) { o_sv_scrollRect(self, _cmd, r, animated); return; }
+    if (SIO_blocked() || !animated || SIO_svZoomEngaged((UIScrollView *)self)) {
+        o_sv_scrollRect(self, _cmd, r, animated); return;
+    }
     if (gEnabled && gMode == 2) {
         [CATransaction begin];
         [CATransaction setValue:(id)kCFBooleanTrue forKey:kCATransactionDisableActions];
