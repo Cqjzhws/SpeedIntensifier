@@ -1211,10 +1211,22 @@ static UIWindow *_wx_notif_window(void) {
     return gWXNotifWindow;
 }
 
+static UIWindow *_wx_key_window(void) {
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+            if (w.isKeyWindow) return w;
+        }
+    }
+    return nil;
+}
+
 static void _wx_show_banner(NSString *title, NSString *body) {
     if (!title.length && !body.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *win = _wx_notif_window();
+        // v1.9.6：直接加到 keyWindow，不用独立全屏 UIWindow（避免拦截触摸导致微信卡死）
+        UIWindow *win = _wx_key_window();
+        if (!win) return;
         CGFloat w = win.bounds.size.width;
         CGFloat bodyH = [body boundingRectWithSize:CGSizeMake(w - 104, CGFLOAT_MAX)
             options:NSStringDrawingUsesLineFragmentOrigin
@@ -1226,14 +1238,12 @@ static void _wx_show_banner(NSString *title, NSString *body) {
         banner.body = body;
         banner.avatar = nil;
 
-        // 时间
         NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
         fmt.dateFormat = @"HH:mm";
         banner.time = [fmt stringFromDate:[NSDate date]];
 
         __weak WXNotifBanner *weakBanner = banner;
         banner.onTap = ^{
-            // 点击跳转：打开微信
             NSURL *url = [NSURL URLWithString:@"weixin://"];
             if ([[UIApplication sharedApplication] canOpenURL:url]) {
                 [[UIApplication sharedApplication] openURL:url];
@@ -1242,21 +1252,18 @@ static void _wx_show_banner(NSString *title, NSString *body) {
         banner.onDismiss = ^{
             if (gWXCurrentBanner == weakBanner) {
                 gWXCurrentBanner = nil;
-                // 显示队列中下一个
                 if (gWXNotifQueue.count > 0) {
                     WXNotifBanner *next = gWXNotifQueue.firstObject;
                     [gWXNotifQueue removeObjectAtIndex:0];
                     gWXCurrentBanner = next;
-                    [next showInView:[weakBanner superview] ?: _wx_notif_window() duration:gWXNotifDur];
+                    [next showInView:[weakBanner superview] ?: _wx_key_window() duration:gWXNotifDur];
                 }
             }
         };
 
-        // 队列：若当前有显示，加入队列
         if (gWXCurrentBanner) {
             if (!gWXNotifQueue) gWXNotifQueue = [NSMutableArray array];
             [gWXNotifQueue addObject:banner];
-            // 8 秒后如果队列还没处理完则丢弃
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 [gWXNotifQueue removeObject:banner];
             });
@@ -1342,35 +1349,11 @@ static void _fbg_installNotifHooks(void) {
     // hook 后台远程推送（willPresent 在后台不触发，需要从这里兜底）
     _fbg_installRemoteNotifHook();
 
-    // v1.9.5：启动 5 秒后无条件弹测试大窗（不依赖 gWXBigNotif），诊断窗口机制
+    // v1.9.6：启动 5 秒后弹测试大窗，验证不卡死
     if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            // 先试最简单的：往 keyWindow 加红色块，确认能往屏幕上画东西
-            UIWindow *kw = nil;
-            for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-                if ([sc isKindOfClass:[UIWindowScene class]]) {
-                    for (UIWindow *w in ((UIWindowScene *)sc).windows) {
-                        if (w.isKeyWindow) { kw = w; break; }
-                    }
-                }
-            }
-            if (kw) {
-                UIView *test = [[UIView alloc] initWithFrame:CGRectMake(20, 100, 200, 60)];
-                test.backgroundColor = [UIColor redColor];
-                test.layer.cornerRadius = 8;
-                UILabel *lbl = [[UILabel alloc] initWithFrame:test.bounds];
-                lbl.text = @"SIOriginal 测试";
-                lbl.textColor = [UIColor whiteColor];
-                lbl.textAlignment = NSTextAlignmentCenter;
-                lbl.font = [UIFont boldSystemFontOfSize:14];
-                [test addSubview:lbl];
-                [kw addSubview:test];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{ [test removeFromSuperview]; });
-            }
-            // 同时弹我们的大窗
-            _wx_show_banner(@"SIOriginal 测试", @"如果你看到这条，说明大窗机制正常");
+            _wx_show_banner(@"SIOriginal 测试", @"如果你看到这条且屏幕没卡死，说明修复成功");
         });
     }
 
