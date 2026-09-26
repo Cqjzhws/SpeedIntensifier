@@ -1104,7 +1104,7 @@ static void _wx_show_banner(NSString *title, NSString *body);  // 前向声明
 static void _wx_checkView(UIView *view, UIWindow *win);          // 前向声明
 
 static void _wx_scanCustomBanner(void) {
-    if (!gWXBigNotif) return;
+    // v1.9.8：微信内无条件运行（诊断 gWXBigNotif 是否被正确读取）
     if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
 
     // 遍历所有 window
@@ -1141,15 +1141,24 @@ static void _wx_checkView(UIView *view, UIWindow *win) {
     // 转换到 window 坐标系
     CGRect f = [view convertRect:view.bounds toView:nil];
     CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
-    // v1.9.4：大幅放宽条件——顶部 25% 区域内、宽度≥100、含 2+ 文字 label
-    if (f.origin.y > screenH * 0.25) return;
+    // v1.9.8：横幅特征——顶部 15%、高度 50-130、宽度≥200、含文字 label
+    if (f.origin.y > screenH * 0.15) return;
     if (f.origin.y < -300) return;
-    if (f.size.width < 100) return;
+    if (f.size.height < 50 || f.size.height > 140) return;
+    if (f.size.width < 200) return;
 
     // 递归收集所有 UILabel
     NSMutableArray *labels = [NSMutableArray array];
     _wx_collectLabels(view, labels);
-    if (labels.count < 2) return;
+
+    // v1.9.8：打印所有顶部视图，诊断微信横幅结构
+    if (labels.count >= 1) {
+        NSLog(@"[WXNotif] top view: class=%@ frame=%@ labels=%lu",
+              NSStringFromClass([view class]), NSStringFromCGRect(f), (unsigned long)labels.count);
+    }
+
+    // v1.9.8：放宽到 1 个 label（微信横幅可能用一个 label 显示全部文字）
+    if (labels.count < 1) return;
 
     // 去重：用 view 指针地址
     NSValue *key = [NSValue valueWithNonretainedObject:view];
@@ -1172,8 +1181,9 @@ static void _wx_checkView(UIView *view, UIWindow *win) {
     NSLog(@"[WXNotif] banner found: class=%@ frame=%@ labels=%lu \"%@\" - \"%@\"",
           NSStringFromClass([view class]), NSStringFromCGRect(f), (unsigned long)labels.count, title, body);
 
-    // 隐藏微信横幅
+    // v1.9.8：强制隐藏微信横幅（hidden + alpha 双保险）
     view.hidden = YES;
+    view.alpha = 0;
 
     // 弹我们的大窗
     _wx_show_banner(title.length ? title : @"微信", body);
@@ -1277,8 +1287,8 @@ static void _wx_show_banner(NSString *title, NSString *body) {
 static void _fbg_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center,
                              UNNotification *note,
                              void (^handler)(UNNotificationPresentationOptions)) {
-    // v1.9.0：微信通知大弹窗接管
-    if (gWXBigNotif && [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
+    // v1.9.8：微信通知大弹窗接管（无条件，诊断用）
+    if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
         UNNotificationContent *c = note.request.content;
         NSString *title = c.title.length ? c.title : (c.subtitle.length ? c.subtitle : @"微信");
         NSString *body = c.body;
@@ -1384,8 +1394,8 @@ static void (*gOrigDidReceiveRemote)(id, SEL, UIApplication *, NSDictionary *, v
 static void _fbg_didReceiveRemote(id self, SEL _cmd, UIApplication *app,
                                    NSDictionary *userInfo,
                                    void (^handler)(UIBackgroundFetchResult)) {
-    // 微信通知大弹窗：后台推送时也弹自定义窗
-    if (gWXBigNotif && [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
+    // v1.9.8：微信通知大弹窗（无条件，诊断用）
+    if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
         NSDictionary *aps = userInfo[@"aps"];
         if ([aps isKindOfClass:[NSDictionary class]]) {
             id alert = aps[@"alert"];
