@@ -239,7 +239,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.8.7 · 微信保活回归（无悬浮球）" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.8.8 · 修微信保活开关残留" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -340,7 +340,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     [rb.heightAnchor constraintEqualToConstant:40].active = YES;
     [rb addTarget:self action:@selector(onReboot) forControlEvents:UIControlEventTouchUpInside];
 
-    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。慢放 = 原版 slowDownFactor 功能，可观察动画细节。瞬切 = 0.01 秒直达。" size:12 dim:YES];
+    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。慢放 = 原版 slowDownFactor 功能，可观察动画细节。瞬切 = 0.01 秒直达。\n\n⚠️ 微信为硬保护对象：动画调速/弹簧/转场/列表加速在微信内全部不生效（为避免破坏预览/手势），仅真后台保活对微信生效。" size:12 dim:YES];
     hint.textAlignment = NSTextAlignmentCenter;
     UILabel *listHint = [self label:@"列表加速含 24 个 TV/CV hook，企业微信/微信已双重保护（黑名单 + 硬编码）。其他重列表 App（淘宝/京东）若出现卡死请关闭此开关。" size:12 dim:YES];
     listHint.textColor = [UIColor systemOrangeColor];

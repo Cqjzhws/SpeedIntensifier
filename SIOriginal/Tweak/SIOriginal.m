@@ -830,6 +830,11 @@ static void _fbg_loadPref(void) {
     } @catch (__unused NSException *e) {}
     if (!gExclude) gExclude = @[];
     gLocalOff = [[NSUserDefaults standardUserDefaults] boolForKey:kFBGLocalOff];
+    // v1.8.8：微信自 v1.8.7 起无悬浮球，本地开关失去载体；
+    // 若旧版本误触过球，fubg_local_off=YES 会永久残留导致微信永不保活，强制清零
+    if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
+        gLocalOff = NO;
+    }
 
     NSArray *modes = [[NSBundle mainBundle] infoDictionary][@"UIBackgroundModes"];
     gHasAudioMode = [modes isKindOfClass:[NSArray class]] && [modes containsObject:@"audio"];
