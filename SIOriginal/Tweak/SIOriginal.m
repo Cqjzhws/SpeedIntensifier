@@ -1353,7 +1353,9 @@ static void _fbg_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n,
     _fbg_loadPref();
     NSLog(@"[FUBG] prefs reloaded: active=%d scene=%d audio=%d ball=%d",
           gActive, gUseScene, gUseAudio, gShowBall);
-    [[FBGFloatingWindow shared] refreshState];
+    // 微信里永不实例化悬浮窗（v1.8.7）
+    BOOL _wc = [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"];
+    if (!_wc) [[FBGFloatingWindow shared] refreshState];
     if (!gUseAudio && gPhysBg) _fbg_stopAudio(NO);
     if (gUseAudio && gPhysBg && (!gPlayer || !gPlayer.isPlaying)) _fbg_startAudio();
 }
@@ -1363,14 +1365,11 @@ static void _fbg_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n,
 __attribute__((constructor))
 static void FUBGEntry(void) {
     @autoreleasepool {
-        // v1.8.6：微信进程完全跳过 FUBG 引擎（场景伪装/音频/悬浮窗/通知hook全不装）。
-        // 微信预览页单击唤不出工具栏的元凶就是 FUBG 引擎默认在微信活跃，
-        // 且黑名单字符串格式不匹配导致排除无效。微信不需要保活，直接整体跳过。
+        // v1.8.7：微信恢复保活（场景伪装+音频断言），但永不创建悬浮球。
+        // 悬浮球是常驻全屏透明 UIWindow（alert+1 层级），会抢占状态栏外观控制权，
+        // 是预览页工具栏唤不出的直接元凶。场景伪装/音频断言只在后台活跃，不影响前台 UI。
         NSString *_bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-        if ([_bid isEqualToString:@"com.tencent.xin"]) {
-            NSLog(@"[FUBG] WeChat detected, FUBG engine skipped entirely (v1.8.6)");
-            return;
-        }
+        BOOL _isWC = [_bid isEqualToString:@"com.tencent.xin"];
         _fbg_loadPref();
 
         // hook 一次性安装，内部按全局开关决定行为
@@ -1409,13 +1408,14 @@ static void FUBGEntry(void) {
                                                               block:^(NSTimer *t){ _fbg_watchdogFire(t); }];
                 [[NSRunLoop mainRunLoop] addTimer:gWatchdog forMode:NSRunLoopCommonModes];
             }
-            if (gShowBall) [[FBGFloatingWindow shared] attachWhenSceneReady];
+            if (gShowBall && !_isWC) [[FBGFloatingWindow shared] attachWhenSceneReady];   // 微信不装悬浮球
         });
 
         NSLog(@"[FUBG] v2.0.0 loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
-              gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
-              (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
+              gActive, gUseScene, gUseAudio, (gShowBall && !_isWC), gHasAudioMode,
+              _isWC ? @" (WeChat: ball disabled)" :
+              ((gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)"));
     }
 }
 
