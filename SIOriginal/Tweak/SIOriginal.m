@@ -1224,7 +1224,7 @@ static void _wx_tryDetectBanner(UIView *v) {
 
     // 完全递归收集文字和头像
     NSMutableArray *labels = [NSMutableArray array];
-    BOOL hasAvatar = NO;
+    __block BOOL hasAvatar = NO;
     void (^scan)(UIView *) = ^(UIView *node) {
         for (UIView *sub in node.subviews) {
             if ([sub isKindOfClass:[UIImageView class]]) hasAvatar = YES;
