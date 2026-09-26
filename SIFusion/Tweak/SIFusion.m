@@ -1,4 +1,6 @@
-// SIFusion v2.0.0 Max — 终极融合版（SIClassic × SpeedsterTS × SpeedIntensifier 三方并集）
+// SIFusion v2.0.1 Max — 终极融合版（SIClassic × SpeedsterTS × SpeedIntensifier 三方并集）
+// v2.0.1 修复：UIScrollView 缩放动画改由 ZoomAccel 开关控制、默认关闭——
+//             v2.0.0 默认开启该 hook 导致微信发图预览放大后无法返回聊天界面。
 // 纯 ObjC runtime，无 substrate。TrollStore / TrollFools 注入任意数据卷 App 即可生效。
 //
 // 三方 hook 并集（去重后 ~68 hooks）：
@@ -13,7 +15,12 @@
 // 关键安全设计：
 //   · TV/CV 列表类 hook（微信闪退根因族）全部独立由 ListAccel 开关控制，默认 OFF。
 //     微信用户保持关闭即可；其他 App 用户开启后获得完整列表动画加速。
-//   · 其余 49 个 hook 均为非列表类，跟随 Enabled 开关，微信安全。
+//   · UIScrollView 缩放 hook（setZoomScale/zoomToRect）由 ZoomAccel 独立开关控制，
+//     默认 OFF。v2.0.0 曾跟随总开关开启，在微信发图预览浏览器中：放大后其手势
+//     状态机（双击复位、工具栏单击、下拉交互式关闭）依赖系统原生 zoom 动画的
+//     回调配对与状态收尾，被「UIView 动画包 animated:NO」替换后会错乱，表现为
+//     放大预览图后返回按钮/手势全部失灵、无法回到微信。v2.0.1 起默认透传原生实现。
+//   · 其余 hook 均为非列表类，跟随 Enabled 开关，微信安全。
 //   · CAAnimation 只 hook 基类 setDuration:；addAnimation 用 associated-object 标记防二次缩放。
 //   · 共存检测：进程内已加载其他加速器时只装弹簧层（互补）。
 //   · v1.1.0 高级模式（Speedy 式独立倍率）+ v1.2.0 层时钟叠加 保留。
@@ -22,6 +29,7 @@
 //   Enabled / Preset(0-4) / Spring / Blacklist
 //   Advanced / DurMult / VelMult / StiffMult / DampMult / MassMult / LayerSpeed
 //   ListAccel（列表类 hook 开关，默认关）
+//   ZoomAccel（UIScrollView 缩放动画加速开关，默认关；微信图片预览必须关）
 // Darwin 通知 com.local.sifusion.settingschanged 热重载。
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -49,6 +57,7 @@ static double  gDampMult  = 1.0;       // 阻尼倍数
 static double  gMassMult  = 1.0;       // 质量倍数
 static BOOL    gLayerSpeed = NO;       // 层时钟叠加（实验，默认关）
 static BOOL    gListAccel = NO;        // 列表类 hook（TV/CV 变异，默认关，微信安全）
+static BOOL    gZoomAccel = NO;        // UIScrollView 缩放动画加速（默认关；开启会破坏微信等图片预览浏览器的放大/返回手势）
 
 // 档位 → 时长乘数（SpeedsterTS 实测数值）
 static const double kDurFactors[5] = { 0.50, 0.30, 0.15, 0.05, 0.001 };
@@ -67,6 +76,9 @@ static inline double _mult(void) {
 static inline BOOL _on(void) { return gEnabled && !gBlacklisted && !gCompanion; }
 // 列表类 hook（TV/CV 选择/刷新/移动/编辑）：微信闪退根因族，独立开关默认关
 static inline BOOL _listOn(void) { return _on() && gListAccel; }
+// UIScrollView 缩放动画：微信发图预览放大后无法返回的根因 hook，独立开关默认关。
+// 关闭时两个缩放 hook 直接透传原实现，行为与未注入时完全一致。
+static inline BOOL _zoomOn(void) { return _on() && gZoomAccel; }
 
 static inline NSTimeInterval _scale(NSTimeInterval t) {
     if (t <= 0) return t;
@@ -107,6 +119,7 @@ static void _loadPref(void) {
             if ((dv = [d[@"MassMult"] doubleValue])  > 0) gMassMult  = dv;
             if (d[@"LayerSpeed"]) gLayerSpeed = [d[@"LayerSpeed"] boolValue];
             if (d[@"ListAccel"])  gListAccel  = [d[@"ListAccel"] boolValue];
+            if (d[@"ZoomAccel"])  gZoomAccel  = [d[@"ZoomAccel"] boolValue];
             gBlacklist = d[@"Blacklist"];
         }
     } @catch (__unused NSException *e) {}
@@ -547,16 +560,31 @@ static inline BOOL _springPhysicsOn(void) {
     [self fu_setViewControllers:vcs direction:dir animated:NO completion:c];
 }
 
-// UIScrollView 缩放
+// UIScrollView 缩放（ZoomAccel 开关，默认关）
+// v2.0.0 旧实现用「UIView block 动画包裹 animated:NO」替换系统 zoom 动画，
+// 破坏了 UIKit 缩放动画的回调配对与 isZooming 状态收尾：微信等 App 的图片
+// 预览浏览器因此在放大后手势仲裁/工具栏状态错乱，返回按钮与下拉关闭全部失灵。
+// v2.0.1：开关关闭时完全透传；即使显式开启，也只用 CATransaction 在系统原 zoom
+// 动画路径上收窄时长（状态机保持完整），不再替换成 animated:NO。
 - (void)fu_setZoomScale:(CGFloat)zs animated:(BOOL)an {
-    if (!an || !_on()) { [self fu_setZoomScale:zs animated:an]; return; }
-    [UIView animateWithDuration:_scale(0.25) delay:0 options:UIViewAnimationOptionCurveEaseInOut
-                     animations:^{ [self fu_setZoomScale:zs animated:NO]; } completion:nil];
+    if (!an || !_zoomOn()) { [self fu_setZoomScale:zs animated:an]; return; }
+    @try {
+        gFSTxInternal = YES;
+        [CATransaction begin];
+        [CATransaction setAnimationDuration:_scaleMin(0.25, 16.0)];
+        [self fu_setZoomScale:zs animated:an];
+        [CATransaction commit];
+    } @finally { gFSTxInternal = NO; }
 }
 - (void)fu_zoomToRect:(CGRect)r animated:(BOOL)an {
-    if (!an || !_on()) { [self fu_zoomToRect:r animated:an]; return; }
-    [UIView animateWithDuration:_scale(0.25) delay:0 options:UIViewAnimationOptionCurveEaseInOut
-                     animations:^{ [self fu_zoomToRect:r animated:NO]; } completion:nil];
+    if (!an || !_zoomOn()) { [self fu_zoomToRect:r animated:an]; return; }
+    @try {
+        gFSTxInternal = YES;
+        [CATransaction begin];
+        [CATransaction setAnimationDuration:_scaleMin(0.25, 16.0)];
+        [self fu_zoomToRect:r animated:an];
+        [CATransaction commit];
+    } @finally { gFSTxInternal = NO; }
 }
 
 // 三类栏 setItems
@@ -719,7 +747,7 @@ static void _fu_notify_cb(CFNotificationCenterRef center, void *observer,
                           CFStringRef name, const void *object,
                           CFDictionaryRef info) {
     _loadPref();
-    NSLog(@"[SIFusion] pref reloaded (preset=%d spring=%d companion=%d)", gPreset, gSpring, gCompanion);
+    NSLog(@"[SIFusion] pref reloaded (preset=%d spring=%d list=%d zoom=%d companion=%d)", gPreset, gSpring, gListAccel, gZoomAccel, gCompanion);
 }
 
 __attribute__((constructor))
@@ -868,7 +896,8 @@ static void _fu_entry(void) {
             ok += _swiz(pvc, @selector(setViewControllers:direction:animated:completion:),
                         @selector(fu_setViewControllers:direction:animated:completion:));
 
-            // UIScrollView 缩放
+            // UIScrollView 缩放：hook 始终安装，由 ZoomAccel 在函数内 gate（默认透传，
+            // 保证 Darwin 热重载切换即时生效；默认关闭修复微信预览图放大后无法返回）
             Class uisv = [UIScrollView class];
             total += 2;
             ok += _swiz(uisv, @selector(setZoomScale:animated:),
@@ -943,9 +972,9 @@ static void _fu_entry(void) {
             }
         }
 
-        NSLog(@"[SIFusion] v2.0.0 Max loaded in %@: %@ mode, hooks %d/%d (preset=%d spring=%d adv=%d lspeed=%d list=%d blacklisted=%d)",
+        NSLog(@"[SIFusion] v2.0.1 Max loaded in %@: %@ mode, hooks %d/%d (preset=%d spring=%d adv=%d lspeed=%d list=%d zoom=%d blacklisted=%d)",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gCompanion ? @"COMPANION (spring-only)" : @"STANDALONE (full ~68)",
-              ok, total, gPreset, gSpring, gAdvanced, gLayerSpeed, gListAccel, gBlacklisted);
+              ok, total, gPreset, gSpring, gAdvanced, gLayerSpeed, gListAccel, gZoomAccel, gBlacklisted);
     }
 }

@@ -121,7 +121,7 @@ static NSString *FUReboot(void) {
 #pragma mark ==================== 配置读写 ====================
 static void FUWriteConfig(BOOL enabled, int preset, BOOL spring, NSArray *blacklist,
                           BOOL adv, double dur, double vel, double stiff, double damp, double mass,
-                          BOOL lspeed, BOOL list) {
+                          BOOL lspeed, BOOL list, BOOL zoom) {
     mkdir("/var/Managed Preferences", 0755);
     mkdir("/var/Managed Preferences/mobile", 0755);
     NSDictionary *d = @{ @"Enabled": @(enabled),
@@ -135,7 +135,8 @@ static void FUWriteConfig(BOOL enabled, int preset, BOOL spring, NSArray *blackl
                          @"DampMult": @(damp),
                          @"MassMult": @(mass),
                          @"LayerSpeed": @(lspeed),
-                         @"ListAccel": @(list) };
+                         @"ListAccel": @(list),
+                         @"ZoomAccel": @(zoom) };
     BOOL ok = [d writeToFile:kPrefPath atomically:YES];
     NSLog(@"[SIFApp] write pref -> %d", ok);
     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
@@ -155,7 +156,8 @@ static NSDictionary *FUReadConfig(void) {
                    @"DampMult": @1.0,
                    @"MassMult": @1.0,
                    @"LayerSpeed": @NO,
-                   @"ListAccel": @NO };
+                   @"ListAccel": @NO,
+                   @"ZoomAccel": @NO };
     return d;
 }
 
@@ -171,6 +173,7 @@ static NSDictionary *FUReadConfig(void) {
     UISwitch *_advSwitch;
     UISwitch *_lsSwitch;
     UISwitch *_listSwitch;
+    UISwitch *_zoomSwitch;
     UISlider *_durSlider, *_velSlider, *_stiffSlider, *_dampSlider, *_massSlider;
     UILabel *_durLbl, *_velLbl, *_stiffLbl, *_dampLbl, *_massLbl;
 }
@@ -187,6 +190,7 @@ static NSDictionary *FUReadConfig(void) {
     BOOL cfgAdv     = cfg[@"Advanced"] ? [cfg[@"Advanced"] boolValue] : NO;
     BOOL cfgLS      = cfg[@"LayerSpeed"] ? [cfg[@"LayerSpeed"] boolValue] : NO;
     BOOL cfgList    = cfg[@"ListAccel"] ? [cfg[@"ListAccel"] boolValue] : NO;
+    BOOL cfgZoom    = cfg[@"ZoomAccel"] ? [cfg[@"ZoomAccel"] boolValue] : NO;
     double cfgDur   = cfg[@"DurMult"]   ? [cfg[@"DurMult"] doubleValue]   : 0.15;
     double cfgVel   = cfg[@"VelMult"]   ? [cfg[@"VelMult"] doubleValue]   : 1.0;
     double cfgStiff = cfg[@"StiffMult"] ? [cfg[@"StiffMult"] doubleValue] : 1.0;
@@ -204,7 +208,7 @@ static NSDictionary *FUReadConfig(void) {
     title.textAlignment = NSTextAlignmentCenter;
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"v2.0.0 Max · ~68 Hooks · 终极融合";
+    sub.text = @"v2.0.1 Max · ~68 Hooks · 终极融合";
     sub.font = [UIFont systemFontOfSize:13];
     sub.textColor = [UIColor secondaryLabelColor];
     sub.textAlignment = NSTextAlignmentCenter;
@@ -265,6 +269,15 @@ static NSDictionary *FUReadConfig(void) {
     _listSwitch = [[UISwitch alloc] init];
     _listSwitch.on = cfgList;
 
+    // 图片缩放动画加速：v2.0.0 默认开启，导致微信发图预览放大后无法返回聊天；
+    // v2.0.1 起默认关闭（关闭后缩放走系统原生动画，返回按钮/手势恢复正常）。
+    UILabel *lblZoom = [[UILabel alloc] init];
+    lblZoom.text = @"图片缩放加速（微信预览必须关）";
+    lblZoom.font = [UIFont systemFontOfSize:15];
+    lblZoom.numberOfLines = 0;
+    _zoomSwitch = [[UISwitch alloc] init];
+    _zoomSwitch.on = cfgZoom;
+
     UILabel *lbl4 = [[UILabel alloc] init];
     lbl4.text = @"黑名单（每行一个 Bundle ID，命中则不加速）";
     lbl4.font = [UIFont systemFontOfSize:15];
@@ -298,7 +311,7 @@ static NSDictionary *FUReadConfig(void) {
     [reboot addTarget:self action:@selector(onReboot) forControlEvents:UIControlEventTouchUpInside];
 
     UILabel *hint = [[UILabel alloc] init];
-    hint.text = @"说明：dylib 用 TrollFools 注入目标 App。改档位保存后杀掉 App 重开即生效，无需重新注入。与其他加速器同时注入时自动只启用独家弹簧 stiffness hook，不双重缩放。不含列表选择类 hook，微信可用。";
+    hint.text = @"说明：dylib 用 TrollFools 注入目标 App。改档位保存后杀掉 App 重开即生效，无需重新注入。与其他加速器同时注入时自动只启用独家弹簧 stiffness hook，不双重缩放。列表类与图片缩放 hook 默认关闭，微信可用；微信发图预览放大后若无法返回，请确认「图片缩放加速」为关闭状态。";
     hint.font = [UIFont systemFontOfSize:12];
     hint.textColor = [UIColor tertiaryLabelColor];
     hint.numberOfLines = 0;
@@ -320,6 +333,7 @@ static NSDictionary *FUReadConfig(void) {
         durRow, velRow, stiffRow, dampRow, massRow,
         [self _rowWith:lblLS ctrl:_lsSwitch],
         [self _rowWith:lblList ctrl:_listSwitch],
+        [self _rowWith:lblZoom ctrl:_zoomSwitch],
         lbl4, _blacklist,
         apply, reboot,
         hint, _status
@@ -418,14 +432,15 @@ static NSDictionary *FUReadConfig(void) {
     FUWriteConfig(_enableSwitch.on, preset, _springSwitch.on, [self _collectBlacklist],
                   _advSwitch.on, _durSlider.value, _velSlider.value,
                   _stiffSlider.value, _dampSlider.value, _massSlider.value,
-                  _lsSwitch.on, _listSwitch.on);
-    _status.text = [NSString stringWithFormat:@"已保存：%@ · %@ · 弹簧%@ · 高级%@ · 层时钟%@ · 列表%@。正在注销…",
+                  _lsSwitch.on, _listSwitch.on, _zoomSwitch.on);
+    _status.text = [NSString stringWithFormat:@"已保存：%@ · %@ · 弹簧%@ · 高级%@ · 层时钟%@ · 列表%@ · 缩放%@。正在注销…",
                     _enableSwitch.on ? @"开" : @"关",
                     names[preset],
                     _springSwitch.on ? @"开" : @"关",
                     _advSwitch.on ? @"开" : @"关",
                     _lsSwitch.on ? @"开" : @"关",
-                    _listSwitch.on ? @"开" : @"关"];
+                    _listSwitch.on ? @"开" : @"关",
+                    _zoomSwitch.on ? @"开" : @"关"];
     dispatch_after(fu_dwell(0.6), dispatch_get_main_queue(), ^{
         FURespring();
     });
@@ -449,7 +464,7 @@ static NSDictionary *FUReadConfig(void) {
     FUWriteConfig(_enableSwitch.on, preset, _springSwitch.on, [self _collectBlacklist],
                   _advSwitch.on, _durSlider.value, _velSlider.value,
                   _stiffSlider.value, _dampSlider.value, _massSlider.value,
-                  _lsSwitch.on, _listSwitch.on);
+                  _lsSwitch.on, _listSwitch.on, _zoomSwitch.on);
     NSString *way = FUReboot();
     _status.text = [NSString stringWithFormat:@"已保存，重启触发方式：%@", way];
     NSLog(@"[SIFApp] reboot via: %@", way);
