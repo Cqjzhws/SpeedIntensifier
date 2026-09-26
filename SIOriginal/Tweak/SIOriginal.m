@@ -1140,11 +1140,11 @@ static void _wx_checkView(UIView *view, UIWindow *win) {
 
     // 转换到 window 坐标系
     CGRect f = [view convertRect:view.bounds toView:nil];
-    // 横幅特征：顶部（含状态栏下方）、高度 40-130、宽度≥200、含 2+ UILabel
-    if (f.origin.y > 80) return;           // 顶部区域（含刘海/状态栏）
-    if (f.origin.y < -200) return;
-    if (f.size.height < 40 || f.size.height > 140) return;
-    if (f.size.width < 200) return;
+    CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
+    // v1.9.4：大幅放宽条件——顶部 25% 区域内、宽度≥100、含 2+ 文字 label
+    if (f.origin.y > screenH * 0.25) return;
+    if (f.origin.y < -300) return;
+    if (f.size.width < 100) return;
 
     // 递归收集所有 UILabel
     NSMutableArray *labels = [NSMutableArray array];
@@ -1157,7 +1157,7 @@ static void _wx_checkView(UIView *view, UIWindow *win) {
     if ([gWXSeenBanners containsObject:key]) return;
     [gWXSeenBanners addObject:key];
 
-    // 提取文字：按 y 坐标排序，第一个是昵称，第二个是内容
+    // 提取文字：按 y 坐标排序，前两个非空 label
     NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
         return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
     }];
@@ -1342,10 +1342,18 @@ static void _fbg_installNotifHooks(void) {
     // hook 后台远程推送（willPresent 在后台不触发，需要从这里兜底）
     _fbg_installRemoteNotifHook();
 
+    // v1.9.4：启动 5 秒后弹测试大窗，确认大窗机制本身正常
+    if (gWXBigNotif && [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            _wx_show_banner(@"SIOriginal 测试", @"如果你看到这条，说明大窗机制正常");
+        });
+    }
+
     // v1.9.2：启动微信自定义横幅扫描器（前台横幅是微信自定义 UIView，不走 UNNotification）
     dispatch_async(dispatch_get_main_queue(), ^{
         if (gWXBannerScanTimer) return;
-        gWXBannerScanTimer = [NSTimer scheduledTimerWithTimeInterval:0.3 repeats:YES
+        gWXBannerScanTimer = [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES
             block:^(NSTimer *t){ _wx_scanCustomBanner(); }];
         [[NSRunLoop mainRunLoop] addTimer:gWXBannerScanTimer forMode:NSRunLoopCommonModes];
     });
