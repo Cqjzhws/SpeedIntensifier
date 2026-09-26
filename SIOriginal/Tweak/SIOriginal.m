@@ -1119,24 +1119,36 @@ static void _wx_scanCustomBanner(void) {
     }
 }
 
-static void _wx_checkView(UIView *view, UIWindow *win) {
-    if (!view || view.hidden || view.alpha < 0.1) return;
-
-    // 横幅特征：位于顶部、高度 50-130、宽度接近屏宽、含 2+ UILabel
-    CGRect f = view.frame;
-    if (f.origin.y > 5) return;           // 必须贴顶
-    if (f.origin.y < -200) return;         // 完全在屏幕外的跳过
-    if (f.size.height < 45 || f.size.height > 140) return;
-    if (f.size.width < 200) return;
-
-    // 收集所有 UILabel（递归一层）
-    NSMutableArray *labels = [NSMutableArray array];
+// 递归收集 view 及其子视图中的所有 UILabel
+static void _wx_collectLabels(UIView *view, NSMutableArray *out) {
     for (UIView *v in view.subviews) {
         if ([v isKindOfClass:[UILabel class]]) {
             UILabel *l = (UILabel *)v;
-            if (l.text.length > 0) [labels addObject:l];
+            if (l.text.length > 0) [out addObject:l];
         }
+        _wx_collectLabels(v, out);
     }
+}
+
+static void _wx_checkView(UIView *view, UIWindow *win) {
+    if (!view || view.hidden || view.alpha < 0.1) return;
+
+    // 递归检查子视图
+    for (UIView *sub in view.subviews) {
+        _wx_checkView(sub, win);
+    }
+
+    // 转换到 window 坐标系
+    CGRect f = [view convertRect:view.bounds toView:nil];
+    // 横幅特征：顶部（含状态栏下方）、高度 40-130、宽度≥200、含 2+ UILabel
+    if (f.origin.y > 80) return;           // 顶部区域（含刘海/状态栏）
+    if (f.origin.y < -200) return;
+    if (f.size.height < 40 || f.size.height > 140) return;
+    if (f.size.width < 200) return;
+
+    // 递归收集所有 UILabel
+    NSMutableArray *labels = [NSMutableArray array];
+    _wx_collectLabels(view, labels);
     if (labels.count < 2) return;
 
     // 去重：用 view 指针地址
@@ -1145,20 +1157,20 @@ static void _wx_checkView(UIView *view, UIWindow *win) {
     if ([gWXSeenBanners containsObject:key]) return;
     [gWXSeenBanners addObject:key];
 
-    // 提取文字：第一个 label 通常是昵称，第二个是内容
-    NSString *title = @"";
-    NSString *body = @"";
-    // 按 y 坐标排序
+    // 提取文字：按 y 坐标排序，第一个是昵称，第二个是内容
     NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
         return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
     }];
+    NSString *title = @"";
+    NSString *body = @"";
     for (UILabel *l in sorted) {
         if (!title.length) title = l.text;
         else if (!body.length) { body = l.text; break; }
     }
     if (!title.length && !body.length) return;
 
-    NSLog(@"[WXNotif] custom banner intercepted: %@ - %@", title, body);
+    NSLog(@"[WXNotif] banner found: class=%@ frame=%@ labels=%lu \"%@\" - \"%@\"",
+          NSStringFromClass([view class]), NSStringFromCGRect(f), (unsigned long)labels.count, title, body);
 
     // 隐藏微信横幅
     view.hidden = YES;
