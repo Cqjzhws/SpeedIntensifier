@@ -785,6 +785,10 @@ static BOOL    gShowBall   = YES;
 static NSArray *gExclude   = nil;
 static BOOL    gLocalOff   = NO;
 
+// ---- 微信通知大弹窗（v1.9.0） ----
+static BOOL    gWXBigNotif    = NO;    // 接管微信通知，弹自定义大窗
+static double  gWXNotifDur    = 5.0;   // 大窗显示时长（秒）
+
 static BOOL    gActive    = NO;   // 本 App 最终是否参与保活（总开关∧名单∧本地开关）
 static BOOL    gUseScene  = NO;   // 本 App 是否启用场景伪装
 static BOOL    gUseAudio  = NO;   // 本 App 是否启用音频断言
@@ -819,6 +823,12 @@ static void _fbg_loadPref(void) {
             if (d[@"FUBGSceneFake"])    gSceneFake = [d[@"FUBGSceneFake"] boolValue];
             if (d[@"FUBGAudioKeep"])    gAudioKeep = [d[@"FUBGAudioKeep"] boolValue];
             if (d[@"FUBGFloatingBall"]) gShowBall  = [d[@"FUBGFloatingBall"] boolValue];
+            // 微信通知大弹窗
+            if (d[@"WXBigNotif"])       gWXBigNotif = [d[@"WXBigNotif"] boolValue];
+            if (d[@"WXNotifDur"]) {
+                double dur = [d[@"WXNotifDur"] doubleValue];
+                if (dur >= 1.0 && dur <= 30.0) gWXNotifDur = dur;
+            }
             id ex = d[@"FUBGExcludeApps"];
             if ([ex isKindOfClass:[NSArray class]]) gExclude = ex;
             // 复用 SIOriginal 黑名单（v1.8.6：兼容字符串格式，原来只认 NSArray 导致黑名单对 FUBG 永远无效）
@@ -900,13 +910,273 @@ static UIApplicationState _fbg_appState(id self, SEL _cmd) {
     return gOrigAppState ? gOrigAppState(self, _cmd) : UIApplicationStateActive;
 }
 
+// ---- 微信通知大弹窗（v1.9.0） ----
+// 拦截微信通知，用自定义大窗替代系统横幅；配合真后台保活实现后台实时推送
+
+@interface WXNotifBanner : UIView
+@property (nonatomic, copy) NSString *title;
+@property (nonatomic, copy) NSString *body;
+@property (nonatomic, copy) NSString *time;
+@property (nonatomic, strong) UIImage *avatar;
+@property (nonatomic, copy) void (^onTap)(void);
+@property (nonatomic, copy) void (^onDismiss)(void);
+@end
+
+@implementation WXNotifBanner {
+    UIImageView *_avatarView;
+    UILabel *_titleLabel;
+    UILabel *_bodyLabel;
+    UILabel *_timeLabel;
+    UIView *_card;
+    NSTimer *_timer;
+    BOOL _dismissing;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor clearColor];
+
+        _card = [[UIView alloc] init];
+        _card.backgroundColor = [UIColor colorWithRed:0.12 green:0.12 blue:0.14 alpha:0.92];
+        _card.layer.cornerRadius = 16;
+        _card.layer.shadowColor = [UIColor blackColor].CGColor;
+        _card.layer.shadowOpacity = 0.4;
+        _card.layer.shadowRadius = 12;
+        _card.layer.shadowOffset = CGSizeMake(0, 4);
+        [self addSubview:_card];
+
+        _avatarView = [[UIImageView alloc] init];
+        _avatarView.contentMode = UIViewContentModeScaleAspectFill;
+        _avatarView.clipsToBounds = YES;
+        _avatarView.layer.cornerRadius = 22;
+        _avatarView.backgroundColor = [UIColor colorWithWhite:0.3 alpha:1];
+        [_card addSubview:_avatarView];
+
+        _titleLabel = [[UILabel alloc] init];
+        _titleLabel.font = [UIFont boldSystemFontOfSize:16];
+        _titleLabel.textColor = [UIColor whiteColor];
+        _titleLabel.numberOfLines = 1;
+        [_card addSubview:_titleLabel];
+
+        _bodyLabel = [[UILabel alloc] init];
+        _bodyLabel.font = [UIFont systemFontOfSize:14];
+        _bodyLabel.textColor = [UIColor colorWithWhite:0.85 alpha:1];
+        _bodyLabel.numberOfLines = 3;
+        [_card addSubview:_bodyLabel];
+
+        _timeLabel = [[UILabel alloc] init];
+        _timeLabel.font = [UIFont systemFontOfSize:11];
+        _timeLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1];
+        _timeLabel.textAlignment = NSTextAlignmentRight;
+        [_card addSubview:_timeLabel];
+
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(_tapped)];
+        [self addGestureRecognizer:tap];
+
+        UISwipeGestureRecognizer *swipe = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(_swiped)];
+        swipe.direction = UISwipeGestureRecognizerDirectionUp;
+        [self addGestureRecognizer:swipe];
+
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(_panned:)];
+        [self addGestureRecognizer:pan];
+    }
+    return self;
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat w = self.bounds.size.width;
+    CGFloat cardW = w - 24;
+    _card.frame = CGRectMake(12, 0, cardW, self.bounds.size.height);
+    _avatarView.frame = CGRectMake(14, 14, 44, 44);
+    _titleLabel.frame = CGRectMake(68, 14, cardW - 68 - 60, 20);
+    _timeLabel.frame = CGRectMake(cardW - 60, 14, 50, 20);
+    _bodyLabel.frame = CGRectMake(68, 38, cardW - 80, self.bounds.size.height - 52);
+}
+
+- (void)setTitle:(NSString *)title { _titleLabel.text = title; }
+- (NSString *)title { return _titleLabel.text; }
+- (void)setBody:(NSString *)body { _bodyLabel.text = body; }
+- (NSString *)body { return _bodyLabel.text; }
+- (void)setTime:(NSString *)time { _timeLabel.text = time; }
+- (NSString *)time { return _timeLabel.text; }
+- (void)setAvatar:(UIImage *)avatar {
+    _avatarView.image = avatar;
+    if (!avatar) {
+        _avatarView.image = [WXNotifBanner _defaultAvatar];
+    }
+}
+- (UIImage *)avatar { return _avatarView.image; }
+
++ (UIImage *)_defaultAvatar {
+    static UIImage *img = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        CGSize s = CGSizeMake(88, 88);
+        UIGraphicsBeginImageContextWithOptions(s, YES, 0);
+        [[UIColor colorWithRed:0.08 green:0.5 blue:0.13 alpha:1] setFill];
+        UIRectFill(CGRectMake(0, 0, s.width, s.height));
+        NSDictionary *attrs = @{ NSFontAttributeName: [UIFont boldSystemFontOfSize:36],
+                                 NSForegroundColorAttributeName: [UIColor whiteColor] };
+        NSString *t = @"微";
+        CGSize ts = [t sizeWithAttributes:attrs];
+        [t drawAtPoint:CGPointMake((s.width - ts.width) / 2, (s.height - ts.height) / 2)
+        withAttributes:attrs];
+        img = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+    });
+    return img;
+}
+
+- (void)_tapped {
+    if (_dismissing) return;
+    [self _dismissAnimated:YES];
+    if (self.onTap) self.onTap();
+}
+
+- (void)_swiped { [self _dismissAnimated:YES]; }
+
+- (void)_panned:(UIPanGestureRecognizer *)pan {
+    CGPoint t = [pan translationInView:self];
+    if (pan.state == UIGestureRecognizerStateChanged) {
+        if (t.y < 0) {
+            self.transform = CGAffineTransformMakeTranslation(0, t.y);
+            self.alpha = 1.0 + t.y / 200.0;
+        }
+    } else if (pan.state == UIGestureRecognizerStateEnded) {
+        if (t.y < -60) {
+            [self _dismissAnimated:YES];
+        } else {
+            [UIView animateWithDuration:0.2 animations:^{
+                self.transform = CGAffineTransformIdentity;
+                self.alpha = 1.0;
+            }];
+        }
+    }
+}
+
+- (void)showInView:(UIView *)container duration:(NSTimeInterval)dur {
+    self.frame = CGRectMake(0, -self.bounds.size.height, container.bounds.size.width, self.bounds.size.height);
+    [container addSubview:self];
+    [UIView animateWithDuration:0.35 delay:0 usingSpringWithDamping:0.8
+          initialSpringVelocity:0.5 options:UIViewAnimationOptionCurveEaseOut animations:^{
+        self.frame = CGRectMake(0, 8, container.bounds.size.width, self.bounds.size.height);
+    } completion:^(BOOL finished) {}];
+    _timer = [NSTimer scheduledTimerWithTimeInterval:dur target:self
+        selector:@selector(_dismissAnimatedTimer) userInfo:nil repeats:NO];
+}
+
+- (void)_dismissAnimatedTimer { [self _dismissAnimated:YES]; }
+
+- (void)_dismissAnimated:(BOOL)animated {
+    if (_dismissing) return;
+    _dismissing = YES;
+    [_timer invalidate]; _timer = nil;
+    void (^anim)(void) = ^{
+        self.frame = CGRectMake(0, -self.bounds.size.height - 20, self.bounds.size.width, self.bounds.size.height);
+        self.alpha = 0;
+    };
+    void (^done)(BOOL) = ^(BOOL f){
+        [self removeFromSuperview];
+        if (self.onDismiss) self.onDismiss();
+    };
+    if (animated) [UIView animateWithDuration:0.3 animations:anim completion:done];
+    else { anim(); done(YES); }
+}
+
+@end
+
 // ---- 通知横幅伪装 ----
 static void (*gOrigWillPresent)(id, SEL, UNUserNotificationCenter *, UNNotification *,
                                 void (^)(UNNotificationPresentationOptions));
 
+// 微信通知大弹窗窗口管理（v1.9.0）
+static UIWindow *gWXNotifWindow = nil;
+static WXNotifBanner *gWXCurrentBanner = nil;
+static NSMutableArray *gWXNotifQueue = nil;
+
+static UIWindow *_wx_notif_window(void) {
+    if (!gWXNotifWindow) {
+        gWXNotifWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        gWXNotifWindow.windowLevel = UIWindowLevelStatusBar + 100;
+        gWXNotifWindow.backgroundColor = [UIColor clearColor];
+        gWXNotifWindow.userInteractionEnabled = YES;
+        gWXNotifWindow.hidden = NO;
+    }
+    return gWXNotifWindow;
+}
+
+static void _wx_show_banner(NSString *title, NSString *body) {
+    if (!title.length && !body.length) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *win = _wx_notif_window();
+        CGFloat w = win.bounds.size.width;
+        CGFloat bodyH = [body boundingRectWithSize:CGSizeMake(w - 104, CGFLOAT_MAX)
+            options:NSStringDrawingUsesLineFragmentOrigin
+            attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:14]} context:nil].size.height;
+        CGFloat h = MAX(72, 38 + MIN(bodyH, 60) + 14);
+
+        WXNotifBanner *banner = [[WXNotifBanner alloc] initWithFrame:CGRectMake(0, 0, w, h)];
+        banner.title = title.length ? title : @"微信";
+        banner.body = body;
+        banner.avatar = nil;
+
+        // 时间
+        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"HH:mm";
+        banner.time = [fmt stringFromDate:[NSDate date]];
+
+        __weak WXNotifBanner *weakBanner = banner;
+        banner.onTap = ^{
+            // 点击跳转：打开微信
+            NSURL *url = [NSURL URLWithString:@"weixin://"];
+            if ([[UIApplication sharedApplication] canOpenURL:url]) {
+                [[UIApplication sharedApplication] openURL:url];
+            }
+        };
+        banner.onDismiss = ^{
+            if (gWXCurrentBanner == weakBanner) {
+                gWXCurrentBanner = nil;
+                // 显示队列中下一个
+                if (gWXNotifQueue.count > 0) {
+                    WXNotifBanner *next = gWXNotifQueue.firstObject;
+                    [gWXNotifQueue removeObjectAtIndex:0];
+                    gWXCurrentBanner = next;
+                    [next showInView:[weakBanner superview] ?: _wx_notif_window() duration:gWXNotifDur];
+                }
+            }
+        };
+
+        // 队列：若当前有显示，加入队列
+        if (gWXCurrentBanner) {
+            if (!gWXNotifQueue) gWXNotifQueue = [NSMutableArray array];
+            [gWXNotifQueue addObject:banner];
+            // 8 秒后如果队列还没处理完则丢弃
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [gWXNotifQueue removeObject:banner];
+            });
+        } else {
+            gWXCurrentBanner = banner;
+            [banner showInView:win duration:gWXNotifDur];
+        }
+    });
+}
+
 static void _fbg_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center,
                              UNNotification *note,
                              void (^handler)(UNNotificationPresentationOptions)) {
+    // v1.9.0：微信通知大弹窗接管
+    if (gWXBigNotif && [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
+        UNNotificationContent *c = note.request.content;
+        NSString *title = c.title.length ? c.title : (c.subtitle.length ? c.subtitle : @"微信");
+        NSString *body = c.body;
+        _wx_show_banner(title, body);
+        // 抑制系统横幅，但保留声音和角标
+        handler(UNNotificationPresentationOptionSound | UNNotificationPresentationOptionBadge);
+        return;
+    }
+
     if (gUseScene && gPhysBg) {
         handler(UNNotificationPresentationOptionBanner |
                 UNNotificationPresentationOptionSound |

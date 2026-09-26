@@ -140,6 +140,8 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
     if (!d[@"FUBGAudioKeep"])    d[@"FUBGAudioKeep"]    = @YES;
     if (!d[@"FUBGFloatingBall"]) d[@"FUBGFloatingBall"] = @YES;
+    if (!d[@"WXBigNotif"])       d[@"WXBigNotif"]       = @NO;
+    if (!d[@"WXNotifDur"])       d[@"WXNotifDur"]       = @5.0;
     return d;
 }
 
@@ -151,7 +153,8 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
     NSArray *sioKeys = @[ @"Enabled", @"Mode", @"Speed", @"SlowFactor",
                           @"Spring", @"Extra", @"ListAccel", @"Blacklist",
                           @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
-                          @"FUBGFloatingBall", @"FUBGExcludeApps" ];
+                          @"FUBGFloatingBall", @"FUBGExcludeApps",
+                          @"WXBigNotif", @"WXNotifDur" ];
     for (NSString *k in sioKeys) {
         if (cfg[k]) merged[k] = cfg[k];
     }
@@ -210,6 +213,9 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *_status;
     UISwitch *_swRM, *_swCF, *_swUIKit;
     UISwitch *_swFUBG, *_swFUBGScene, *_swFUBGAudio, *_swFUBGBall;
+    UISwitch *_swWXBigNotif;
+    UISlider *_sliderWXDur;
+    UILabel *_sliderWXDurLabel;
 }
 
 - (UIStackView *)row:(UIView *)l ctrl:(UIView *)c {
@@ -239,7 +245,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.8.9 · 微信动画加速恢复（实验）" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.9.0 · 微信通知大弹窗" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -305,6 +311,24 @@ static void WriteUIKitDrag(BOOL enabled) {
     _swFUBGBall = [[UISwitch alloc] init];
     _swFUBGBall.on = [cfg[@"FUBGFloatingBall"] boolValue];
 
+    // === 微信通知大弹窗区块（v1.9.0） ===
+    UILabel *wxTitle = [self label:@"微信通知大弹窗（v1.9.0）" size:15 dim:YES];
+
+    UILabel *lblWXBig = [self label:@"接管微信通知（大弹窗）" size:17 dim:NO];
+    _swWXBigNotif = [[UISwitch alloc] init];
+    _swWXBigNotif.on = [cfg[@"WXBigNotif"] boolValue];
+    _swWXBigNotif.onTintColor = [UIColor systemGreenColor];
+
+    double wxDuration = [cfg[@"WXNotifDur"] doubleValue];
+    UILabel *lblWXDur = [self label:[NSString stringWithFormat:@"显示时长（%.0f 秒）", wxDuration] size:17 dim:NO];
+    _sliderWXDurLabel = lblWXDur;
+    _sliderWXDur = [[UISlider alloc] init];
+    _sliderWXDur.minimumValue = 1.0;
+    _sliderWXDur.maximumValue = 15.0;
+    _sliderWXDur.continuous = YES;
+    _sliderWXDur.value = wxDuration;
+    [_sliderWXDur addTarget:self action:@selector(wxDurChanged) forControlEvents:UIControlEventValueChanged];
+
     UILabel *lblBL = [self label:@"黑名单（每行一个 Bundle ID）" size:15 dim:YES];
     _blacklist = [[UITextView alloc] init];
     _blacklist.font = [UIFont systemFontOfSize:14];
@@ -366,6 +390,9 @@ static void WriteUIKitDrag(BOOL enabled) {
         [self row:lblFUBGScene ctrl:_swFUBGScene],
         [self row:lblFUBGAudio ctrl:_swFUBGAudio],
         [self row:lblFUBGBall ctrl:_swFUBGBall],
+        wxTitle,
+        [self row:lblWXBig ctrl:_swWXBigNotif],
+        [self row:lblWXDur ctrl:_sliderWXDur],
         lblBL, _blacklist, save, rs, rb, listHint, hint, _status
     ]];
     stack.axis = UILayoutConstraintAxisVertical;
@@ -401,6 +428,10 @@ static void WriteUIKitDrag(BOOL enabled) {
     _sliderLabel.text = [NSString stringWithFormat:@"加速倍率（当前 ×%.1f）", _slider.value];
 }
 
+- (void)wxDurChanged {
+    _sliderWXDurLabel.text = [NSString stringWithFormat:@"显示时长（%.0f 秒）", _sliderWXDur.value];
+}
+
 - (void)onSave {
     NSMutableDictionary *cfg = ReadConfig();
     cfg[@"Enabled"] = @(_swEnabled.on);
@@ -413,6 +444,8 @@ static void WriteUIKitDrag(BOOL enabled) {
     cfg[@"FUBGSceneFake"] = @(_swFUBGScene.on);
     cfg[@"FUBGAudioKeep"] = @(_swFUBGAudio.on);
     cfg[@"FUBGFloatingBall"] = @(_swFUBGBall.on);
+    cfg[@"WXBigNotif"] = @(_swWXBigNotif.on);
+    cfg[@"WXNotifDur"] = @((double)_sliderWXDur.value);
     NSMutableArray *bl = [NSMutableArray array];
     for (NSString *line in [_blacklist.text componentsSeparatedByCharactersInSet:
             [NSCharacterSet newlineCharacterSet]]) {
