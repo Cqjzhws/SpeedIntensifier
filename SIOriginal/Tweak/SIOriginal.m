@@ -1101,6 +1101,7 @@ static NSTimer *gWXBannerScanTimer = nil;
 static NSMutableSet *gWXSeenBanners = nil;
 
 static void _wx_show_banner(NSString *title, NSString *body);  // 前向声明
+static void _wx_checkView(UIView *view, UIWindow *win);          // 前向声明
 
 static void _wx_scanCustomBanner(void) {
     if (!gWXBigNotif) return;
