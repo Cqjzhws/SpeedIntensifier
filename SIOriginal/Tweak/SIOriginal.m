@@ -1293,14 +1293,14 @@ static void _wx_tryDetectBanner(UIView *v) {
 
     BOOL nameMatch = _wx_classNameIsBanner([v class]);
     CGRect f = [v convertRect:v.bounds toView:nil];
-    CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
 
     if (!nameMatch) {
-        // —— 几何兜底路径（收紧）——
-        if (f.origin.y > screenH * 0.18) return;  // 顶部 18%
-        if (f.origin.y < -10) return;
-        if (f.size.height < 44 || f.size.height > 120) return;
-        if (f.size.width < 200) return;
+        // —— 几何兜底路径（v1.9.23：放宽尺寸/层级，防误报靠输入框与导航栏排除）——
+        // 微信前台横幅固定从顶部状态栏下方滑入，y 必在顶部 ~150pt 内
+        if (f.origin.y > 150) return;
+        if (f.origin.y < -20) return;
+        if (f.size.height < 36 || f.size.height > 150) return;
+        if (f.size.width < 120) return;
 
         // 排除导航/标签/搜索/工具栏祖先，以及键盘/导航类簇
         UIView *p = v.superview;
@@ -1317,12 +1317,12 @@ static void _wx_tryDetectBanner(UIView *v) {
             p = p.superview;
         }
         // 排除含输入框的子树（点输入框误报根源）
-        if (_wx_subtreeContainsInput(v, 3)) return;
+        if (_wx_subtreeContainsInput(v, 4)) return;
     }
 
     NSMutableArray *labels = [NSMutableArray array];
     BOOL hasAvatar = NO;
-    _wx_walkCollect(v, 2, labels, &hasAvatar);
+    _wx_walkCollect(v, 3, labels, &hasAvatar);
     if (labels.count < 1) return;
     if (!nameMatch && !hasAvatar) return;  // 几何路径必须含头像；类名路径信任
 
