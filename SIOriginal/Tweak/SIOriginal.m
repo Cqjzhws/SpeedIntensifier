@@ -788,6 +788,9 @@ static BOOL    gLocalOff   = NO;
 // ---- 微信通知大弹窗（v1.9.0） ----
 static BOOL    gWXBigNotif    = NO;    // 接管微信通知，弹自定义大窗
 static double  gWXNotifDur    = 5.0;   // 大窗显示时长（秒）
+static BOOL    gWXDiag        = NO;    // v1.9.24：屏幕自诊断（把候选横幅类名直接弹出来）
+static NSTimeInterval gWXDiagLast = 0; // 诊断去节流
+static NSString    *gWXDiagLastKey = nil;
 
 static BOOL    gActive    = NO;   // 本 App 最终是否参与保活（总开关∧名单∧本地开关）
 static BOOL    gUseScene  = NO;   // 本 App 是否启用场景伪装
@@ -825,6 +828,7 @@ static void _fbg_loadPref(void) {
             if (d[@"FUBGFloatingBall"]) gShowBall  = [d[@"FUBGFloatingBall"] boolValue];
             // 微信通知大弹窗
             if (d[@"WXBigNotif"])       gWXBigNotif = [d[@"WXBigNotif"] boolValue];
+            if (d[@"WXDiag"])           gWXDiag = [d[@"WXDiag"] boolValue];
             if (d[@"WXNotifDur"]) {
                 double dur = [d[@"WXNotifDur"] doubleValue];
                 if (dur >= 1.0 && dur <= 30.0) gWXNotifDur = dur;
@@ -1287,6 +1291,53 @@ static void _wx_emitBanner(NSString *title, NSString *body) {
 // v1.9.22：微信进程内无条件运行；类名白名单直通，几何路径严格排除输入框/导航栏/键盘
 static void _wx_tryDetectBanner(UIView *v) {
     if (!v || !v.window || v.hidden || v.alpha < 0.05) return;
+
+    // ===== v1.9.24：屏幕自诊断模式（无 Mac 时用）=====
+    // 放宽一切尺寸，只保留输入框/键盘/导航/列表排除，把候选 view 的真实类名直接弹出来。
+    // 用户让真实消息进来，截图含类名的弹窗即可，无需 Console。
+    if (gWXDiag && [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
+        UIWindow *dw = v.window;
+        if (dw.windowLevel > UIWindowLevelNormal + 1.0) return;
+        CGRect df = [v convertRect:v.bounds toView:nil];
+        if (df.origin.y > 160 || df.origin.y < -20) return;
+        if (df.size.height < 28 || df.size.height > 170) return;
+        if (df.size.width < 80) return;
+
+        UIView *dp = v.superview;
+        BOOL bad = NO;
+        while (dp) {
+            if ([dp isKindOfClass:[UINavigationBar class]] ||
+                [dp isKindOfClass:[UITabBar class]] ||
+                [dp isKindOfClass:[UIToolbar class]] ||
+                [dp isKindOfClass:[UIScrollView class]]) { bad = YES; break; }
+            NSString *dcn = [NSStringFromClass([dp class]) lowercaseString];
+            if ([dcn containsString:@"inputset"] || [dcn containsString:@"keyboard"]) { bad = YES; break; }
+            dp = dp.superview;
+        }
+        if (bad || _wx_subtreeContainsInput(v, 4)) return;
+
+        NSMutableArray *dl = [NSMutableArray array];
+        BOOL dav = NO;
+        _wx_walkCollect(v, 3, dl, &dav);
+        if (dl.count < 1) return;
+        NSString *dt, *db;
+        _wx_pickTitleBody(dl, &dt, &db);
+        if (!dt.length && !db.length) return;
+
+        // 3 秒去重，避免同一次动画 alpha/hidden/add 连弹
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        NSString *dkey = [NSString stringWithFormat:@"%@|%@|%@",
+                          NSStringFromClass([v class]), dt, db];
+        if (![dkey isEqualToString:gWXDiagLastKey] || now - gWXDiagLast > 3.0) {
+            gWXDiagLastKey = dkey;
+            gWXDiagLast = now;
+            NSString *diagTitle = [NSString stringWithFormat:@"🔍%@", NSStringFromClass([v class])];
+            _wx_show_banner(diagTitle, [NSString stringWithFormat:@"%@ %@",
+                                        dt.length ? dt : @"", db.length ? db : @""]);
+        }
+        return;  // 诊断模式下不执行正式识别
+    }
+
     UIWindow *win = v.window;
     // 只接受普通层级 window，排除键盘 window（键盘 windowLevel=UIWindowLevelStatusBar）
     if (win.windowLevel > UIWindowLevelNormal + 1.0) return;

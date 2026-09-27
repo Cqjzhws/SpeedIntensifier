@@ -141,6 +141,7 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"FUBGAudioKeep"])    d[@"FUBGAudioKeep"]    = @YES;
     if (!d[@"FUBGFloatingBall"]) d[@"FUBGFloatingBall"] = @YES;
     if (!d[@"WXBigNotif"])       d[@"WXBigNotif"]       = @NO;
+    if (!d[@"WXDiag"])           d[@"WXDiag"]           = @NO;
     if (!d[@"WXNotifDur"])       d[@"WXNotifDur"]       = @5.0;
     return d;
 }
@@ -154,7 +155,7 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
                           @"Spring", @"Extra", @"ListAccel", @"Blacklist",
                           @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
                           @"FUBGFloatingBall", @"FUBGExcludeApps",
-                          @"WXBigNotif", @"WXNotifDur" ];
+                          @"WXBigNotif", @"WXDiag", @"WXNotifDur" ];
     for (NSString *k in sioKeys) {
         if (cfg[k]) merged[k] = cfg[k];
     }
@@ -214,6 +215,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UISwitch *_swRM, *_swCF, *_swUIKit;
     UISwitch *_swFUBG, *_swFUBGScene, *_swFUBGAudio, *_swFUBGBall;
     UISwitch *_swWXBigNotif;
+    UISwitch *_swWXDiag;
     UISlider *_sliderWXDur;
     UILabel *_sliderWXDurLabel;
 }
@@ -245,7 +247,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.9.23 · 8.0.58几何放宽" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.9.24 · 新增诊断模式（无Mac抓横幅类名）" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -318,6 +320,12 @@ static void WriteUIKitDrag(BOOL enabled) {
     _swWXBigNotif = [[UISwitch alloc] init];
     _swWXBigNotif.on = [cfg[@"WXBigNotif"] boolValue];
     _swWXBigNotif.onTintColor = [UIColor systemGreenColor];
+
+    UILabel *lblWXDiag = [self label:@"🔍诊断模式（弹出横幅类名，抓包用，用完关）" size:15 dim:NO];
+    lblWXDiag.textColor = [UIColor systemOrangeColor];
+    _swWXDiag = [[UISwitch alloc] init];
+    _swWXDiag.on = [cfg[@"WXDiag"] boolValue];
+    _swWXDiag.onTintColor = [UIColor systemOrangeColor];
 
     double wxDuration = [cfg[@"WXNotifDur"] doubleValue];
     UILabel *lblWXDur = [self label:[NSString stringWithFormat:@"显示时长（%.0f 秒）", wxDuration] size:17 dim:NO];
@@ -392,6 +400,7 @@ static void WriteUIKitDrag(BOOL enabled) {
         [self row:lblFUBGBall ctrl:_swFUBGBall],
         wxTitle,
         [self row:lblWXBig ctrl:_swWXBigNotif],
+        [self row:lblWXDiag ctrl:_swWXDiag],
         [self row:lblWXDur ctrl:_sliderWXDur],
         lblBL, _blacklist, save, rs, rb, listHint, hint, _status
     ]];
@@ -445,6 +454,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     cfg[@"FUBGAudioKeep"] = @(_swFUBGAudio.on);
     cfg[@"FUBGFloatingBall"] = @(_swFUBGBall.on);
     cfg[@"WXBigNotif"] = @(_swWXBigNotif.on);
+    cfg[@"WXDiag"] = @(_swWXDiag.on);
     cfg[@"WXNotifDur"] = @((double)_sliderWXDur.value);
     NSMutableArray *bl = [NSMutableArray array];
     for (NSString *line in [_blacklist.text componentsSeparatedByCharactersInSet:
