@@ -1109,6 +1109,7 @@ static NSTimeInterval gWXLastBannerTime = 0;       // v1.9.13：上次弹窗时�
 static __weak UIView *gWXTrackedBanner = nil;       // v1.9.16：追踪的横幅 view
 static NSString *gWXTrackedText = nil;              // v1.9.16：上次追踪的文字
 static NSTimer *gWXTrackTimer = nil;                // v1.9.16：内容变化监控定时器
+static int gWXTrackNilCount = 0;                    // v1.9.22：追踪横幅短暂离窗容忍计数
 
 static void _wx_show_banner(NSString *title, NSString *body);  // 前向声明
 static void _wx_checkView(UIView *view, UIWindow *win);          // 前向声明
@@ -1203,85 +1204,183 @@ static void _wx_checkView(UIView *view, UIWindow *win) {
     _wx_show_banner(title.length ? title : @"微信", body);
 }
 
-// v1.9.17：横幅检测核心逻辑（供 didMoveToWindow/setHidden:/setAlpha:/layoutSubviews 共用）
-// v1.9.20：去掉 gWXBigNotif 检查（微信进程内无条件运行），完全递归扫描子视图
-static void _wx_tryDetectBanner(UIView *v) {
-    if (!v || !v.window || v.hidden) return;
+// ===== v1.9.22：精确化横幅识别（消除输入框误报 + 修复后期失效）=====
 
-    CGRect f = [v convertRect:v.bounds toView:nil];
-    CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
-    if (f.origin.y > screenH * 0.25) return;  // 顶部 25%
-    if (f.origin.y < -300) return;
-    if (f.size.height < 40 || f.size.height > 130) return;
-    if (f.size.width < 150) return;
-
-    // 不能在 UIScrollView 内
-    UIView *parent = v.superview;
-    while (parent) {
-        if ([parent isKindOfClass:[UIScrollView class]]) return;
-        parent = parent.superview;
+// 类名（沿父类链）是否为微信 in-app 通知横幅，覆盖不同微信版本命名
+static BOOL _wx_classNameIsBanner(Class cls) {
+    Class c = cls;
+    while (c && c != [NSObject class]) {
+        NSString *l = [NSStringFromClass(c) lowercaseString];
+        if ([l containsString:@"inappnotification"] ||
+            [l containsString:@"inappmsg"] ||
+            [l containsString:@"notificationbanner"] ||
+            [l containsString:@"messagebanner"] ||
+            ([l containsString:@"mainframe"] && [l containsString:@"notification"])) {
+            return YES;
+        }
+        c = class_getSuperclass(c);
     }
+    return NO;
+}
 
-    // 两层递归收集文字和头像（避免完全递归栈溢出）
-    NSMutableArray *labels = [NSMutableArray array];
-    BOOL hasAvatar = NO;
-    for (UIView *sub in v.subviews) {
-        if ([sub isKindOfClass:[UIImageView class]]) hasAvatar = YES;
+// 子树（限层）是否含输入控件——真实消息横幅内部绝不会有输入框（点输入框误报根源）
+static BOOL _wx_subtreeContainsInput(UIView *v, int depth) {
+    if (!v || depth < 0) return NO;
+    if ([v isKindOfClass:[UITextField class]] ||
+        [v isKindOfClass:[UITextView class]] ||
+        [v isKindOfClass:[UISearchBar class]]) return YES;
+    if (depth == 0) return NO;
+    for (UIView *s in v.subviews) {
+        if (_wx_subtreeContainsInput(s, depth - 1)) return YES;
+    }
+    return NO;
+}
+
+// 限层收集文字 label 与头像
+static void _wx_walkCollect(UIView *node, int depth, NSMutableArray *labels, BOOL *hasAvatar) {
+    for (UIView *sub in node.subviews) {
+        if ([sub isKindOfClass:[UIImageView class]]) *hasAvatar = YES;
         if ([sub isKindOfClass:[UILabel class]]) {
             UILabel *l = (UILabel *)sub;
             if (l.text.length > 0) [labels addObject:l];
         }
-        for (UIView *ss in sub.subviews) {
-            if ([ss isKindOfClass:[UIImageView class]]) hasAvatar = YES;
-            if ([ss isKindOfClass:[UILabel class]]) {
-                UILabel *l = (UILabel *)ss;
-                if (l.text.length > 0) [labels addObject:l];
-            }
-            for (UIView *sss in ss.subviews) {
-                if ([sss isKindOfClass:[UIImageView class]]) hasAvatar = YES;
-                if ([sss isKindOfClass:[UILabel class]]) {
-                    UILabel *l = (UILabel *)sss;
-                    if (l.text.length > 0) [labels addObject:l];
-                }
-            }
-        }
+        if (depth > 0) _wx_walkCollect(sub, depth - 1, labels, hasAvatar);
     }
-    if (labels.count < 1) return;
-    if (!hasAvatar && labels.count < 2) return;
+}
 
+// 从 labels 取标题/正文（按 y 排序前两个）
+static void _wx_pickTitleBody(NSArray *labels, NSString **title, NSString **body) {
     NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
         return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
     }];
-    NSString *title = @"";
-    NSString *body = @"";
+    NSString *t = @"";
+    NSString *b = @"";
     for (UILabel *l in sorted) {
-        if (!title.length) title = l.text;
-        else if (!body.length) { body = l.text; break; }
+        if (!t.length) t = l.text;
+        else if (!b.length) { b = l.text; break; }
+    }
+    *title = t; *body = b;
+}
+
+// 统一出口：同内容 8 秒去重（吸收同一条横幅的 add/alpha/hidden 连续触发与系统提示刷屏），
+// 不再用全局时间节流，避免连发不同消息被误吞
+static void _wx_emitBanner(NSString *title, NSString *body) {
+    if (!title.length && !body.length) return;
+    NSString *key = [NSString stringWithFormat:@"%@|%@", title ?: @"", body ?: @""];
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (!gWXBannerDedup) gWXBannerDedup = [NSMutableDictionary dictionary];
+    NSNumber *last = gWXBannerDedup[key];
+    if (last && now - [last doubleValue] < 8.0) return;
+    gWXBannerDedup[key] = @(now);
+    // 顺带清理过期键，防止字典无限膨胀
+    if (gWXBannerDedup.count > 60) {
+        NSMutableArray *oldKeys = [NSMutableArray array];
+        for (NSString *k in gWXBannerDedup)
+            if (now - [gWXBannerDedup[k] doubleValue] > 30) [oldKeys addObject:k];
+        [gWXBannerDedup removeObjectsForKeys:oldKeys];
+    }
+    NSLog(@"[WXNotif] EMIT banner \"%@\" - \"%@\"", title, body);
+    _wx_show_banner(title.length ? title : @"微信", body);
+}
+
+// 横幅检测核心（供 didMoveToWindow/setHidden:/setAlpha: 共用）
+// v1.9.22：微信进程内无条件运行；类名白名单直通，几何路径严格排除输入框/导航栏/键盘
+static void _wx_tryDetectBanner(UIView *v) {
+    if (!v || !v.window || v.hidden || v.alpha < 0.05) return;
+    UIWindow *win = v.window;
+    // 只接受普通层级 window，排除键盘 window（键盘 windowLevel=UIWindowLevelStatusBar）
+    if (win.windowLevel > UIWindowLevelNormal + 1.0) return;
+
+    BOOL nameMatch = _wx_classNameIsBanner([v class]);
+    CGRect f = [v convertRect:v.bounds toView:nil];
+    CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
+
+    if (!nameMatch) {
+        // —— 几何兜底路径（收紧）——
+        if (f.origin.y > screenH * 0.18) return;  // 顶部 18%
+        if (f.origin.y < -10) return;
+        if (f.size.height < 44 || f.size.height > 120) return;
+        if (f.size.width < 200) return;
+
+        // 排除导航/标签/搜索/工具栏祖先，以及键盘/导航类簇
+        UIView *p = v.superview;
+        while (p) {
+            if ([p isKindOfClass:[UINavigationBar class]] ||
+                [p isKindOfClass:[UITabBar class]] ||
+                [p isKindOfClass:[UISearchBar class]] ||
+                [p isKindOfClass:[UIToolbar class]]) return;
+            if ([p isKindOfClass:[UIScrollView class]]) return;
+            NSString *cn = [NSStringFromClass([p class]) lowercaseString];
+            if ([cn containsString:@"inputset"] ||
+                [cn containsString:@"keyboard"] ||
+                [cn containsString:@"navigationbar"]) return;
+            p = p.superview;
+        }
+        // 排除含输入框的子树（点输入框误报根源）
+        if (_wx_subtreeContainsInput(v, 3)) return;
     }
 
-    // 追踪 + 内容变化监控
+    NSMutableArray *labels = [NSMutableArray array];
+    BOOL hasAvatar = NO;
+    _wx_walkCollect(v, 2, labels, &hasAvatar);
+    if (labels.count < 1) return;
+    if (!nameMatch && !hasAvatar) return;  // 几何路径必须含头像；类名路径信任
+
+    NSString *title, *body;
+    _wx_pickTitleBody(labels, &title, &body);
+    if (!title.length && !body.length) return;
+
+    // 追踪 + 内容变化监控（唯一低频引擎）
     gWXTrackedBanner = v;
     gWXTrackedText = [NSString stringWithFormat:@"%@|%@", title, body];
+    gWXTrackNilCount = 0;
     if (!gWXTrackTimer) {
         gWXTrackTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES
             block:^(NSTimer *t){ _wx_checkTrackedBanner(); }];
         [[NSRunLoop mainRunLoop] addTimer:gWXTrackTimer forMode:NSRunLoopCommonModes];
     }
 
-    NSLog(@"[WXNotif] banner detected: class=%@ frame=%@ \"%@\" - \"%@\"",
+    NSLog(@"[WXNotif] banner detected (%@): class=%@ frame=%@ \"%@\" - \"%@\"",
+          nameMatch ? @"name" : @"geo",
           NSStringFromClass([v class]), NSStringFromCGRect(f), title, body);
 
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - gWXLastBannerTime < 1.5) return;
+    _wx_emitBanner(title, body);
+}
 
-    NSString *dedupKey = [NSString stringWithFormat:@"%@|%@", title, body];
-    if (!gWXBannerDedup) gWXBannerDedup = [NSMutableDictionary dictionary];
-    NSNumber *lastTime = gWXBannerDedup[dedupKey];
-    if (lastTime && now - [lastTime doubleValue] < 10.0) return;
-    gWXBannerDedup[dedupKey] = @(now);
-    gWXLastBannerTime = now;
+// v1.9.22：类名白名单浅扫描兜底（只看 keyWindow 三层，按类名，零误报），
+// 事件 hook 漏掉（单例复用/无显隐变化）时由此捞回
+static void _wx_scanNamedBanner(void) {
+    if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
+    UIWindow *kw = nil;
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+            if (w.isKeyWindow && w.windowLevel == UIWindowLevelNormal) { kw = w; break; }
+        }
+        if (kw) break;
+    }
+    if (!kw) return;
 
-    _wx_show_banner(title.length ? title : @"微信", body);
+    NSArray *cur = kw.subviews;
+    for (int lvl = 0; lvl < 3 && cur.count; lvl++) {
+        NSMutableArray *next = [NSMutableArray array];
+        for (UIView *v in cur) {
+            if (_wx_classNameIsBanner([v class]) && !v.hidden && v.alpha > 0.05 && v.window) {
+                NSMutableArray *labels = [NSMutableArray array];
+                BOOL av = NO;
+                _wx_walkCollect(v, 2, labels, &av);
+                NSString *title, *body;
+                _wx_pickTitleBody(labels, &title, &body);
+                if (title.length || body.length) {
+                    gWXTrackedBanner = v;
+                    gWXTrackedText = [NSString stringWithFormat:@"%@|%@", title, body];
+                    _wx_emitBanner(title, body);
+                }
+            }
+            [next addObjectsFromArray:v.subviews];
+        }
+        cur = next;
+    }
 }
 
 // v1.9.9：事件驱动——UIView 被加到 window 时检查是否是微信横幅
@@ -1330,58 +1429,40 @@ static void _wx_setAlpha(id self, SEL _cmd, CGFloat alpha) {
 
 // v1.9.21：移除 layoutSubviews hook（高频调用导致闪退），保留三个事件驱动 hook
 
-// v1.9.16：监控追踪的横幅 view 内容变化（微信复用同一 view 更新文字）
+// v1.9.22：监控追踪横幅的内容变化（微信复用同一 view 更新文字），并容忍短暂离窗
 static void _wx_checkTrackedBanner(void) {
     if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
+
+    // 每 tick 都跑一次类名白名单浅扫描兜底（事件漏掉时捞回）
+    _wx_scanNamedBanner();
+
     UIView *v = gWXTrackedBanner;
-    if (!v || !v.window) {
-        gWXTrackedBanner = nil;
+    if (!v) return;
+    if (!v.window || v.hidden || v.alpha < 0.05) {
+        // 横幅动画过程中可能短暂离窗，连续约 2 秒（4 次）才放弃追踪，避免断链漏消息
+        if (++gWXTrackNilCount >= 4) {
+            gWXTrackedBanner = nil;
+            gWXTrackedText = nil;
+            gWXTrackNilCount = 0;
+        }
         return;
     }
+    gWXTrackNilCount = 0;
 
-    // 提取当前文字
     NSMutableArray *labels = [NSMutableArray array];
-    for (UIView *sub in v.subviews) {
-        if ([sub isKindOfClass:[UILabel class]]) {
-            UILabel *l = (UILabel *)sub;
-            if (l.text.length > 0) [labels addObject:l];
-        }
-        for (UIView *ss in sub.subviews) {
-            if ([ss isKindOfClass:[UILabel class]]) {
-                UILabel *l = (UILabel *)ss;
-                if (l.text.length > 0) [labels addObject:l];
-            }
-        }
-    }
+    BOOL av = NO;
+    _wx_walkCollect(v, 2, labels, &av);
     if (labels.count < 1) return;
 
-    NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
-        return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
-    }];
-    NSString *title = @"";
-    NSString *body = @"";
-    for (UILabel *l in sorted) {
-        if (!title.length) title = l.text;
-        else if (!body.length) { body = l.text; break; }
-    }
+    NSString *title, *body;
+    _wx_pickTitleBody(labels, &title, &body);
 
     NSString *curText = [NSString stringWithFormat:@"%@|%@", title, body];
     if ([curText isEqualToString:gWXTrackedText]) return;  // 内容没变
     gWXTrackedText = curText;
 
-    // 内容变了，弹新窗（复用去重逻辑）
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - gWXLastBannerTime < 2.0) return;
-
-    NSString *dedupKey = curText;
-    if (!gWXBannerDedup) gWXBannerDedup = [NSMutableDictionary dictionary];
-    NSNumber *lastTime = gWXBannerDedup[dedupKey];
-    if (lastTime && now - [lastTime doubleValue] < 10.0) return;
-    gWXBannerDedup[dedupKey] = @(now);
-    gWXLastBannerTime = now;
-
     NSLog(@"[WXNotif] tracked banner changed: \"%@\" - \"%@\"", title, body);
-    _wx_show_banner(title.length ? title : @"微信", body);
+    _wx_emitBanner(title, body);
 }
 
 // 获取当前活跃的 UIWindowScene（v1.9.1：修复无 scene 导致窗口间歇性不显示）
@@ -1590,13 +1671,18 @@ static void _fbg_installNotifHooks(void) {
         NSLog(@"[WXNotif] hooked didMoveToWindow + setHidden: + setAlpha:");
     }
 
-    // v1.9.2：启动微信自定义横幅扫描器（前台横幅是微信自定义 UIView，不走 UNNotification）
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (gWXBannerScanTimer) return;
-        gWXBannerScanTimer = [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES
-            block:^(NSTimer *t){ _wx_scanCustomBanner(); }];
-        [[NSRunLoop mainRunLoop] addTimer:gWXBannerScanTimer forMode:NSRunLoopCommonModes];
-    });
+    // v1.9.22：微信启动即无条件启动统一低频引擎（内容追踪 + 类名白名单浅扫描兜底），
+    // 不再依赖「先检测到横幅」才启动，消除冷启动死锁导致的后期失效
+    if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!gWXTrackTimer) {
+                gWXTrackTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES
+                    block:^(NSTimer *t){ _wx_checkTrackedBanner(); }];
+                [[NSRunLoop mainRunLoop] addTimer:gWXTrackTimer forMode:NSRunLoopCommonModes];
+                NSLog(@"[WXNotif] unified track/scan engine started");
+            }
+        });
+    }
 }
 
 static void _fbg_installSceneHooks(void) {
