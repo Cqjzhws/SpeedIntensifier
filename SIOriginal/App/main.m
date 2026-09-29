@@ -134,7 +134,7 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"SlowFactor"]) d[@"SlowFactor"] = @2.0;
     if (!d[@"Spring"])     d[@"Spring"]     = @YES;
     if (!d[@"Extra"])      d[@"Extra"]      = @YES;
-    if (!d[@"ListAccel"])  d[@"ListAccel"]  = @YES;
+    if (!d[@"ListAccel"])  d[@"ListAccel"]  = @NO;
     if (!d[@"Blacklist"])  d[@"Blacklist"]  = @[ @"com.tencent.wework" ];
     if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
@@ -239,7 +239,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.8.10 · 全 App 通用" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.8.11 · 列表 hook 纯开关控制" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -267,7 +267,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     _swExtra = [[UISwitch alloc] init];
     _swExtra.on = [cfg[@"Extra"] boolValue];
 
-    UILabel *lblList = [self label:@"列表加速 TV/CV（微信已硬保护）" size:17 dim:NO];
+    UILabel *lblList = [self label:@"列表加速 TV/CV（重列表 App 保持关闭）" size:17 dim:NO];
     lblList.textColor = [UIColor systemRedColor];
     _swList = [[UISwitch alloc] init];
     _swList.on = [cfg[@"ListAccel"] boolValue];
@@ -341,9 +341,9 @@ static void WriteUIKitDrag(BOOL enabled) {
     [rb.heightAnchor constraintEqualToConstant:40].active = YES;
     [rb addTarget:self action:@selector(onReboot) forControlEvents:UIControlEventTouchUpInside];
 
-    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。慢放 = 原版 slowDownFactor 功能，可观察动画细节。瞬切 = 0.01 秒直达。\n\n⚠️ v1.8.10 起全 App 通用：加速 + 真后台保活在所有注入的 App 中生效，悬浮球已全局禁用。微信预览放大时动画 hook 自动旁路保护。若预览/手势出现异常请立即反馈。" size:12 dim:YES];
+    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。慢放 = 原版 slowDownFactor 功能，可观察动画细节。瞬切 = 0.01 秒直达。\n\n⚠️ v1.8.11 起全 App 通用：加速 + 真后台保活在所有注入的 App 中生效，悬浮球已全局禁用，列表 hook 取消硬保护改由开关控制。微信预览放大时动画 hook 自动旁路保护。若预览/手势出现异常请立即反馈。" size:12 dim:YES];
     hint.textAlignment = NSTextAlignmentCenter;
-    UILabel *listHint = [self label:@"列表加速含 24 个 TV/CV hook。v1.8.10 全 App 通用；顺丰骑士保持硬保护。重列表 App（淘宝/京东）若出现卡死请关闭此开关或加黑名单。" size:12 dim:YES];
+    UILabel *listHint = [self label:@"列表加速含 24 个 TV/CV hook。v1.8.11 起取消 bundleid 硬保护，完全由此开关控制，默认关闭。顺丰骑士/淘宝/京东等重列表 App 必须保持关闭，否则破坏列表状态机导致卡死。" size:12 dim:YES];
     listHint.textColor = [UIColor systemOrangeColor];
     listHint.numberOfLines = 0;
     _status = [self label:@"" size:13 dim:YES];

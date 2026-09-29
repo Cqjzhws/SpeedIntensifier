@@ -29,9 +29,8 @@ static double   gSpeed     = 5.0;    // 加速倍率（时长 ÷ 倍率）
 static double   gSlowFactor = 2.0;   // 慢放倍率（时长 × 因子）
 static BOOL     gSpring    = YES;    // CASpring 参数缩放
 static BOOL     gExtra     = YES;    // 导航/模态进阶转场
-static BOOL     gListAccel = YES;    // TV/CV 列表全家桶（微信/顺丰骑士已硬保护）
+static BOOL     gListAccel = NO;     // TV/CV 列表全家桶（v1.8.11 起纯开关控制，默认关）
 static BOOL     gIsWeChat  = NO;     // 微信缩放预览守卫用（L104）
-static BOOL     gIsSFKnight = NO;    // 硬保护：顺丰同城骑士（订单列表密集，同微信崩溃家族）
 static NSString *gBlacklist = nil;   // 逗号拼接，逐进程缓存
 static NSString *gSelfBundle = nil;
 
@@ -350,10 +349,11 @@ static void sio_vc_dismiss(id self, SEL _cmd, BOOL anim, void (^c)(void)) {
     [CATransaction commit];
 }
 
-#pragma mark - TV/CV 列表全家桶（ListAccel 控制；com.tencent.xin / com.sfic.knight 硬保护）
+#pragma mark - TV/CV 列表全家桶（ListAccel 纯开关控制）
 
-// v1.8.9：微信列表 hook 恢复（实验）；顺丰骑士保持硬保护
-static BOOL SIO_listOK(void) { return gListAccel && !gIsSFKnight && !SIO_blocked(); }
+// v1.8.11：移除 com.sfic.knight 硬编码保护，24 个列表 hook 完全由配置开关控制。
+// 重列表 App（顺丰骑士/淘宝/京东等）务必在配置 App 关闭「列表加速」，否则会破坏列表状态机。
+static BOOL SIO_listOK(void) { return gListAccel && !SIO_blocked(); }
 
 static void SIO_listWrap(void (^block)(void)) {
     [CATransaction begin];
@@ -493,9 +493,6 @@ static void SIOriginalInit(void) {
     pthread_key_create(&gInUIViewAnimKey, NULL);
     gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     gIsWeChat = [gSelfBundle isEqualToString:@"com.tencent.xin"];
-    // 顺丰同城骑士：订单/任务列表密集型 App，TV/CV mutation hooks 会破坏列表状态机
-    // 导致卡死（与微信同家族），且需与 SFKnightMax 共存，硬保护
-    gIsSFKnight = [gSelfBundle isEqualToString:@"com.sfic.knight"];
     SIO_reload();
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
@@ -563,7 +560,7 @@ static void SIOriginalInit(void) {
                             (IMP)sio_vc_dismiss, (IMP *)&o_vc_dismiss);
     }
 
-    // TV/CV 列表全家桶 ×24（ListAccel 控制；微信/顺丰骑士硬保护）
+    // TV/CV 列表全家桶 ×24（ListAccel 纯开关控制；重列表 App 默认关闭）
     Class tv = objc_getClass("UITableView");
     Class cv = objc_getClass("UICollectionView");
     if (tv) {
