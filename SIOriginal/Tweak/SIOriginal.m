@@ -30,7 +30,7 @@ static double   gSlowFactor = 2.0;   // 慢放倍率（时长 × 因子）
 static BOOL     gSpring    = YES;    // CASpring 参数缩放
 static BOOL     gExtra     = YES;    // 导航/模态进阶转场
 static BOOL     gListAccel = YES;    // TV/CV 列表全家桶（微信/顺丰骑士已硬保护）
-static BOOL     gIsWeChat  = NO;     // 硬保护：TV/CV hook 对微信永远关闭
+static BOOL     gIsWeChat  = NO;     // 微信缩放预览守卫用（L104）
 static BOOL     gIsSFKnight = NO;    // 硬保护：顺丰同城骑士（订单列表密集，同微信崩溃家族）
 static NSString *gBlacklist = nil;   // 逗号拼接，逐进程缓存
 static NSString *gSelfBundle = nil;
@@ -785,13 +785,6 @@ static BOOL    gShowBall   = YES;
 static NSArray *gExclude   = nil;
 static BOOL    gLocalOff   = NO;
 
-// ---- 微信通知大弹窗（v1.9.0） ----
-static BOOL    gWXBigNotif    = NO;    // 接管微信通知，弹自定义大窗
-static double  gWXNotifDur    = 5.0;   // 大窗显示时长（秒）
-static BOOL    gWXDiag        = NO;    // v1.9.24：屏幕自诊断（把候选横幅类名直接弹出来）
-static NSTimeInterval gWXDiagLast = 0; // 诊断去节流
-static NSString    *gWXDiagLastKey = nil;
-
 static BOOL    gActive    = NO;   // 本 App 最终是否参与保活（总开关∧名单∧本地开关）
 static BOOL    gUseScene  = NO;   // 本 App 是否启用场景伪装
 static BOOL    gUseAudio  = NO;   // 本 App 是否启用音频断言
@@ -826,13 +819,6 @@ static void _fbg_loadPref(void) {
             if (d[@"FUBGSceneFake"])    gSceneFake = [d[@"FUBGSceneFake"] boolValue];
             if (d[@"FUBGAudioKeep"])    gAudioKeep = [d[@"FUBGAudioKeep"] boolValue];
             if (d[@"FUBGFloatingBall"]) gShowBall  = [d[@"FUBGFloatingBall"] boolValue];
-            // 微信通知大弹窗
-            if (d[@"WXBigNotif"])       gWXBigNotif = [d[@"WXBigNotif"] boolValue];
-            if (d[@"WXDiag"])           gWXDiag = [d[@"WXDiag"] boolValue];
-            if (d[@"WXNotifDur"]) {
-                double dur = [d[@"WXNotifDur"] doubleValue];
-                if (dur >= 1.0 && dur <= 30.0) gWXNotifDur = dur;
-            }
             id ex = d[@"FUBGExcludeApps"];
             if ([ex isKindOfClass:[NSArray class]]) gExclude = ex;
             // 复用 SIOriginal 黑名单（v1.8.6：兼容字符串格式，原来只认 NSArray 导致黑名单对 FUBG 永远无效）
@@ -846,11 +832,9 @@ static void _fbg_loadPref(void) {
     } @catch (__unused NSException *e) {}
     if (!gExclude) gExclude = @[];
     gLocalOff = [[NSUserDefaults standardUserDefaults] boolForKey:kFBGLocalOff];
-    // v1.8.8：微信自 v1.8.7 起无悬浮球，本地开关失去载体；
-    // 若旧版本误触过球，fubg_local_off=YES 会永久残留导致微信永不保活，强制清零
-    if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
-        gLocalOff = NO;
-    }
+    // v1.8.10：悬浮球全局禁用，本地开关失去载体；
+    // 若旧版本误触过球，fubg_local_off=YES 永久残留导致保活永不生效，全部清零
+    gLocalOff = NO;
 
     NSArray *modes = [[NSBundle mainBundle] infoDictionary][@"UIBackgroundModes"];
     gHasAudioMode = [modes isKindOfClass:[NSArray class]] && [modes containsObject:@"audio"];
@@ -914,718 +898,13 @@ static UIApplicationState _fbg_appState(id self, SEL _cmd) {
     return gOrigAppState ? gOrigAppState(self, _cmd) : UIApplicationStateActive;
 }
 
-// ---- 微信通知大弹窗（v1.9.0） ----
-// 拦截微信通知，用自定义大窗替代系统横幅；配合真后台保活实现后台实时推送
-
-@interface WXNotifBanner : UIView
-@property (nonatomic, copy) NSString *title;
-@property (nonatomic, copy) NSString *body;
-@property (nonatomic, copy) NSString *time;
-@property (nonatomic, strong) UIImage *avatar;
-@property (nonatomic, copy) void (^onTap)(void);
-@property (nonatomic, copy) void (^onDismiss)(void);
-@end
-
-@implementation WXNotifBanner {
-    UIImageView *_avatarView;
-    UILabel *_titleLabel;
-    UILabel *_bodyLabel;
-    UILabel *_timeLabel;
-    UIView *_card;
-    NSTimer *_timer;
-    BOOL _dismissing;
-}
-
-- (instancetype)initWithFrame:(CGRect)frame {
-    self = [super initWithFrame:frame];
-    if (self) {
-        self.backgroundColor = [UIColor clearColor];
-
-        _card = [[UIView alloc] init];
-        _card.backgroundColor = [UIColor colorWithRed:0.12 green:0.12 blue:0.14 alpha:0.92];
-        _card.layer.cornerRadius = 16;
-        _card.layer.shadowColor = [UIColor blackColor].CGColor;
-        _card.layer.shadowOpacity = 0.4;
-        _card.layer.shadowRadius = 12;
-        _card.layer.shadowOffset = CGSizeMake(0, 4);
-        [self addSubview:_card];
-
-        _avatarView = [[UIImageView alloc] init];
-        _avatarView.contentMode = UIViewContentModeScaleAspectFill;
-        _avatarView.clipsToBounds = YES;
-        _avatarView.layer.cornerRadius = 22;
-        _avatarView.backgroundColor = [UIColor colorWithWhite:0.3 alpha:1];
-        [_card addSubview:_avatarView];
-
-        _titleLabel = [[UILabel alloc] init];
-        _titleLabel.font = [UIFont boldSystemFontOfSize:16];
-        _titleLabel.textColor = [UIColor whiteColor];
-        _titleLabel.numberOfLines = 1;
-        [_card addSubview:_titleLabel];
-
-        _bodyLabel = [[UILabel alloc] init];
-        _bodyLabel.font = [UIFont systemFontOfSize:14];
-        _bodyLabel.textColor = [UIColor colorWithWhite:0.85 alpha:1];
-        _bodyLabel.numberOfLines = 3;
-        [_card addSubview:_bodyLabel];
-
-        _timeLabel = [[UILabel alloc] init];
-        _timeLabel.font = [UIFont systemFontOfSize:11];
-        _timeLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1];
-        _timeLabel.textAlignment = NSTextAlignmentRight;
-        [_card addSubview:_timeLabel];
-
-        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(_tapped)];
-        [self addGestureRecognizer:tap];
-
-        UISwipeGestureRecognizer *swipe = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(_swiped)];
-        swipe.direction = UISwipeGestureRecognizerDirectionUp;
-        [self addGestureRecognizer:swipe];
-
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(_panned:)];
-        [self addGestureRecognizer:pan];
-    }
-    return self;
-}
-
-- (void)layoutSubviews {
-    [super layoutSubviews];
-    CGFloat w = self.bounds.size.width;
-    CGFloat cardW = w - 24;
-    _card.frame = CGRectMake(12, 0, cardW, self.bounds.size.height);
-    _avatarView.frame = CGRectMake(14, 14, 44, 44);
-    _titleLabel.frame = CGRectMake(68, 14, cardW - 68 - 60, 20);
-    _timeLabel.frame = CGRectMake(cardW - 60, 14, 50, 20);
-    _bodyLabel.frame = CGRectMake(68, 38, cardW - 80, self.bounds.size.height - 52);
-}
-
-- (void)setTitle:(NSString *)title { _titleLabel.text = title; }
-- (NSString *)title { return _titleLabel.text; }
-- (void)setBody:(NSString *)body { _bodyLabel.text = body; }
-- (NSString *)body { return _bodyLabel.text; }
-- (void)setTime:(NSString *)time { _timeLabel.text = time; }
-- (NSString *)time { return _timeLabel.text; }
-- (void)setAvatar:(UIImage *)avatar {
-    _avatarView.image = avatar;
-    if (!avatar) {
-        _avatarView.image = [WXNotifBanner _defaultAvatar];
-    }
-}
-- (UIImage *)avatar { return _avatarView.image; }
-
-+ (UIImage *)_defaultAvatar {
-    static UIImage *img = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        CGSize s = CGSizeMake(88, 88);
-        UIGraphicsBeginImageContextWithOptions(s, YES, 0);
-        [[UIColor colorWithRed:0.08 green:0.5 blue:0.13 alpha:1] setFill];
-        UIRectFill(CGRectMake(0, 0, s.width, s.height));
-        NSDictionary *attrs = @{ NSFontAttributeName: [UIFont boldSystemFontOfSize:36],
-                                 NSForegroundColorAttributeName: [UIColor whiteColor] };
-        NSString *t = @"微";
-        CGSize ts = [t sizeWithAttributes:attrs];
-        [t drawAtPoint:CGPointMake((s.width - ts.width) / 2, (s.height - ts.height) / 2)
-        withAttributes:attrs];
-        img = UIGraphicsGetImageFromCurrentImageContext();
-        UIGraphicsEndImageContext();
-    });
-    return img;
-}
-
-- (void)_tapped {
-    if (_dismissing) return;
-    [self _dismissAnimated:YES];
-    if (self.onTap) self.onTap();
-}
-
-- (void)_swiped { [self _dismissAnimated:YES]; }
-
-- (void)_panned:(UIPanGestureRecognizer *)pan {
-    CGPoint t = [pan translationInView:self];
-    if (pan.state == UIGestureRecognizerStateChanged) {
-        if (t.y < 0) {
-            self.transform = CGAffineTransformMakeTranslation(0, t.y);
-            self.alpha = 1.0 + t.y / 200.0;
-        }
-    } else if (pan.state == UIGestureRecognizerStateEnded) {
-        if (t.y < -60) {
-            [self _dismissAnimated:YES];
-        } else {
-            [UIView animateWithDuration:0.2 animations:^{
-                self.transform = CGAffineTransformIdentity;
-                self.alpha = 1.0;
-            }];
-        }
-    }
-}
-
-- (void)showInView:(UIView *)container duration:(NSTimeInterval)dur {
-    self.frame = CGRectMake(0, -self.bounds.size.height, container.bounds.size.width, self.bounds.size.height);
-    [container addSubview:self];
-    [UIView animateWithDuration:0.35 delay:0 usingSpringWithDamping:0.8
-          initialSpringVelocity:0.5 options:UIViewAnimationOptionCurveEaseOut animations:^{
-        self.frame = CGRectMake(0, 8, container.bounds.size.width, self.bounds.size.height);
-    } completion:^(BOOL finished) {}];
-    _timer = [NSTimer scheduledTimerWithTimeInterval:dur target:self
-        selector:@selector(_dismissAnimatedTimer) userInfo:nil repeats:NO];
-}
-
-- (void)_dismissAnimatedTimer { [self _dismissAnimated:YES]; }
-
-- (void)_dismissAnimated:(BOOL)animated {
-    if (_dismissing) return;
-    _dismissing = YES;
-    [_timer invalidate]; _timer = nil;
-    void (^anim)(void) = ^{
-        self.frame = CGRectMake(0, -self.bounds.size.height - 20, self.bounds.size.width, self.bounds.size.height);
-        self.alpha = 0;
-    };
-    void (^done)(BOOL) = ^(BOOL f){
-        [self removeFromSuperview];
-        if (self.onDismiss) self.onDismiss();
-    };
-    if (animated) [UIView animateWithDuration:0.3 animations:anim completion:done];
-    else { anim(); done(YES); }
-}
-
-@end
-
 // ---- 通知横幅伪装 ----
 static void (*gOrigWillPresent)(id, SEL, UNUserNotificationCenter *, UNNotification *,
                                 void (^)(UNNotificationPresentationOptions));
 
-// 微信通知大弹窗窗口管理（v1.9.1）
-static UIWindow *gWXNotifWindow = nil;
-static WXNotifBanner *gWXCurrentBanner = nil;
-static NSMutableArray *gWXNotifQueue = nil;
-
-// v1.9.2：微信自定义横幅拦截（微信前台横幅不走 UNNotification，是自定义 UIView）
-static NSTimer *gWXBannerScanTimer = nil;
-static NSMutableSet *gWXSeenBanners = nil;
-static void (*gOrigViewDidMove)(id, SEL);  // v1.9.9：UIView didMoveToWindow 原实现
-static void (*gOrigSetHidden)(id, SEL, BOOL);  // v1.9.17：UIView setHidden: 原实现
-static void (*gOrigSetAlpha)(id, SEL, CGFloat);  // v1.9.18：UIView setAlpha: 原实现
-static void (*gOrigLayoutSubviews)(id, SEL);  // v1.9.19：UIView layoutSubviews 原实现
-static NSTimeInterval gWXLastLayoutCheck = 0;  // v1.9.19：layoutSubviews 检测节流
-static NSMutableDictionary *gWXBannerDedup = nil;  // v1.9.13：内容去重（key=内容，value=时间戳）
-static NSTimeInterval gWXLastBannerTime = 0;       // v1.9.13：上次弹窗时间
-static __weak UIView *gWXTrackedBanner = nil;       // v1.9.16：追踪的横幅 view
-static NSString *gWXTrackedText = nil;              // v1.9.16：上次追踪的文字
-static NSTimer *gWXTrackTimer = nil;                // v1.9.16：内容变化监控定时器
-static int gWXTrackNilCount = 0;                    // v1.9.22：追踪横幅短暂离窗容忍计数
-
-static void _wx_show_banner(NSString *title, NSString *body);  // 前向声明
-static void _wx_checkView(UIView *view, UIWindow *win);          // 前向声明
-static void _wx_checkTrackedBanner(void);                         // 前向声明
-static void _wx_tryDetectBanner(UIView *v);                       // 前向声明
-
-static void _wx_scanCustomBanner(void) {
-    // v1.9.15：定时器扫描已禁用（会误杀聊天列表），保留 didMoveToWindow 事件驱动
-    return;
-    if (!gWXBigNotif) return;
-    if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
-
-    // 遍历所有 window
-    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *win in ((UIWindowScene *)sc).windows) {
-            if (win.hidden || win.alpha < 0.1) continue;
-            for (UIView *sub in win.subviews) {
-                _wx_checkView(sub, win);
-            }
-        }
-    }
-}
-
-// 递归收集 view 及其子视图中的所有 UILabel
-static void _wx_collectLabels(UIView *view, NSMutableArray *out) {
-    for (UIView *v in view.subviews) {
-        if ([v isKindOfClass:[UILabel class]]) {
-            UILabel *l = (UILabel *)v;
-            if (l.text.length > 0) [out addObject:l];
-        }
-        _wx_collectLabels(v, out);
-    }
-}
-
-static void _wx_checkView(UIView *view, UIWindow *win) {
-    if (!view || view.hidden || view.alpha < 0.1) return;
-
-    // 递归检查子视图
-    for (UIView *sub in view.subviews) {
-        _wx_checkView(sub, win);
-    }
-
-    // 转换到 window 坐标系
-    CGRect f = [view convertRect:view.bounds toView:nil];
-    CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
-    // v1.9.8：横幅特征——顶部 15%、高度 50-130、宽度≥200、含文字 label
-    if (f.origin.y > screenH * 0.15) return;
-    if (f.origin.y < -300) return;
-    if (f.size.height < 50 || f.size.height > 140) return;
-    if (f.size.width < 200) return;
-
-    // v1.9.9：必须包含头像 UIImageView（排除导航栏/状态栏等正常 UI）
-    BOOL hasAvatar = NO;
-    for (UIView *sub in view.subviews) {
-        if ([sub isKindOfClass:[UIImageView class]]) { hasAvatar = YES; break; }
-    }
-    if (!hasAvatar) return;
-
-    // 递归收集所有 UILabel
-    NSMutableArray *labels = [NSMutableArray array];
-    _wx_collectLabels(view, labels);
-
-    if (labels.count < 1) return;
-
-    // 去重：用 view 指针地址
-    NSValue *key = [NSValue valueWithNonretainedObject:view];
-    if (!gWXSeenBanners) gWXSeenBanners = [NSMutableSet set];
-    if ([gWXSeenBanners containsObject:key]) return;
-    [gWXSeenBanners addObject:key];
-
-    // 提取文字：按 y 坐标排序，前两个非空 label
-    NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
-        return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
-    }];
-    NSString *title = @"";
-    NSString *body = @"";
-    for (UILabel *l in sorted) {
-        if (!title.length) title = l.text;
-        else if (!body.length) { body = l.text; break; }
-    }
-    if (!title.length && !body.length) return;
-
-    NSLog(@"[WXNotif] banner found: class=%@ frame=%@ labels=%lu \"%@\" - \"%@\"",
-          NSStringFromClass([view class]), NSStringFromCGRect(f), (unsigned long)labels.count, title, body);
-
-    // v1.9.8：强制隐藏微信横幅（hidden + alpha 双保险）
-    view.hidden = YES;
-    view.alpha = 0;
-
-    // 弹我们的大窗
-    _wx_show_banner(title.length ? title : @"微信", body);
-}
-
-// ===== v1.9.22：精确化横幅识别（消除输入框误报 + 修复后期失效）=====
-
-// 类名（沿父类链）是否为微信 in-app 通知横幅，覆盖不同微信版本命名
-static BOOL _wx_classNameIsBanner(Class cls) {
-    Class c = cls;
-    while (c && c != [NSObject class]) {
-        NSString *l = [NSStringFromClass(c) lowercaseString];
-        if ([l containsString:@"inappnotification"] ||
-            [l containsString:@"inappmsg"] ||
-            [l containsString:@"notificationbanner"] ||
-            [l containsString:@"messagebanner"] ||
-            ([l containsString:@"mainframe"] && [l containsString:@"notification"])) {
-            return YES;
-        }
-        c = class_getSuperclass(c);
-    }
-    return NO;
-}
-
-// 子树（限层）是否含输入控件——真实消息横幅内部绝不会有输入框（点输入框误报根源）
-static BOOL _wx_subtreeContainsInput(UIView *v, int depth) {
-    if (!v || depth < 0) return NO;
-    if ([v isKindOfClass:[UITextField class]] ||
-        [v isKindOfClass:[UITextView class]] ||
-        [v isKindOfClass:[UISearchBar class]]) return YES;
-    if (depth == 0) return NO;
-    for (UIView *s in v.subviews) {
-        if (_wx_subtreeContainsInput(s, depth - 1)) return YES;
-    }
-    return NO;
-}
-
-// 限层收集文字 label 与头像
-static void _wx_walkCollect(UIView *node, int depth, NSMutableArray *labels, BOOL *hasAvatar) {
-    for (UIView *sub in node.subviews) {
-        if ([sub isKindOfClass:[UIImageView class]]) *hasAvatar = YES;
-        if ([sub isKindOfClass:[UILabel class]]) {
-            UILabel *l = (UILabel *)sub;
-            if (l.text.length > 0) [labels addObject:l];
-        }
-        if (depth > 0) _wx_walkCollect(sub, depth - 1, labels, hasAvatar);
-    }
-}
-
-// 从 labels 取标题/正文（按 y 排序前两个）
-static void _wx_pickTitleBody(NSArray *labels, NSString **title, NSString **body) {
-    NSArray *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
-        return a.frame.origin.y < b.frame.origin.y ? NSOrderedAscending : NSOrderedDescending;
-    }];
-    NSString *t = @"";
-    NSString *b = @"";
-    for (UILabel *l in sorted) {
-        if (!t.length) t = l.text;
-        else if (!b.length) { b = l.text; break; }
-    }
-    *title = t; *body = b;
-}
-
-// 统一出口：同内容 8 秒去重（吸收同一条横幅的 add/alpha/hidden 连续触发与系统提示刷屏），
-// 不再用全局时间节流，避免连发不同消息被误吞
-static void _wx_emitBanner(NSString *title, NSString *body) {
-    if (!title.length && !body.length) return;
-    NSString *key = [NSString stringWithFormat:@"%@|%@", title ?: @"", body ?: @""];
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (!gWXBannerDedup) gWXBannerDedup = [NSMutableDictionary dictionary];
-    NSNumber *last = gWXBannerDedup[key];
-    if (last && now - [last doubleValue] < 8.0) return;
-    gWXBannerDedup[key] = @(now);
-    // 顺带清理过期键，防止字典无限膨胀
-    if (gWXBannerDedup.count > 60) {
-        NSMutableArray *oldKeys = [NSMutableArray array];
-        for (NSString *k in gWXBannerDedup)
-            if (now - [gWXBannerDedup[k] doubleValue] > 30) [oldKeys addObject:k];
-        [gWXBannerDedup removeObjectsForKeys:oldKeys];
-    }
-    NSLog(@"[WXNotif] EMIT banner \"%@\" - \"%@\"", title, body);
-    _wx_show_banner(title.length ? title : @"微信", body);
-}
-
-// 横幅检测核心（供 didMoveToWindow/setHidden:/setAlpha: 共用）
-// v1.9.22：微信进程内无条件运行；类名白名单直通，几何路径严格排除输入框/导航栏/键盘
-static void _wx_tryDetectBanner(UIView *v) {
-    if (!v || !v.window || v.hidden || v.alpha < 0.05) return;
-
-    // ===== v1.9.24：屏幕自诊断模式（无 Mac 时用）=====
-    // 放宽一切尺寸，只保留输入框/键盘/导航/列表排除，把候选 view 的真实类名直接弹出来。
-    // 用户让真实消息进来，截图含类名的弹窗即可，无需 Console。
-    if (gWXDiag && [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
-        UIWindow *dw = v.window;
-        if (dw.windowLevel > UIWindowLevelNormal + 1.0) return;
-        CGRect df = [v convertRect:v.bounds toView:nil];
-        if (df.origin.y > 160 || df.origin.y < -20) return;
-        if (df.size.height < 28 || df.size.height > 170) return;
-        if (df.size.width < 80) return;
-
-        UIView *dp = v.superview;
-        BOOL bad = NO;
-        while (dp) {
-            if ([dp isKindOfClass:[UINavigationBar class]] ||
-                [dp isKindOfClass:[UITabBar class]] ||
-                [dp isKindOfClass:[UIToolbar class]] ||
-                [dp isKindOfClass:[UIScrollView class]]) { bad = YES; break; }
-            NSString *dcn = [NSStringFromClass([dp class]) lowercaseString];
-            if ([dcn containsString:@"inputset"] || [dcn containsString:@"keyboard"]) { bad = YES; break; }
-            dp = dp.superview;
-        }
-        if (bad || _wx_subtreeContainsInput(v, 4)) return;
-
-        NSMutableArray *dl = [NSMutableArray array];
-        BOOL dav = NO;
-        _wx_walkCollect(v, 3, dl, &dav);
-        if (dl.count < 1) return;
-        NSString *dt, *db;
-        _wx_pickTitleBody(dl, &dt, &db);
-        if (!dt.length && !db.length) return;
-
-        // 3 秒去重，避免同一次动画 alpha/hidden/add 连弹
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        NSString *dkey = [NSString stringWithFormat:@"%@|%@|%@",
-                          NSStringFromClass([v class]), dt, db];
-        if (![dkey isEqualToString:gWXDiagLastKey] || now - gWXDiagLast > 3.0) {
-            gWXDiagLastKey = dkey;
-            gWXDiagLast = now;
-            NSString *diagTitle = [NSString stringWithFormat:@"🔍%@", NSStringFromClass([v class])];
-            _wx_show_banner(diagTitle, [NSString stringWithFormat:@"%@ %@",
-                                        dt.length ? dt : @"", db.length ? db : @""]);
-        }
-        return;  // 诊断模式下不执行正式识别
-    }
-
-    UIWindow *win = v.window;
-    // 只接受普通层级 window，排除键盘 window（键盘 windowLevel=UIWindowLevelStatusBar）
-    if (win.windowLevel > UIWindowLevelNormal + 1.0) return;
-
-    BOOL nameMatch = _wx_classNameIsBanner([v class]);
-    CGRect f = [v convertRect:v.bounds toView:nil];
-
-    if (!nameMatch) {
-        // —— 几何兜底路径（v1.9.23：放宽尺寸/层级，防误报靠输入框与导航栏排除）——
-        // 微信前台横幅固定从顶部状态栏下方滑入，y 必在顶部 ~150pt 内
-        if (f.origin.y > 150) return;
-        if (f.origin.y < -20) return;
-        if (f.size.height < 36 || f.size.height > 150) return;
-        if (f.size.width < 120) return;
-
-        // 排除导航/标签/搜索/工具栏祖先，以及键盘/导航类簇
-        UIView *p = v.superview;
-        while (p) {
-            if ([p isKindOfClass:[UINavigationBar class]] ||
-                [p isKindOfClass:[UITabBar class]] ||
-                [p isKindOfClass:[UISearchBar class]] ||
-                [p isKindOfClass:[UIToolbar class]]) return;
-            if ([p isKindOfClass:[UIScrollView class]]) return;
-            NSString *cn = [NSStringFromClass([p class]) lowercaseString];
-            if ([cn containsString:@"inputset"] ||
-                [cn containsString:@"keyboard"] ||
-                [cn containsString:@"navigationbar"]) return;
-            p = p.superview;
-        }
-        // 排除含输入框的子树（点输入框误报根源）
-        if (_wx_subtreeContainsInput(v, 4)) return;
-    }
-
-    NSMutableArray *labels = [NSMutableArray array];
-    BOOL hasAvatar = NO;
-    _wx_walkCollect(v, 3, labels, &hasAvatar);
-    if (labels.count < 1) return;
-    if (!nameMatch && !hasAvatar) return;  // 几何路径必须含头像；类名路径信任
-
-    NSString *title, *body;
-    _wx_pickTitleBody(labels, &title, &body);
-    if (!title.length && !body.length) return;
-
-    // 追踪 + 内容变化监控（唯一低频引擎）
-    gWXTrackedBanner = v;
-    gWXTrackedText = [NSString stringWithFormat:@"%@|%@", title, body];
-    gWXTrackNilCount = 0;
-    if (!gWXTrackTimer) {
-        gWXTrackTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES
-            block:^(NSTimer *t){ _wx_checkTrackedBanner(); }];
-        [[NSRunLoop mainRunLoop] addTimer:gWXTrackTimer forMode:NSRunLoopCommonModes];
-    }
-
-    NSLog(@"[WXNotif] banner detected (%@): class=%@ frame=%@ \"%@\" - \"%@\"",
-          nameMatch ? @"name" : @"geo",
-          NSStringFromClass([v class]), NSStringFromCGRect(f), title, body);
-
-    _wx_emitBanner(title, body);
-}
-
-// v1.9.22：类名白名单浅扫描兜底（只看 keyWindow 三层，按类名，零误报），
-// 事件 hook 漏掉（单例复用/无显隐变化）时由此捞回
-static void _wx_scanNamedBanner(void) {
-    if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
-    UIWindow *kw = nil;
-    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in ((UIWindowScene *)sc).windows) {
-            if (w.isKeyWindow && w.windowLevel == UIWindowLevelNormal) { kw = w; break; }
-        }
-        if (kw) break;
-    }
-    if (!kw) return;
-
-    NSArray *cur = kw.subviews;
-    for (int lvl = 0; lvl < 3 && cur.count; lvl++) {
-        NSMutableArray *next = [NSMutableArray array];
-        for (UIView *v in cur) {
-            if (_wx_classNameIsBanner([v class]) && !v.hidden && v.alpha > 0.05 && v.window) {
-                NSMutableArray *labels = [NSMutableArray array];
-                BOOL av = NO;
-                _wx_walkCollect(v, 2, labels, &av);
-                NSString *title, *body;
-                _wx_pickTitleBody(labels, &title, &body);
-                if (title.length || body.length) {
-                    gWXTrackedBanner = v;
-                    gWXTrackedText = [NSString stringWithFormat:@"%@|%@", title, body];
-                    _wx_emitBanner(title, body);
-                }
-            }
-            [next addObjectsFromArray:v.subviews];
-        }
-        cur = next;
-    }
-}
-
-// v1.9.9：事件驱动——UIView 被加到 window 时检查是否是微信横幅
-static void _wx_viewDidMoveToWindow(id self, SEL _cmd) {
-    if (gOrigViewDidMove) gOrigViewDidMove(self, _cmd);
-
-    // v1.9.20：去掉 gWXBigNotif 检查，微信进程内无条件运行
-    if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
-
-    UIView *view = (UIView *)self;
-    if (!view.window) return;
-
-    __weak UIView *weakView = view;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        _wx_tryDetectBanner(weakView);
-    });
-}
-
-// v1.9.17：hook setHidden:——横幅从隐藏变显示时触发检测
-static void _wx_setHidden(id self, SEL _cmd, BOOL hidden) {
-    if (gOrigSetHidden) gOrigSetHidden(self, _cmd, hidden);
-
-    if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
-    if (hidden) return;  // 只处理从隐藏变显示
-
-    UIView *view = (UIView *)self;
-    __weak UIView *weakView = view;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        _wx_tryDetectBanner(weakView);
-    });
-}
-
-// v1.9.18：hook setAlpha:——微信可能用 alpha 控制显隐
-static void _wx_setAlpha(id self, SEL _cmd, CGFloat alpha) {
-    if (gOrigSetAlpha) gOrigSetAlpha(self, _cmd, alpha);
-
-    if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
-    if (alpha <= 0.01) return;  // 只处理变可见
-
-    UIView *view = (UIView *)self;
-    __weak UIView *weakView = view;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        _wx_tryDetectBanner(weakView);
-    });
-}
-
-// v1.9.21：移除 layoutSubviews hook（高频调用导致闪退），保留三个事件驱动 hook
-
-// v1.9.22：监控追踪横幅的内容变化（微信复用同一 view 更新文字），并容忍短暂离窗
-static void _wx_checkTrackedBanner(void) {
-    if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) return;
-
-    // 每 tick 都跑一次类名白名单浅扫描兜底（事件漏掉时捞回）
-    _wx_scanNamedBanner();
-
-    UIView *v = gWXTrackedBanner;
-    if (!v) return;
-    if (!v.window || v.hidden || v.alpha < 0.05) {
-        // 横幅动画过程中可能短暂离窗，连续约 2 秒（4 次）才放弃追踪，避免断链漏消息
-        if (++gWXTrackNilCount >= 4) {
-            gWXTrackedBanner = nil;
-            gWXTrackedText = nil;
-            gWXTrackNilCount = 0;
-        }
-        return;
-    }
-    gWXTrackNilCount = 0;
-
-    NSMutableArray *labels = [NSMutableArray array];
-    BOOL av = NO;
-    _wx_walkCollect(v, 2, labels, &av);
-    if (labels.count < 1) return;
-
-    NSString *title, *body;
-    _wx_pickTitleBody(labels, &title, &body);
-
-    NSString *curText = [NSString stringWithFormat:@"%@|%@", title, body];
-    if ([curText isEqualToString:gWXTrackedText]) return;  // 内容没变
-    gWXTrackedText = curText;
-
-    NSLog(@"[WXNotif] tracked banner changed: \"%@\" - \"%@\"", title, body);
-    _wx_emitBanner(title, body);
-}
-
-// 获取当前活跃的 UIWindowScene（v1.9.1：修复无 scene 导致窗口间歇性不显示）
-static UIWindowScene *_wx_activeScene(void) {
-    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-        if (sc.activationState == UISceneActivationStateForegroundActive &&
-            [sc isKindOfClass:[UIWindowScene class]]) {
-            return (UIWindowScene *)sc;
-        }
-    }
-    // 退而求其次：取第一个 window scene
-    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-        if ([sc isKindOfClass:[UIWindowScene class]]) return (UIWindowScene *)sc;
-    }
-    return nil;
-}
-
-static UIWindow *_wx_notif_window(void) {
-    if (!gWXNotifWindow) {
-        gWXNotifWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        gWXNotifWindow.windowLevel = UIWindowLevelStatusBar + 100;
-        gWXNotifWindow.backgroundColor = [UIColor clearColor];
-        gWXNotifWindow.userInteractionEnabled = YES;
-        gWXNotifWindow.hidden = NO;
-    }
-    // v1.9.1：每次显示前确保绑定到活跃 scene（多 App 并发时 scene 可能变化）
-    UIWindowScene *sc = _wx_activeScene();
-    if (sc && gWXNotifWindow.windowScene != sc) {
-        gWXNotifWindow.windowScene = sc;
-    }
-    gWXNotifWindow.hidden = NO;
-    return gWXNotifWindow;
-}
-
-static UIWindow *_wx_key_window(void) {
-    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in ((UIWindowScene *)sc).windows) {
-            if (w.isKeyWindow) return w;
-        }
-    }
-    return nil;
-}
-
-static void _wx_show_banner(NSString *title, NSString *body) {
-    if (!title.length && !body.length) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        // v1.9.6：直接加到 keyWindow，不用独立全屏 UIWindow（避免拦截触摸导致微信卡死）
-        UIWindow *win = _wx_key_window();
-        if (!win) return;
-        CGFloat w = win.bounds.size.width;
-        CGFloat bodyH = [body boundingRectWithSize:CGSizeMake(w - 104, CGFLOAT_MAX)
-            options:NSStringDrawingUsesLineFragmentOrigin
-            attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:14]} context:nil].size.height;
-        CGFloat h = MAX(72, 38 + MIN(bodyH, 60) + 14);
-
-        WXNotifBanner *banner = [[WXNotifBanner alloc] initWithFrame:CGRectMake(0, 0, w, h)];
-        banner.title = title.length ? title : @"微信";
-        banner.body = body;
-        banner.avatar = nil;
-
-        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-        fmt.dateFormat = @"HH:mm";
-        banner.time = [fmt stringFromDate:[NSDate date]];
-
-        __weak WXNotifBanner *weakBanner = banner;
-        banner.onTap = ^{
-            NSURL *url = [NSURL URLWithString:@"weixin://"];
-            if ([[UIApplication sharedApplication] canOpenURL:url]) {
-                [[UIApplication sharedApplication] openURL:url];
-            }
-        };
-        banner.onDismiss = ^{
-            if (gWXCurrentBanner == weakBanner) {
-                gWXCurrentBanner = nil;
-                if (gWXNotifQueue.count > 0) {
-                    WXNotifBanner *next = gWXNotifQueue.firstObject;
-                    [gWXNotifQueue removeObjectAtIndex:0];
-                    gWXCurrentBanner = next;
-                    [next showInView:[weakBanner superview] ?: _wx_key_window() duration:gWXNotifDur];
-                }
-            }
-        };
-
-        if (gWXCurrentBanner) {
-            if (!gWXNotifQueue) gWXNotifQueue = [NSMutableArray array];
-            [gWXNotifQueue addObject:banner];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [gWXNotifQueue removeObject:banner];
-            });
-        } else {
-            gWXCurrentBanner = banner;
-            [banner showInView:win duration:gWXNotifDur];
-        }
-    });
-}
-
 static void _fbg_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center,
                              UNNotification *note,
                              void (^handler)(UNNotificationPresentationOptions)) {
-    // v1.9.15：恢复 gWXBigNotif 配置检查
-    if (gWXBigNotif && [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
-        UNNotificationContent *c = note.request.content;
-        NSString *title = c.title.length ? c.title : (c.subtitle.length ? c.subtitle : @"微信");
-        NSString *body = c.body;
-        NSLog(@"[WXNotif] willPresent fired: title=%@ body=%@", title, body);
-        _wx_show_banner(title, body);
-        // 抑制系统横幅，但保留声音和角标
-        handler(UNNotificationPresentationOptionSound | UNNotificationPresentationOptionBadge);
-        return;
-    }
-
     if (gUseScene && gPhysBg) {
         handler(UNNotificationPresentationOptionBanner |
                 UNNotificationPresentationOptionSound |
@@ -1637,102 +916,19 @@ static void _fbg_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center
 
 static void (*gOrigUNSetDelegate)(id, SEL, id);
 
-// v1.9.1 前向声明
-static void _fbg_installRemoteNotifHook(void);
-static void _fbg_installNotifHooks(void);
-
-// v1.9.1：统一的 delegate hook 逻辑，供 setDelegate 和初始化时主动调用
-static void _fbg_hookNotifDelegate(id<UNUserNotificationCenterDelegate> delegate) {
-    if (!delegate) return;
-    Class dc = [delegate class];
-    SEL sel = @selector(userNotificationCenter:willPresentNotification:withCompletionHandler:);
-    Method m = class_getInstanceMethod(dc, sel);
-    if (m) {
-        IMP cur = method_getImplementation(m);
-        if (cur != (IMP)_fbg_willPresent) {
-            gOrigWillPresent = (void *)cur;
-            method_setImplementation(m, (IMP)_fbg_willPresent);
-            NSLog(@"[FUBG] hooked willPresentNotification on %@", NSStringFromClass(dc));
-        }
-    }
-}
-
 static void _fbg_unSetDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDelegate> delegate) {
     if (gOrigUNSetDelegate) gOrigUNSetDelegate(self, _cmd, delegate);
-    _fbg_hookNotifDelegate(delegate);
-}
-
-static void _fbg_installNotifHooks(void) {
-    Class unClass = [UNUserNotificationCenter class];
-    Method delM = class_getInstanceMethod(unClass, @selector(setDelegate:));
-    if (delM) {
-        gOrigUNSetDelegate = (void (*)(id, SEL, id))method_getImplementation(delM);
-        method_setImplementation(delM, (IMP)_fbg_unSetDelegate);
-    }
-
-    // 主动 hook 当前已设置的 delegate（修复竞态：微信可能在我们 swizzle 前就设好了 delegate）
-    UNUserNotificationCenter *unc = [UNUserNotificationCenter currentNotificationCenter];
-    if (unc.delegate) {
-        _fbg_hookNotifDelegate(unc.delegate);
-        NSLog(@"[FUBG] proactively hooked existing notif delegate");
-    }
-    // 延迟重试：有些 App 会在启动后期才设 delegate
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        UNUserNotificationCenter *c = [UNUserNotificationCenter currentNotificationCenter];
-        if (c.delegate) _fbg_hookNotifDelegate(c.delegate);
-    });
-
-    // hook 后台远程推送（willPresent 在后台不触发，需要从这里兜底）
-    _fbg_installRemoteNotifHook();
-
-    // v1.9.9：hook UIView didMoveToWindow，事件驱动拦截微信横幅（不依赖 UILabel）
-    if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
-        Class uv = [UIView class];
-        SEL dmSel = @selector(didMoveToWindow);
-        Method dm = class_getInstanceMethod(uv, dmSel);
-        if (dm) {
-            IMP cur = method_getImplementation(dm);
-            if (cur != (IMP)_wx_viewDidMoveToWindow) {
-                gOrigViewDidMove = (void *)cur;
-                method_setImplementation(dm, (IMP)_wx_viewDidMoveToWindow);
+    if (delegate) {
+        Class dc = [delegate class];
+        SEL sel = @selector(userNotificationCenter:willPresentNotification:withCompletionHandler:);
+        Method m = class_getInstanceMethod(dc, sel);
+        if (m) {
+            IMP cur = method_getImplementation(m);
+            if (cur != (IMP)_fbg_willPresent) {
+                gOrigWillPresent = (void *)cur;
+                method_setImplementation(m, (IMP)_fbg_willPresent);
             }
         }
-        // v1.9.17：hook setHidden:，横幅从隐藏变显示时也触发检测
-        SEL shSel = @selector(setHidden:);
-        Method sh = class_getInstanceMethod(uv, shSel);
-        if (sh) {
-            IMP cur2 = method_getImplementation(sh);
-            if (cur2 != (IMP)_wx_setHidden) {
-                gOrigSetHidden = (void *)cur2;
-                method_setImplementation(sh, (IMP)_wx_setHidden);
-            }
-        }
-        // v1.9.18：hook setAlpha:，微信可能用 alpha 控制显隐
-        SEL saSel = @selector(setAlpha:);
-        Method sa = class_getInstanceMethod(uv, saSel);
-        if (sa) {
-            IMP cur3 = method_getImplementation(sa);
-            if (cur3 != (IMP)_wx_setAlpha) {
-                gOrigSetAlpha = (void *)cur3;
-                method_setImplementation(sa, (IMP)_wx_setAlpha);
-            }
-        }
-        // v1.9.21：移除 layoutSubviews hook
-        NSLog(@"[WXNotif] hooked didMoveToWindow + setHidden: + setAlpha:");
-    }
-
-    // v1.9.22：微信启动即无条件启动统一低频引擎（内容追踪 + 类名白名单浅扫描兜底），
-    // 不再依赖「先检测到横幅」才启动，消除冷启动死锁导致的后期失效
-    if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (!gWXTrackTimer) {
-                gWXTrackTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES
-                    block:^(NSTimer *t){ _wx_checkTrackedBanner(); }];
-                [[NSRunLoop mainRunLoop] addTimer:gWXTrackTimer forMode:NSRunLoopCommonModes];
-                NSLog(@"[WXNotif] unified track/scan engine started");
-            }
-        });
     }
 }
 
@@ -1753,72 +949,13 @@ static void _fbg_installSceneHooks(void) {
         gOrigAppState = (UIApplicationState (*)(id, SEL))method_getImplementation(stateM);
         method_setImplementation(stateM, (IMP)_fbg_appState);
     }
-}
 
-#pragma mark - 后台远程推送 hook（v1.9.1）
-
-static void (*gOrigDidReceiveRemote)(id, SEL, UIApplication *, NSDictionary *, void (^)(UIBackgroundFetchResult));
-
-static void _fbg_didReceiveRemote(id self, SEL _cmd, UIApplication *app,
-                                   NSDictionary *userInfo,
-                                   void (^handler)(UIBackgroundFetchResult)) {
-    // v1.9.15：恢复 gWXBigNotif 配置检查
-    if (gWXBigNotif && [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"]) {
-        NSDictionary *aps = userInfo[@"aps"];
-        if ([aps isKindOfClass:[NSDictionary class]]) {
-            id alert = aps[@"alert"];
-            NSString *title = nil, *body = nil;
-            if ([alert isKindOfClass:[NSDictionary class]]) {
-                title = alert[@"title"];
-                body = alert[@"body"];
-            } else if ([alert isKindOfClass:[NSString class]]) {
-                body = alert;
-            }
-            if (title.length || body.length) {
-                _wx_show_banner(title.length ? title : @"微信", body);
-            }
-        }
+    Class unClass = [UNUserNotificationCenter class];
+    Method delM = class_getInstanceMethod(unClass, @selector(setDelegate:));
+    if (delM) {
+        gOrigUNSetDelegate = (void (*)(id, SEL, id))method_getImplementation(delM);
+        method_setImplementation(delM, (IMP)_fbg_unSetDelegate);
     }
-    if (gOrigDidReceiveRemote) {
-        gOrigDidReceiveRemote(self, _cmd, app, userInfo, handler);
-    } else if (handler) {
-        handler(UIBackgroundFetchResultNoData);
-    }
-}
-
-static void _fbg_installRemoteNotifHook(void) {
-    // 微信的 AppDelegate 可能不实现 didReceiveRemoteNotification，需要动态添加
-    // 先尝试 hook UIApplication 的 delegate 方法
-    Class appClass = [UIApplication class];
-    SEL sel = @selector(application:didReceiveRemoteNotification:fetchCompletionHandler:);
-    Method m = class_getInstanceMethod(appClass, sel);
-    // 这个方法实际在 delegate 上，不在 UIApplication 上
-    // 我们通过 method exchange 在 AppDelegate 上添加
-    // 由于无法预知 delegate 类名，采用另一种方式：hook UIApplication sendAction 或直接监听
-    // 更可靠的方式：hook UIApplicationDelegate 协议方法的实现
-    // 这里使用 +load 时机太晚，改用动态方式：遍历 window 的 delegate
-
-    // 方案：hook UIApplication 的 _setDelegate: 或在 delegate 设置时拦截
-    // 简化方案：直接 hook AppDelegate 的方法（通过 class_getInstanceMethod on delegate class）
-    dispatch_async(dispatch_get_main_queue(), ^{
-        id<UIApplicationDelegate> del = [UIApplication sharedApplication].delegate;
-        if (del) {
-            Class dc = [del class];
-            Method rm = class_getInstanceMethod(dc, sel);
-            if (rm) {
-                IMP cur = method_getImplementation(rm);
-                if (cur != (IMP)_fbg_didReceiveRemote) {
-                    gOrigDidReceiveRemote = (void *)cur;
-                    method_setImplementation(rm, (IMP)_fbg_didReceiveRemote);
-                    NSLog(@"[FUBG] hooked didReceiveRemoteNotification on %@", NSStringFromClass(dc));
-                }
-            } else {
-                // delegate 没实现这个方法，动态添加
-                class_addMethod(dc, sel, (IMP)_fbg_didReceiveRemote, "v@:@@?");
-                NSLog(@"[FUBG] added didReceiveRemoteNotification to %@", NSStringFromClass(dc));
-            }
-        }
-    });
 }
 
 #pragma mark - 引擎二：音频断言
@@ -2221,9 +1358,7 @@ static void _fbg_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n,
     _fbg_loadPref();
     NSLog(@"[FUBG] prefs reloaded: active=%d scene=%d audio=%d ball=%d",
           gActive, gUseScene, gUseAudio, gShowBall);
-    // 微信里永不实例化悬浮窗（v1.8.7）
-    BOOL _wc = [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.tencent.xin"];
-    if (!_wc) [[FBGFloatingWindow shared] refreshState];
+    // v1.8.10：悬浮球全局禁用，无需刷新
     if (!gUseAudio && gPhysBg) _fbg_stopAudio(NO);
     if (gUseAudio && gPhysBg && (!gPlayer || !gPlayer.isPlaying)) _fbg_startAudio();
 }
@@ -2233,15 +1368,10 @@ static void _fbg_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n,
 __attribute__((constructor))
 static void FUBGEntry(void) {
     @autoreleasepool {
-        // v1.8.7：微信恢复保活（场景伪装+音频断言），但永不创建悬浮球。
-        // 悬浮球是常驻全屏透明 UIWindow（alert+1 层级），会抢占状态栏外观控制权，
-        // 是预览页工具栏唤不出的直接元凶。场景伪装/音频断言只在后台活跃，不影响前台 UI。
-        NSString *_bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-        BOOL _isWC = [_bid isEqualToString:@"com.tencent.xin"];
+        // v1.8.10：全 App 通用保活（场景伪装+音频断言），悬浮球全局禁用。
+        // 悬浮球是常驻全屏透明 UIWindow（alert+1 层级），会拦截触摸/抢占状态栏。
+        // 场景伪装/音频断言只在后台活跃，不影响前台 UI。
         _fbg_loadPref();
-
-        // v1.9.1：通知 hook 同步安装（修复竞态：dispatch_async 可能晚于微信设置 delegate）
-        _fbg_installNotifHooks();
 
         // hook 一次性安装，内部按全局开关决定行为
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -2279,7 +1409,7 @@ static void FUBGEntry(void) {
                                                               block:^(NSTimer *t){ _fbg_watchdogFire(t); }];
                 [[NSRunLoop mainRunLoop] addTimer:gWatchdog forMode:NSRunLoopCommonModes];
             }
-            if (gShowBall && !_isWC) [[FBGFloatingWindow shared] attachWhenSceneReady];   // 微信不装悬浮球
+            // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
         });
 
         NSLog(@"[FUBG] v2.0.0 loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
