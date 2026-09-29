@@ -1414,9 +1414,8 @@ static void FUBGEntry(void) {
 
         NSLog(@"[FUBG] v2.0.0 loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
-              gActive, gUseScene, gUseAudio, (gShowBall && !_isWC), gHasAudioMode,
-              _isWC ? @" (WeChat: ball disabled)" :
-              ((gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)"));
+              gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
+              (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)"));
     }
 }
 
