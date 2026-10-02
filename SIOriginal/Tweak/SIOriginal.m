@@ -58,6 +58,25 @@
 //     优先级：硬保护 > App 覆盖 > 全局配置。
 // =========================================================================
 //
+// ==================== v1.8.15 顺丰同城骑士 11.5.0 针对性 hook ====================
+// 依据：拆包 Knight.app 11.5.0（com.sfic.knight，arm64 已解密，10947 个 ObjC 类）
+// 得到的证据表，见文件末尾「拆包证据」注释。落地两件事：
+//
+// [真 bug] 修掉 CAAnimation ↔ CALayer 的残留双重缩放。
+//   sio_CAAnim_setDuration 会缩放一次，sio_layer_addAnim 兜底又会缩放一次：
+//   App 只要「先 setDuration 再 addAnimation」（标准写法）就被连缩两次，
+//   实际倍率是 speed²（×5 变 ×25），并频繁撞上 0.01s 下限。
+//   本 App 的高德地图相机动画（MAMapKeyFrameAnimation，CAKeyframeAnimation 子类）
+//   与 NXDesign 的 addAnimation:forKey: 路径都吃这个 bug。
+//   修法：用关联对象给动画打「已处理」标记，两个入口谁先处理谁打标，另一个跳过。
+//
+// [新覆盖] UIScrollView setZoomScale:animated: / zoomToRect:animated:
+//   拆包证实 App 侧（NXDesign.framework）确实在用这两个入口，而此前完全没接管。
+//   实现要点：只用 CATransaction 覆写时长，绝不把 animated:YES 改成 NO
+//   （v1.8.3/v1.8.4 微信预览故障的根因就是改写 animated 语义 + 禁用事务动作）。
+//   默认关闭（ZoomAccel=0），因为这一族在微信上出过"预览页卡死"，需要实测再开。
+// =========================================================================
+//
 // ============================ v1.8.13 优化加强 ============================
 // [加强] 补齐老式 UIView 动画 API 的时长/延迟接管：
 //   +[UIView setAnimationDuration:] 与 +[UIView setAnimationDelay:]
@@ -94,6 +113,7 @@ static double   gSlowFactor = 2.0;   // 慢放倍率（时长 × 因子）
 static BOOL     gSpring    = YES;    // CASpring 参数缩放
 static BOOL     gExtra     = YES;    // 导航/模态进阶转场
 static BOOL     gListAccel = NO;     // TV/CV 列表全家桶（v1.8.11 起纯开关控制，默认关）
+static BOOL     gZoomAccel = NO;     // v1.8.15：UIScrollView 缩放动画（setZoomScale:animated: 等），默认关
 static BOOL     gIsWeChat  = NO;     // 微信缩放预览守卫用（L104）
 // v1.8.12：黑名单在重载时一次性解析成本进程布尔值，热路径零分配（见 SIO_reload）
 static BOOL     gSelfBlacklisted = NO;
@@ -111,6 +131,25 @@ static inline void SIO_setPAInit(BOOL v)    { pthread_setspecific(gInPAInitKey, 
 // 万一 orig 为空，直接放弃本次拦截，绝不对空指针发消息。
 #define SIO_REQUIRE_ORIG(imp)      do { if (__builtin_expect((imp) == NULL, 0)) return; } while (0)
 #define SIO_REQUIRE_ORIG_NIL(imp)  do { if (__builtin_expect((imp) == NULL, 0)) return nil; } while (0)
+
+// ---------- v1.8.15：CAAnimation 时长缩放幂等标记 ----------
+// 两个入口都会缩放时长：CAAnimation 的 setDuration: 属性 setter，以及
+// CALayer 的 addAnimation:forKey: 兜底。App 标准写法「先设 duration 再 add」
+// 会让两个入口都跑一遍 → 连缩两次（×speed²），并容易撞 0.01s 下限。
+// 用关联对象打标：谁先处理谁打标，另一个看到标记就跳过。
+// 注意：显式 setDuration: 不受标记限制 —— 那是 App 的新意图，必须按新值重新缩放。
+static const void *kSIOScaledMark = &kSIOScaledMark;
+
+static inline BOOL SIO_animScaled(id anim) {
+    return anim != nil && objc_getAssociatedObject(anim, kSIOScaledMark) != nil;
+}
+static inline void SIO_markAnimScaled(id anim) {
+    if (!anim) return;
+    // 用 CFBoolean 常量避免每次分配 NSNumber
+    objc_setAssociatedObject(anim, kSIOScaledMark,
+                             (__bridge id)kCFBooleanTrue,
+                             OBJC_ASSOCIATION_ASSIGN);
+}
 
 static inline double SIO_targetDuration(double orig) {
     if (!gEnabled) return orig;
@@ -213,6 +252,8 @@ static void SIO_reload(void) {
     // 手工编辑过的、被其他工具覆盖过的），原来会静默打开 24 个列表 hook，
     // 在重列表 App 上直接破坏列表状态机——危险功能必须 fail-safe。
     gListAccel = d[@"ListAccel"] ? [d[@"ListAccel"] boolValue] : NO;
+    // v1.8.15：缩放动画加速，缺键默认 NO（同一族在微信上出过「预览页卡死」，必须显式开）
+    gZoomAccel = d[@"ZoomAccel"] ? [d[@"ZoomAccel"] boolValue] : NO;
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     gSelfBlacklisted = NO;
@@ -254,6 +295,7 @@ static void SIO_reload(void) {
         if (ovr[@"Spring"])     gSpring    = [ovr[@"Spring"] boolValue];
         if (ovr[@"Extra"])      gExtra     = [ovr[@"Extra"] boolValue];
         if (ovr[@"ListAccel"])  gListAccel = [ovr[@"ListAccel"] boolValue];
+        if (ovr[@"ZoomAccel"])  gZoomAccel = [ovr[@"ZoomAccel"] boolValue];
     }
 
     // ---- v1.8.14：列表 hook 硬保护，必须放在所有覆盖之后，优先级最高 ----
@@ -406,6 +448,10 @@ static void   (*o_sv_scrollRect)(id, SEL, CGRect, BOOL);
 // ---- CALayer addAnimation 补盲区 ----
 static void   (*o_layer_addAnim)(id, SEL, id, NSString *);
 
+// ---- v1.8.15：UIScrollView 缩放动画 ----
+static void   (*o_sv_setZoomScale)(id, SEL, CGFloat, BOOL);
+static void   (*o_sv_zoomToRect)(id, SEL, CGRect, BOOL);
+
 // ---- v1.8.12 新增 hook ----
 static void   (*o_UV_anim_keyframes)(Class, SEL, double, double, NSUInteger, void (^)(void), void (^)(BOOL));
 static void   (*o_UV_systemAnim)(Class, SEL, NSUInteger, NSArray *, NSUInteger, void (^)(void), void (^)(BOOL));
@@ -424,7 +470,10 @@ static void   (*o_UV_setAnimDelay)(Class, SEL, double);
 static void sio_CAAnim_setDuration(id self, SEL _cmd, double d) {
     SIO_REQUIRE_ORIG(o_CAAnim_setDuration);
     if (SIO_blocked()) { o_CAAnim_setDuration(self, _cmd, d); return; }
+    // v1.8.15：显式设时长视为新意图，按传入值缩放并重新打标
+    //（不因已有标记而跳过，否则「add 之后再改时长」会被错误忽略）
     o_CAAnim_setDuration(self, _cmd, SIO_targetDuration(d));
+    SIO_markAnimScaled(self);
 }
 
 #pragma mark - CATransaction
@@ -1012,8 +1061,8 @@ static void SIOriginalInit(void) {
 
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
-    NSLog(@"[SIOriginal] v1.8.14 hooks installed in %@ (enabled=%d mode=%d speed=%.1f spring=%d extra=%d list=%d override=%d listGuard=%d)",
-          gSelfBundle, gEnabled, gMode, gSpeed, gSpring, gExtra, gListAccel, gHasAppOverride, gListHardGuarded);
+    NSLog(@"[SIOriginal] v1.8.15 hooks installed in %@ (enabled=%d mode=%d speed=%.1f spring=%d extra=%d list=%d zoom=%d override=%d listGuard=%d)",
+          gSelfBundle, gEnabled, gMode, gSpeed, gSpring, gExtra, gListAccel, gZoomAccel, gHasAppOverride, gListHardGuarded);
     if (gListHardGuarded) {
         NSLog(@"[SIOriginal] %@ is on the list-hook hard-guard list: ListAccel is forced OFF (safety)", gSelfBundle);
     }
@@ -1154,23 +1203,55 @@ static void sio_SV_scrollRect(id self, SEL _cmd, CGRect r, BOOL animated) {
     [CATransaction commit];
 }
 
+#pragma mark - UIScrollView 缩放动画（v1.8.15 新增，默认关闭）
+
+// 拆包证据：Knight.app 11.5.0 的 NXDesign.framework 引用了 setZoomScale:animated: 与
+// zoomToRect:animated:，而此前这两个入口完全没有接管（滚动类里唯一的盲区）。
+//
+// 安全约束（吸取 v1.8.3/v1.8.4 微信预览故障的教训）：
+//   · 只用 CATransaction 覆写时长，**绝不把 animated:YES 改写成 NO**，
+//     也不加 kCATransactionDisableActions —— 那会取消 UIKit 的缩放事务，
+//     使 isZooming/isZoomBouncing 无法靠动画完成回调收尾，页面卡死。
+//   · 复用 SIO_svZoomEngaged：正在缩放 / 回弹中 / 当前已放大 → 一律原样透传。
+//   · 由 ZoomAccel 开关控制，默认关；可在 App 专属覆盖里为单个 App 打开。
+static void sio_SV_setZoomScale(id self, SEL _cmd, CGFloat s, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_sv_setZoomScale);
+    if (SIO_blocked() || !gZoomAccel || !animated || SIO_svZoomEngaged((UIScrollView *)self)) {
+        o_sv_setZoomScale(self, _cmd, s, animated); return;
+    }
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_targetDuration(0.25));
+    o_sv_setZoomScale(self, _cmd, s, animated);
+    [CATransaction commit];
+}
+
+static void sio_SV_zoomToRect(id self, SEL _cmd, CGRect r, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_sv_zoomToRect);
+    if (SIO_blocked() || !gZoomAccel || !animated || SIO_svZoomEngaged((UIScrollView *)self)) {
+        o_sv_zoomToRect(self, _cmd, r, animated); return;
+    }
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_targetDuration(0.25));
+    o_sv_zoomToRect(self, _cmd, r, animated);
+    [CATransaction commit];
+}
+
 #pragma mark - CALayer addAnimation:forKey:（补 CAAnimation setDuration 盲区）
 
 static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
     SIO_REQUIRE_ORIG(o_layer_addAnim);
-    // CAAnimation setDuration 基类 hook 已经覆盖了绝大多数情况，
-    // 但少数 app 在 addAnimation 后才设置 duration（顺序问题），这里二次兜底。
+    // CAAnimation setDuration 基类 hook 已覆盖绝大多数情况，这里只兜底
+    // 「App 从未调用 setDuration:、动画保持类默认时长」的动画（如 0.25s 默认值）。
     //
-    // v1.8.12 真 bug 修复：原来用 objc_msgSend(anim, setDuration:, newDur) 回写，
-    // 而 setDuration: 的 IMP 此时已经是我们自己的 sio_CAAnim_setDuration，
-    // 于是同一次时长被 SIO_targetDuration 处理两次（加速 ×5 实际变成 ÷25），
-    // 与文件开头声称的「防双重除法」正好相反。
-    // 正确做法：直接调用 swizzle 时保存下来的原始 IMP，绕过自己的 hook。
+    // v1.8.12 修掉了本函数经 objc_msgSend 回调自己的 hook（自递归式双重除法）。
+    // v1.8.15 再修掉残留的**逻辑**双重缩放：若该动画的时长已经过
+    // sio_CAAnim_setDuration 处理（带标记），这里必须跳过，否则同一个值被缩两次。
     if (!SIO_blocked() && anim && o_CAAnim_setDuration &&
-        [anim isKindOfClass:[CAAnimation class]]) {
+        [anim isKindOfClass:[CAAnimation class]] && !SIO_animScaled(anim)) {
         @try {
             double origDur = ((CAAnimation *)anim).duration;
             if (origDur > 0) {
+                SIO_markAnimScaled(anim);
                 double newDur = SIO_targetDuration(origDur);
                 if (newDur != origDur) {
                     o_CAAnim_setDuration(anim, @selector(setDuration:), newDur);
@@ -1212,6 +1293,11 @@ static void SIO_installiOS16Extras(void) {
                             (IMP)sio_SV_setContentOffset, (IMP *)&o_sv_setContentOffset);
         SIO_swizzleInstance(sv, @selector(scrollRectToVisible:animated:),
                             (IMP)sio_SV_scrollRect, (IMP *)&o_sv_scrollRect);
+        // v1.8.15 新增：缩放动画（默认关闭，ZoomAccel 控制）
+        SIO_swizzleInstance(sv, @selector(setZoomScale:animated:),
+                            (IMP)sio_SV_setZoomScale, (IMP *)&o_sv_setZoomScale);
+        SIO_swizzleInstance(sv, @selector(zoomToRect:animated:),
+                            (IMP)sio_SV_zoomToRect, (IMP *)&o_sv_zoomToRect);
     }
 
     if (layer) {
@@ -1882,7 +1968,7 @@ static void FUBGEntry(void) {
             // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
         });
 
-        NSLog(@"[FUBG] v2.0.0 (SIOriginal v1.8.14) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.0.0 (SIOriginal v1.8.15) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
@@ -1892,3 +1978,59 @@ static void FUBGEntry(void) {
     }
 }
 
+
+
+// ============================================================================
+// 拆包证据（v1.8.15，Knight.app 11.5.0 / com.sfic.knight / arm64 已解密）
+// ----------------------------------------------------------------------------
+// 来源：IPA 内 Payload/Knight.app/Knight（180MB，cryptid=0），
+//       解析 Mach-O 的 __TEXT,__objc_classname / __objc_methname 得到
+//       10,947 个 ObjC 类名、148,813 个方法名、114,402 条 C 字符串。
+//
+// [1] UI 技术栈：原生 UIKit + 大量 .nib（数百个 *AlertView/*Cell/*View nib），
+//     非 Flutter；RN 只占少量模块（hermes.framework + RNInnerBundleResource.plist）。
+//     → 现有 UIView / CAAnimation / CATransaction 系 hook 在本 App 上确实生效。
+//
+// [2] App 在用、且我们已覆盖的动画入口（__objc_methname 命中）：
+//     beginAnimations:context: / commitAnimations / setAnimationDuration: /
+//     setAnimationDelay:（老式 API —— v1.8.13 才补上，对本品是净增覆盖）
+//     animateKeyframesWithDuration:delay:options:animations:completion:（v1.8.12 补）
+//     transitionFromViewController:toViewController:duration:options:animations:completion:（v1.8.12 补）
+//     animateWithDuration: 全系 / transitionWithView:duration: /
+//     setDuration: / addAnimation:forKey: / setMass: / setStiffness: / setDamping:
+//     setContentOffset:animated: / scrollRectToVisible:animated: / setSelectedIndex:
+//     presentViewController:animated:completion: / dismissViewControllerAnimated:completion:
+//
+// [3] App 在用、v1.8.15 才覆盖：setZoomScale:animated:、zoomToRect:animated:
+//     （由 NXDesign.framework 引用）
+//
+// [4] App 未使用 → 我们这些 hook 在本品上是惰性的（无害，不必再投入）：
+//     UIViewPropertyAnimator 的 addAnimations: / startAnimationAfterDelay: /
+//     runningPropertyAnimatorWithDuration:、setCollectionViewLayout:animated:、
+//     performSystemAnimation:onViews:、transitionFromView:toView:、
+//     setCamera:animated:、setPreferredFrameRateRange:、setMaximumFramesPerSecond:
+//
+// [5] 地图：高德 AMap 静态链入（MAMapView / MAMapKeyFrameAnimation /
+//     MAAnnotationMoveAnimation / MAAnimatedAnnotation），
+//     相机动画属性类型为 CAKeyframeAnimation（如 _mapCenterAnimation /
+//     _cameraDegreeAnimation / _zoomAnimation）。
+//     → 地图相机动画走 CAKeyframeAnimation，本文件的 CAAnimation setDuration: hook 已覆盖，
+//       无需再为 MAMapView 单独加 hook；而 [1] 的双重缩放 bug 修正对它是直接收益。
+//
+// [6] App 自研 UI 体系（动画由内部 UIView/CAAnimation 驱动，同样已被覆盖）：
+//     NAAlertController / NAAlertView / NA_PresentAnimation / NA_DimissAnimation（弹窗转场）
+//     NXDesign.framework：SFSlideOverController / slideOverViewController:type:animated:、
+//     nx_pushViewController:animated: / safe_pushViewController:animated:、
+//     navigationController:animationControllerForOperation:...（自定义导航转场）
+//     SFToast / SFMToastView / SFAnimatedImageView
+//
+// [7] 无法用「改时长」加速的动画引擎（做了也没用，不要承诺）：
+//     SVGA（SVGAPlayer / SVGAVideoEntity，CADisplayLink 自驱）、
+//     Ugen 动态 UI 引擎（UgenAnimation* 自有渲染循环）、
+//     CSJRWLottie*（穿山甲广告 SDK 自带 Lottie）、RN Reanimated。
+//
+// [8] 风险提示：二进制含越狱/注入检测语料
+//     （cydia ×15 / substrate ×17 / jailbreak ×6 / frida ×2 / inject ×18 / debugger ×3），
+//     且 App 内嵌 CydiaSubstrate.framework。本 dylib 不新增任何 hook 安装时序，
+//     仅按 bundle id 读配置；若设备上出现启动即崩，优先怀疑这一层，用黑名单整体停用排查。
+// ============================================================================

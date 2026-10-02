@@ -144,6 +144,8 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"Spring"])     d[@"Spring"]     = @YES;
     if (!d[@"Extra"])      d[@"Extra"]      = @YES;
     if (!d[@"ListAccel"])  d[@"ListAccel"]  = @NO;
+    // v1.8.15：缩放动画加速，默认关闭（同一族在微信上出过「预览页卡死」）
+    if (!d[@"ZoomAccel"])  d[@"ZoomAccel"]  = @NO;
     if (!d[@"Blacklist"])  d[@"Blacklist"]  = @[ @"com.tencent.wework" ];
     if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
@@ -159,7 +161,7 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
     NSMutableDictionary *merged = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
     if (!merged) merged = [NSMutableDictionary dictionary];
     NSArray *sioKeys = @[ @"Enabled", @"Mode", @"Speed", @"SlowFactor",
-                          @"Spring", @"Extra", @"ListAccel", @"Blacklist",
+                          @"Spring", @"Extra", @"ListAccel", @"Blacklist", @"ZoomAccel",
                           @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
                           @"FUBGFloatingBall", @"FUBGExcludeApps", @"AppOverrides" ];
     for (NSString *k in sioKeys) {
@@ -212,7 +214,7 @@ static void WriteUIKitDrag(BOOL enabled) {
 @end
 
 @implementation SIOVC {
-    UISwitch *_swEnabled, *_swSpring, *_swExtra, *_swList;
+    UISwitch *_swEnabled, *_swSpring, *_swExtra, *_swList, *_swZoom;
     UISegmentedControl *_segMode;
     UISlider *_slider;
     UILabel *_sliderLabel;
@@ -222,7 +224,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UISwitch *_swFUBG, *_swFUBGScene, *_swFUBGAudio, *_swFUBGBall;
     // v1.8.14 App 专属覆盖
     UITextField *_ovBundle;
-    UISwitch *_ovOn, *_ovSpring, *_ovExtra, *_ovList;
+    UISwitch *_ovOn, *_ovSpring, *_ovExtra, *_ovList, *_ovZoom;
     UISlider *_ovSpeed;
     UILabel *_ovSpeedLabel, *_ovGuard;
     UISegmentedControl *_ovMode;
@@ -255,7 +257,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.8.14 · 顺丰同城骑士硬保护 + App 专属覆盖" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.8.15 · 顺丰同城骑士针对性适配" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -270,7 +272,9 @@ static void WriteUIKitDrag(BOOL enabled) {
     _sliderLabel = lblSpeed;
     _slider = [[UISlider alloc] init];
     _slider.minimumValue = 1.0;
-    _slider.maximumValue = 20.0;
+    // v1.8.15：上限 20 → 50。修正 CAAnimation 双重缩放后，高倍率重新有意义
+    // （此前显式 CAAnimation 实际吃的是 speed²，×5 相当于 ×25）
+    _slider.maximumValue = 50.0;
     _slider.continuous = YES;
     _slider.value = speed;
     [_slider addTarget:self action:@selector(sliderChanged) forControlEvents:UIControlEventValueChanged];
@@ -288,6 +292,11 @@ static void WriteUIKitDrag(BOOL enabled) {
     _swList = [[UISwitch alloc] init];
     _swList.on = [cfg[@"ListAccel"] boolValue];
     _swList.onTintColor = [UIColor systemRedColor];
+
+    // v1.8.15：UIScrollView 缩放动画（setZoomScale:animated: / zoomToRect:animated:）
+    UILabel *lblZoom = [self label:@"缩放动画加速（实验，图片预览异常就关掉）" size:17 dim:NO];
+    _swZoom = [[UISwitch alloc] init];
+    _swZoom.on = [cfg[@"ZoomAccel"] boolValue];
 
     UILabel *axTitle = [self label:@"系统动态效果（写入辅助功能，需注销生效）" size:15 dim:YES];
     UILabel *lblRM = [self label:@"减弱动态效果（系统级）" size:17 dim:NO];
@@ -356,7 +365,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     _ovSpeedLabel = [self label:@"专属倍率（当前 ×5.0）" size:17 dim:NO];
     _ovSpeed = [[UISlider alloc] init];
     _ovSpeed.minimumValue = 1.0;
-    _ovSpeed.maximumValue = 20.0;
+    _ovSpeed.maximumValue = 50.0;
     _ovSpeed.value = 5.0;
     _ovSpeed.continuous = YES;
     [_ovSpeed addTarget:self action:@selector(ovSliderChanged) forControlEvents:UIControlEventValueChanged];
@@ -375,6 +384,9 @@ static void WriteUIKitDrag(BOOL enabled) {
     _ovList = [[UISwitch alloc] init];
     _ovList.on = NO;
     _ovList.onTintColor = [UIColor systemRedColor];
+    UILabel *lblOvZoom = [self label:@"专属：缩放动画加速（实验）" size:17 dim:NO];
+    _ovZoom = [[UISwitch alloc] init];
+    _ovZoom.on = NO;
     _ovGuard = [self label:@"" size:12 dim:YES];
     _ovGuard.textColor = [UIColor systemOrangeColor];
     _ovGuard.numberOfLines = 0;
@@ -414,7 +426,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     [rb.heightAnchor constraintEqualToConstant:40].active = YES;
     [rb addTarget:self action:@selector(onReboot) forControlEvents:UIControlEventTouchUpInside];
 
-    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。慢放 = 原版 slowDownFactor 功能，可观察动画细节（导航/模态/底部 Tab 转场也真正慢放）。瞬切 = 0.01 秒直达。\n\n⚠️ v1.8.14：新增「App 专属覆盖」—— 配置文件是全局的，以前给某个 App 调参数会连带影响所有注入的 App；现在可以为指定 Bundle ID 单独设置倍率/模式/弹簧/转场，优先级高于全局值。同时为顺丰同城骑士 com.sfic.knight 恢复列表 hook 硬保护（该 App 与 TV/CV 变更类 hook 冲突会卡死，此前只剩“记得关开关”这一层，而开关是全局的）。\n\nv1.8.13 补齐老式 beginAnimations 的 setAnimationDuration:/setAnimationDelay:；v1.8.12 修复 CALayer 动画双重除速、runningPropertyAnimator 从未生效、黑名单字符串崩溃、慢放转场被强制瞬间完成。全 App 通用，微信预览放大时动画 hook 自动旁路保护。" size:12 dim:YES];
+    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。慢放 = 原版 slowDownFactor 功能，可观察动画细节。瞬切 = 0.01 秒直达。\n\n⚠️ v1.8.15（依据顺丰同城骑士 11.5.0 拆包证据）：① 修正 CAAnimation 残留双重缩放 —— 此前 App「先设时长再 addAnimation」会被连缩两次，实际倍率是 speed²（显示 ×5 其实 ÷25）并频繁撞 0.01s 下限，本 App 的高德地图相机动画（MAMapKeyFrameAnimation）正吃这个 bug；修正后若觉得变慢，把倍率从 5 提到 15–25 即可等价。② 新增缩放动画加速开关「ZoomAccel」（默认关，本 App 的 NXDesign 确实在用 setZoomScale:animated:，但这一族在微信上出过预览卡死，请先小范围试）。③ 倍率上限 20 → 50。\n\n本 App UI 是原生 UIKit + 数百个 nib，动画 hook 正常生效；老式 beginAnimations/setAnimationDuration: 与关键帧动画本 App 都在用。SVGA / Ugen 引擎动画为自驱，无法用改时长加速。" size:12 dim:YES];
     hint.textAlignment = NSTextAlignmentCenter;
     UILabel *listHint = [self label:@"列表加速含 24 个 TV/CV hook，默认关闭。⚠️ 顺丰同城骑士 com.sfic.knight 在硬保护名单内，列表加速恒为关闭，任何配置都打不开（该 App 只会走其余 34 个非列表 hook）。淘宝/京东等重列表 App 同样必须保持关闭，否则破坏列表状态机导致卡死。" size:12 dim:YES];
     listHint.textColor = [UIColor systemOrangeColor];
@@ -430,6 +442,7 @@ static void WriteUIKitDrag(BOOL enabled) {
         [self row:lblSpring ctrl:_swSpring],
         [self row:lblExtra ctrl:_swExtra],
         [self row:lblList ctrl:_swList],
+        [self row:lblZoom ctrl:_swZoom],
         axTitle,
         [self row:lblRM ctrl:_swRM],
         [self row:lblCF ctrl:_swCF],
@@ -446,6 +459,7 @@ static void WriteUIKitDrag(BOOL enabled) {
         [self row:lblOvSpring ctrl:_ovSpring],
         [self row:lblOvExtra ctrl:_ovExtra],
         [self row:lblOvList ctrl:_ovList],
+        [self row:lblOvZoom ctrl:_ovZoom],
         _ovGuard,
         lblBL, _blacklist, save, rs, rb, listHint, hint, _status
     ]];
@@ -486,7 +500,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     _ovOn.on = (mine != nil);
 
     double sp = mine[@"Speed"] ? [mine[@"Speed"] doubleValue] : 5.0;
-    if (sp < 1.0 || sp > 20.0) sp = 5.0;
+    if (sp < 1.0 || sp > 50.0) sp = 5.0;
     _ovSpeed.value = sp;
     _ovSpeedLabel.text = [NSString stringWithFormat:@"专属倍率（当前 ×%.1f）", sp];
 
@@ -496,6 +510,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     _ovSpring.on = mine[@"Spring"] ? [mine[@"Spring"] boolValue] : YES;
     _ovExtra.on  = mine[@"Extra"]  ? [mine[@"Extra"] boolValue]  : YES;
     _ovList.on   = mine[@"ListAccel"] ? [mine[@"ListAccel"] boolValue] : NO;
+    _ovZoom.on   = mine[@"ZoomAccel"] ? [mine[@"ZoomAccel"] boolValue] : NO;
 
     BOOL guarded = [HardGuardBundles() containsObject:bid];
     _ovList.enabled = !guarded;
@@ -548,6 +563,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     cfg[@"Spring"] = @(_swSpring.on);
     cfg[@"Extra"] = @(_swExtra.on);
     cfg[@"ListAccel"] = @(_swList.on);
+    cfg[@"ZoomAccel"] = @(_swZoom.on);
     cfg[@"FUBGEnabled"] = @(_swFUBG.on);
     cfg[@"FUBGSceneFake"] = @(_swFUBGScene.on);
     cfg[@"FUBGAudioKeep"] = @(_swFUBGAudio.on);
@@ -578,6 +594,7 @@ static void WriteUIKitDrag(BOOL enabled) {
                 @"Extra":     @(_ovExtra.on),
                 // 硬保护名单内恒写 NO，避免配置文件里留下一个会被 dylib 忽略的 YES
                 @"ListAccel": @(guarded ? NO : _ovList.on),
+                @"ZoomAccel": @(_ovZoom.on),
             };
         } else {
             [ovOut removeObjectForKey:ovBid];
