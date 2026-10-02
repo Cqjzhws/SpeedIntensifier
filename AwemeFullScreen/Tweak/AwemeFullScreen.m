@@ -1,4 +1,4 @@
-// AwemeFullScreen — 抖音(Aweme) 全屏插件 v2.5.0
+// AwemeFullScreen — 抖音(Aweme) 全屏插件 v2.6.0
 // ============================================================================
 // 本版依据「诊断版在抖音 38.0.0 上实测回传的真实数据」，并修正 v2.3.0 的失误。
 //
@@ -66,12 +66,18 @@ static int8_t gFeedVal[kAFSClsCacheSize];
 
 static NSHashTable *gHidden = nil;       // 我们隐藏过的视图（弱引用）
 
-// v2.5.0：底栏的 0 高约束。
-// 几何诊断实测：把 tabBar 设成 hidden=YES 之后，UITabBarController **仍然**把 tabBar
-// 的高度（实测 83pt）作为子控制器的底部安全区 —— 子 VC 的 sa.b 一直是 83，
-// 而所有视图的 frame 又都是整屏、滚动视图 inset 也全是 0，所以底部那条黑边就是
-// 这 83pt 安全区逼出来的。把 tabBar 高度压成 0，安全区贡献即归零。
-static NSLayoutConstraint *gTabBarZeroH = nil;
+// v2.5.0 试过给底栏挂 0 高约束 —— 几何诊断回传 sa.b 仍然是 83，**没用**。
+// v2.6.0 改用最强手段：把底栏**整个从父视图移除**。只有它不在视图层级里，
+// UITabBarController 才会重新计算，子控制器的 83pt 底部安全区才会归零。
+// 离开首页区时按原父视图 + 原索引放回去。
+static __weak UIView *gTabBarRef   = nil;
+static __weak UIView *gTabBarSuper = nil;
+static NSUInteger    gTabBarIndex  = 0;
+
+// 自动进入全屏：截图证据 —— 合集/详情页里视频是 16:9 小窗（428x273pt，仅占屏幕 29%），
+// 页面里自带一个「全屏观看」控件。命中标题含「全屏」的可见 UIControl 就替用户点一下。
+static NSTimeInterval gLastTapAt = 0;
+static int            gTapCount  = 0;
 
 static BOOL           gInFeed = NO;
 static NSTimeInterval gInFeedAt = 0;
@@ -209,6 +215,50 @@ static inline BOOL AFS_inFeedNow(void) {
     return gInFeed;
 }
 
+#pragma mark - 自动进入全屏（点「全屏观看」）
+
+static BOOL AFS_titleIsFullscreen(NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || s.length == 0) return NO;
+    return ([s rangeOfString:@"全屏"].location != NSNotFound);
+}
+
+// 找标题/无障碍标签含「全屏」的可见 UIControl
+static UIControl *AFS_findFullscreenControl(UIView *v, int depth, int *budget) {
+    if (!v || depth > 12 || *budget <= 0) return nil;
+    (*budget)--;
+    if (v.hidden || v.alpha < 0.01 || !v.window) return nil;
+    if ([v isKindOfClass:[UIControl class]]) {
+        UIControl *c = (UIControl *)v;
+        NSString *t = nil;
+        if ([c isKindOfClass:[UIButton class]]) t = [(UIButton *)c titleForState:c.state];
+        if (!AFS_titleIsFullscreen(t)) t = c.accessibilityLabel;
+        if (AFS_titleIsFullscreen(t)) return c;
+    }
+    for (UIView *s in v.subviews) {
+        UIControl *r = AFS_findFullscreenControl(s, depth + 1, budget);
+        if (r) return r;
+    }
+    return nil;
+}
+
+static void AFS_tryEnterFullscreen(void) {
+    if (gTapCount >= 8) return;
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (now - gLastTapAt < 2.0) return;
+    gLastTapAt = now;
+    UIWindow *kw = AFS_keyWindow();
+    if (!kw) return;
+    int budget = 4000;
+    UIControl *c = AFS_findFullscreenControl(kw, 0, &budget);
+    if (!c) return;
+    gTapCount++;
+    NSLog(@"[AwemeFullScreen] auto-tap fullscreen control #%d: %s",
+          gTapCount, class_getName(object_getClass(c)));
+    @try {
+        [c sendActionsForControlEvents:UIControlEventTouchUpInside];
+    } @catch (__unused NSException *e) {}
+}
+
 #pragma mark - 隐藏 / 恢复
 
 static void AFS_hideTarget(UIView *v) {
@@ -216,28 +266,40 @@ static void AFS_hideTarget(UIView *v) {
     if (!gHidden) gHidden = [NSHashTable weakObjectsHashTable];
     [gHidden addObject:v];
     if (!v.hidden) v.hidden = YES;
-    // 底栏本体（AWENormalModeTabBar 是 UITabBar 系）：把高度压成 0，
-    // 让 UITabBarController 不再给子控制器留 83pt 底部安全区
-    if ([v isKindOfClass:[UITabBar class]] && !gTabBarZeroH) {
+    // 底栏本体（AWENormalModeTabBar 是 UITabBar 系）：整个移出视图层级，
+    // 这是唯一能让 UITabBarController 重新计算、把子控制器 83pt 底部安全区归零的办法。
+    if ([v isKindOfClass:[UITabBar class]] && !gTabBarRef) {
         @try {
-            gTabBarZeroH = [v.heightAnchor constraintEqualToConstant:0.0];
-            gTabBarZeroH.priority = 999;
-            gTabBarZeroH.active = YES;
-            NSLog(@"[AwemeFullScreen] tabBar height pinned to 0 to drop the bottom safe-area inset");
-        } @catch (__unused NSException *e) { gTabBarZeroH = nil; }
+            UIView *sup = v.superview;
+            if (sup) {
+                gTabBarSuper = sup;
+                gTabBarIndex = [sup.subviews indexOfObject:v];
+                gTabBarRef = v;
+                [v removeFromSuperview];
+                NSLog(@"[AwemeFullScreen] tabBar detached from hierarchy (drops the 83pt bottom inset)");
+            }
+        } @catch (__unused NSException *e) { gTabBarRef = nil; gTabBarSuper = nil; }
     }
     if (!gFirstHitLogged) {
         gFirstHitLogged = YES;
-        NSLog(@"[AwemeFullScreen] v2.5.0 first hit: hid %s",
+        NSLog(@"[AwemeFullScreen] v2.6.0 first hit: hid %s",
               class_getName(object_getClass(v)));
     }
 }
 
 static void AFS_restoreAll(void) {
-    if (gTabBarZeroH) {
-        @try { gTabBarZeroH.active = NO; } @catch (__unused NSException *e) {}
-        gTabBarZeroH = nil;
+    // 先把底栏放回原处，再恢复显示
+    UIView *tb = gTabBarRef;
+    UIView *sup = gTabBarSuper;
+    if (tb && sup && !tb.superview) {
+        @try {
+            NSUInteger n = sup.subviews.count;
+            [sup insertSubview:tb atIndex:(gTabBarIndex <= n ? gTabBarIndex : n)];
+        } @catch (__unused NSException *e) {}
     }
+    gTabBarRef = nil;
+    gTabBarSuper = nil;
+    if (tb && tb.hidden) tb.hidden = NO;
     if (!gHidden || gHidden.count == 0) return;
     for (UIView *v in gHidden.allObjects) {
         if (v.hidden) v.hidden = NO;
@@ -269,7 +331,11 @@ static void AFS_tick(__unused NSTimer *t) {
                 if (!v.hidden) v.hidden = YES;
             }
         }
-        // 注意：v2.4.0 刻意不做任何 frame 调整（v2.3.0 的 frame 强设反而破坏了布局）
+        // 底栏被重新加回层级时再摘一次
+        UIView *tb = gTabBarRef;
+        if (tb && tb.superview) [tb removeFromSuperview];
+        // 合集/详情页里视频是小窗时，替用户点「全屏观看」
+        AFS_tryEnterFullscreen();
     } else {
         AFS_restoreAll();
     }
@@ -333,7 +399,7 @@ static void AFSD_refresh(void) {
         UIViewController *vc = kw.rootViewController;
 
         NSMutableString *s = [NSMutableString string];
-        [s appendFormat:@"AFS-GEO v2.5.0  screen=%@ safe=(%.0f,%.0f)\n",
+        [s appendFormat:@"AFS-GEO v2.6.0  screen=%@ safe=(%.0f,%.0f)\n",
                          AFSD_rect(sb), sa.top, sa.bottom];
 
         int guard = 0;
@@ -366,6 +432,10 @@ static void AFSD_refresh(void) {
         [s appendFormat:@"feedVC=%@ hidden=%lu\n",
             feed ? AFSD_short(feed) : @"(nil)",
             (unsigned long)(gHidden ? gHidden.count : 0)];
+        int b2 = 4000;
+        UIControl *fc = AFS_findFullscreenControl(kw, 0, &b2);
+        [s appendFormat:@"fsCtrl=%@ taps=%d tabDetached=%d\n",
+            fc ? AFSD_short(fc) : @"none", gTapCount, gTabBarRef ? 1 : 0];
 
         dispatch_async(dispatch_get_main_queue(), ^{ gLabel.text = s; });
     } @catch (__unused NSException *e) {}
@@ -419,7 +489,7 @@ static void AFS_init(void) {
         AFS_swizzle([UIView class], @selector(layoutSubviews),
                     (IMP)afs_layoutSubviews, (IMP *)&o_afs_layoutSubviews);
 
-        NSLog(@"[AwemeFullScreen] v2.5.0%s installed in %@ active=%d layoutSubviews=%s",
+        NSLog(@"[AwemeFullScreen] v2.6.0%s installed in %@ active=%d layoutSubviews=%s",
               AFS_DIAG ? "-diag" : "", [[NSBundle mainBundle] bundleIdentifier], gActive,
               o_afs_layoutSubviews ? "ok" : "FAILED");
 
