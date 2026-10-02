@@ -1,0 +1,55 @@
+name: Build AwemeNoToast (dylib only)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'awemenotoast-v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build AwemeNoToast dylib
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      # 只吞掉 AwemeFullScreen 插件自己弹出的提示文字；不改动原 dylib 一个字节
+      - name: Build dylib (pure clang)
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p artifacts
+          clang -arch arm64 -dynamiclib -O2 \
+            -install_name @rpath/AwemeNoToast.dylib \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -undefined dynamic_lookup -fobjc-arc \
+            -framework Foundation -framework UIKit \
+            -o artifacts/AwemeNoToast.dylib AwemeNoToast/Tweak/AwemeNoToast.m
+          codesign --force --sign - artifacts/AwemeNoToast.dylib
+          lipo -info artifacts/AwemeNoToast.dylib
+          file artifacts/AwemeNoToast.dylib
+          ls -lh artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AwemeNoToast
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/awemenotoast-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: AwemeNoToast ${{ github.ref_name }}
+          files: artifacts/AwemeNoToast.dylib
+          generate_release_notes: true
