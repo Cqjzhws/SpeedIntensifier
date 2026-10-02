@@ -27,6 +27,15 @@ extern int reboot(int);
 static NSString * const PrefPath  = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
 static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 
+// v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
+// 名单内 App 的列表加速恒为关闭，配置界面直接置灰，避免用户以为"打开了但没生效"。
+static NSArray *HardGuardBundles(void) {
+    static NSArray *a;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ a = @[ @"com.sfic.knight" ]; });
+    return a;
+}
+
 static void SpawnRoot(NSString *path, NSArray *args) {
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
@@ -140,6 +149,7 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
     if (!d[@"FUBGAudioKeep"])    d[@"FUBGAudioKeep"]    = @YES;
     if (!d[@"FUBGFloatingBall"]) d[@"FUBGFloatingBall"] = @NO;
+    if (!d[@"AppOverrides"])     d[@"AppOverrides"]     = @{};
     return d;
 }
 
@@ -151,7 +161,7 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
     NSArray *sioKeys = @[ @"Enabled", @"Mode", @"Speed", @"SlowFactor",
                           @"Spring", @"Extra", @"ListAccel", @"Blacklist",
                           @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
-                          @"FUBGFloatingBall", @"FUBGExcludeApps" ];
+                          @"FUBGFloatingBall", @"FUBGExcludeApps", @"AppOverrides" ];
     for (NSString *k in sioKeys) {
         if (cfg[k]) merged[k] = cfg[k];
     }
@@ -210,6 +220,12 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *_status;
     UISwitch *_swRM, *_swCF, *_swUIKit;
     UISwitch *_swFUBG, *_swFUBGScene, *_swFUBGAudio, *_swFUBGBall;
+    // v1.8.14 App 专属覆盖
+    UITextField *_ovBundle;
+    UISwitch *_ovOn, *_ovSpring, *_ovExtra, *_ovList;
+    UISlider *_ovSpeed;
+    UILabel *_ovSpeedLabel, *_ovGuard;
+    UISegmentedControl *_ovMode;
 }
 
 - (UIStackView *)row:(UIView *)l ctrl:(UIView *)c {
@@ -239,7 +255,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.8.13 · 补齐老式 UIView 动画 API" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.8.14 · 顺丰同城骑士硬保护 + App 专属覆盖" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -306,6 +322,63 @@ static void WriteUIKitDrag(BOOL enabled) {
     _swFUBGBall.on = [cfg[@"FUBGFloatingBall"] boolValue];
     _swFUBGBall.enabled = NO;
 
+    // === v1.8.14 App 专属覆盖 ===
+    // 配置文件是全局的：给某一个 App 调参数会连带影响所有注入的 App。
+    // 这里为指定 Bundle ID 写一份独立配置，优先级高于全局值，互不干扰。
+    UILabel *ovTitle = [self label:@"App 专属覆盖（只影响该 Bundle ID，不影响其他 App）" size:15 dim:YES];
+
+    NSDictionary *ovAllCfg = [cfg[@"AppOverrides"] isKindOfClass:[NSDictionary class]]
+                             ? cfg[@"AppOverrides"] : @{};
+    NSString *ovFirst = ovAllCfg[@"com.sfic.knight"] ? @"com.sfic.knight"
+                      : ([ovAllCfg.allKeys sortedArrayUsingSelector:@selector(compare:)].firstObject
+                         ?: @"com.sfic.knight");
+
+    _ovBundle = [[UITextField alloc] init];
+    _ovBundle.text = ovFirst;
+    _ovBundle.placeholder = @"com.sfic.knight";
+    _ovBundle.borderStyle = UITextBorderStyleRoundedRect;
+    _ovBundle.font = [UIFont systemFontOfSize:14];
+    _ovBundle.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    _ovBundle.autocorrectionType = UITextAutocorrectionTypeNo;
+    _ovBundle.spellCheckingType = UITextSpellCheckingTypeNo;
+    _ovBundle.keyboardType = UIKeyboardTypeURL;
+    _ovBundle.clearButtonMode = UITextFieldViewModeWhileEditing;
+    _ovBundle.returnKeyType = UIReturnKeyDone;
+    [_ovBundle addTarget:self action:@selector(ovBundleChanged)
+        forControlEvents:UIControlEventEditingDidEnd | UIControlEventEditingDidEndOnExit];
+    [_ovBundle.heightAnchor constraintEqualToConstant:36].active = YES;
+
+    UILabel *lblOvOn = [self label:@"为该 App 启用专属配置" size:17 dim:NO];
+    _ovOn = [[UISwitch alloc] init];
+    // 只刷新提示文案，绝不回读 plist —— 否则开关会被立刻重置回当前已保存状态
+    [_ovOn addTarget:self action:@selector(ovToggled) forControlEvents:UIControlEventValueChanged];
+
+    _ovSpeedLabel = [self label:@"专属倍率（当前 ×5.0）" size:17 dim:NO];
+    _ovSpeed = [[UISlider alloc] init];
+    _ovSpeed.minimumValue = 1.0;
+    _ovSpeed.maximumValue = 20.0;
+    _ovSpeed.value = 5.0;
+    _ovSpeed.continuous = YES;
+    [_ovSpeed addTarget:self action:@selector(ovSliderChanged) forControlEvents:UIControlEventValueChanged];
+
+    _ovMode = [[UISegmentedControl alloc] initWithItems:@[ @"加速", @"慢放 ×2", @"瞬切" ]];
+    _ovMode.selectedSegmentIndex = 0;
+
+    UILabel *lblOvSpring = [self label:@"专属：弹簧参数缩放" size:17 dim:NO];
+    _ovSpring = [[UISwitch alloc] init];
+    _ovSpring.on = YES;
+    UILabel *lblOvExtra = [self label:@"专属：进阶转场" size:17 dim:NO];
+    _ovExtra = [[UISwitch alloc] init];
+    _ovExtra.on = YES;
+    UILabel *lblOvList = [self label:@"专属：列表加速（高危）" size:17 dim:NO];
+    lblOvList.textColor = [UIColor systemRedColor];
+    _ovList = [[UISwitch alloc] init];
+    _ovList.on = NO;
+    _ovList.onTintColor = [UIColor systemRedColor];
+    _ovGuard = [self label:@"" size:12 dim:YES];
+    _ovGuard.textColor = [UIColor systemOrangeColor];
+    _ovGuard.numberOfLines = 0;
+
     UILabel *lblBL = [self label:@"黑名单（每行一个 Bundle ID）" size:15 dim:YES];
     _blacklist = [[UITextView alloc] init];
     _blacklist.font = [UIFont systemFontOfSize:14];
@@ -341,9 +414,9 @@ static void WriteUIKitDrag(BOOL enabled) {
     [rb.heightAnchor constraintEqualToConstant:40].active = YES;
     [rb addTarget:self action:@selector(onReboot) forControlEvents:UIControlEventTouchUpInside];
 
-    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。慢放 = 原版 slowDownFactor 功能，可观察动画细节（导航/模态/底部 Tab 转场也真正慢放）。瞬切 = 0.01 秒直达。\n\n⚠️ v1.8.13：新增接管老式 beginAnimations/commitAnimations 时代的 setAnimationDuration: 与 setAnimationDelay:（老 SDK、第三方库、部分国产 App 内部仍在用，此前完全不受加速影响）。v1.8.12 已修复 CALayer 动画双重除速、runningPropertyAnimator 从未生效、黑名单字符串崩溃、慢放转场被强制瞬间完成，并新增关键帧动画/容器转场/底部 Tab/系统动画共 5 处 hook。全 App 通用，微信预览放大时动画 hook 自动旁路保护。若预览/手势出现异常请立即反馈。" size:12 dim:YES];
+    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。慢放 = 原版 slowDownFactor 功能，可观察动画细节（导航/模态/底部 Tab 转场也真正慢放）。瞬切 = 0.01 秒直达。\n\n⚠️ v1.8.14：新增「App 专属覆盖」—— 配置文件是全局的，以前给某个 App 调参数会连带影响所有注入的 App；现在可以为指定 Bundle ID 单独设置倍率/模式/弹簧/转场，优先级高于全局值。同时为顺丰同城骑士 com.sfic.knight 恢复列表 hook 硬保护（该 App 与 TV/CV 变更类 hook 冲突会卡死，此前只剩“记得关开关”这一层，而开关是全局的）。\n\nv1.8.13 补齐老式 beginAnimations 的 setAnimationDuration:/setAnimationDelay:；v1.8.12 修复 CALayer 动画双重除速、runningPropertyAnimator 从未生效、黑名单字符串崩溃、慢放转场被强制瞬间完成。全 App 通用，微信预览放大时动画 hook 自动旁路保护。" size:12 dim:YES];
     hint.textAlignment = NSTextAlignmentCenter;
-    UILabel *listHint = [self label:@"列表加速含 24 个 TV/CV hook，默认关闭。v1.8.12 起配置项缺失也按关闭处理（fail-safe，旧版本缺键会被误当成开启）。顺丰骑士/淘宝/京东等重列表 App 必须保持关闭，否则破坏列表状态机导致卡死。" size:12 dim:YES];
+    UILabel *listHint = [self label:@"列表加速含 24 个 TV/CV hook，默认关闭。⚠️ 顺丰同城骑士 com.sfic.knight 在硬保护名单内，列表加速恒为关闭，任何配置都打不开（该 App 只会走其余 34 个非列表 hook）。淘宝/京东等重列表 App 同样必须保持关闭，否则破坏列表状态机导致卡死。" size:12 dim:YES];
     listHint.textColor = [UIColor systemOrangeColor];
     listHint.numberOfLines = 0;
     _status = [self label:@"" size:13 dim:YES];
@@ -367,6 +440,13 @@ static void WriteUIKitDrag(BOOL enabled) {
         [self row:lblFUBGScene ctrl:_swFUBGScene],
         [self row:lblFUBGAudio ctrl:_swFUBGAudio],
         [self row:lblFUBGBall ctrl:_swFUBGBall],
+        ovTitle, _ovBundle,
+        [self row:lblOvOn ctrl:_ovOn],
+        _ovSpeedLabel, _ovSpeed, _ovMode,
+        [self row:lblOvSpring ctrl:_ovSpring],
+        [self row:lblOvExtra ctrl:_ovExtra],
+        [self row:lblOvList ctrl:_ovList],
+        _ovGuard,
         lblBL, _blacklist, save, rs, rb, listHint, hint, _status
     ]];
     stack.axis = UILayoutConstraintAxisVertical;
@@ -389,6 +469,64 @@ static void WriteUIKitDrag(BOOL enabled) {
         [stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-40],
     ]];
     [self modeChanged];
+    [self ovBundleChanged];
+}
+
+// v1.8.14：切换 Bundle ID 时把该 App 已有的专属配置读进控件，并刷新硬保护提示
+- (void)ovBundleChanged {
+    NSString *bid = [_ovBundle.text stringByTrimmingCharactersInSet:
+                     [NSCharacterSet whitespaceCharacterSet]];
+    if (!bid.length) bid = @"com.sfic.knight";
+
+    id allRaw = [NSDictionary dictionaryWithContentsOfFile:PrefPath][@"AppOverrides"];
+    NSDictionary *all = [allRaw isKindOfClass:[NSDictionary class]] ? allRaw : @{};
+    id mineRaw = all[bid];
+    NSDictionary *mine = [mineRaw isKindOfClass:[NSDictionary class]] ? mineRaw : nil;
+
+    _ovOn.on = (mine != nil);
+
+    double sp = mine[@"Speed"] ? [mine[@"Speed"] doubleValue] : 5.0;
+    if (sp < 1.0 || sp > 20.0) sp = 5.0;
+    _ovSpeed.value = sp;
+    _ovSpeedLabel.text = [NSString stringWithFormat:@"专属倍率（当前 ×%.1f）", sp];
+
+    int m = mine[@"Mode"] ? [mine[@"Mode"] intValue] : 0;
+    _ovMode.selectedSegmentIndex = (m >= 0 && m <= 2) ? m : 0;
+
+    _ovSpring.on = mine[@"Spring"] ? [mine[@"Spring"] boolValue] : YES;
+    _ovExtra.on  = mine[@"Extra"]  ? [mine[@"Extra"] boolValue]  : YES;
+    _ovList.on   = mine[@"ListAccel"] ? [mine[@"ListAccel"] boolValue] : NO;
+
+    BOOL guarded = [HardGuardBundles() containsObject:bid];
+    _ovList.enabled = !guarded;
+    if (guarded) {
+        _ovList.on = NO;
+        _ovGuard.text = [NSString stringWithFormat:
+            @"⚠️ %@ 在列表 hook 硬保护名单内：列表加速恒为关闭，开关与配置都无法打开（dylib 启动日志会打印 listGuard=1）。该 App 的加速只走其余 34 个非列表 hook。", bid];
+    } else if (mine) {
+        _ovGuard.text = [NSString stringWithFormat:@"已存在 %@ 的专属配置，修改后点「保存配置」生效。", bid];
+    } else {
+        _ovGuard.text = [NSString stringWithFormat:@"%@ 暂无专属配置。打开「为该 App 启用专属配置」再保存即可创建。", bid];
+    }
+}
+
+- (void)ovSliderChanged {
+    _ovSpeedLabel.text = [NSString stringWithFormat:@"专属倍率（当前 ×%.1f）", _ovSpeed.value];
+}
+
+// 勾选/取消「启用专属配置」时只更新提示，不动控件值
+- (void)ovToggled {
+    NSString *bid = [_ovBundle.text stringByTrimmingCharactersInSet:
+                     [NSCharacterSet whitespaceCharacterSet]];
+    if (!bid.length) bid = @"com.sfic.knight";
+    if ([HardGuardBundles() containsObject:bid]) {
+        _ovGuard.text = [NSString stringWithFormat:
+            @"⚠️ %@ 在列表 hook 硬保护名单内：列表加速恒为关闭，开关与配置都无法打开。该 App 的加速只走其余 34 个非列表 hook。", bid];
+    } else if (_ovOn.on) {
+        _ovGuard.text = [NSString stringWithFormat:@"保存后将为 %@ 创建专属配置（优先级高于全局值）。", bid];
+    } else {
+        _ovGuard.text = [NSString stringWithFormat:@"保存后将删除 %@ 的专属配置，该 App 回到全局配置。", bid];
+    }
 }
 
 - (void)modeChanged {
@@ -422,6 +560,31 @@ static void WriteUIKitDrag(BOOL enabled) {
         if (t.length) [bl addObject:t];
     }
     cfg[@"Blacklist"] = bl;
+
+    // v1.8.14：写入 / 删除 App 专属覆盖
+    NSString *ovBid = [_ovBundle.text stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceCharacterSet]];
+    id ovAllRaw = [NSDictionary dictionaryWithContentsOfFile:PrefPath][@"AppOverrides"];
+    NSMutableDictionary *ovOut = [ovAllRaw isKindOfClass:[NSDictionary class]]
+                                 ? [ovAllRaw mutableCopy] : [NSMutableDictionary dictionary];
+    if (ovBid.length) {
+        if (_ovOn.on) {
+            BOOL guarded = [HardGuardBundles() containsObject:ovBid];
+            ovOut[ovBid] = @{
+                @"Enabled":   @YES,
+                @"Mode":      @((int)_ovMode.selectedSegmentIndex),
+                @"Speed":     @((double)_ovSpeed.value),
+                @"Spring":    @(_ovSpring.on),
+                @"Extra":     @(_ovExtra.on),
+                // 硬保护名单内恒写 NO，避免配置文件里留下一个会被 dylib 忽略的 YES
+                @"ListAccel": @(guarded ? NO : _ovList.on),
+            };
+        } else {
+            [ovOut removeObjectForKey:ovBid];
+        }
+    }
+    cfg[@"AppOverrides"] = ovOut;
+
     BOOL ok = WriteConfig(cfg);
     WriteAx(@"ReduceMotionEnabled", _swRM.on);
     WriteAx(@"PreferCrossFadeTransitions", _swCF.on);
@@ -431,12 +594,13 @@ static void WriteUIKitDrag(BOOL enabled) {
     [fg prepare];
     if (ok) {
         [fg notificationOccurred:UINotificationFeedbackTypeSuccess];
-        NSString *msg = [NSString stringWithFormat:@"已保存：%@ · %@ · 弹簧%@ · 转场%@ · 列表%@",
+        NSString *msg = [NSString stringWithFormat:@"已保存：%@ · %@ · 弹簧%@ · 转场%@ · 列表%@ · 专属%@",
                         _swEnabled.on ? @"开" : @"关",
                         ModeText((int)_segMode.selectedSegmentIndex),
                         _swSpring.on ? @"开" : @"关",
                         _swExtra.on ? @"开" : @"关",
-                        _swList.on ? @"开" : @"关"];
+                        _swList.on ? @"开" : @"关",
+                        (_ovOn.on && ovBid.length) ? ovBid : @"无"];
         _status.text = msg;
         UIAlertController *a = [UIAlertController alertControllerWithTitle:@"✅ 配置已保存"
                             message:msg preferredStyle:UIAlertControllerStyleAlert];

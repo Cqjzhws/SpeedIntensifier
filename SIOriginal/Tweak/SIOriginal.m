@@ -41,6 +41,23 @@
 // 全部沿用已验证的 CATransaction/时长改写机制，不触碰 TV/CV 列表状态机。
 // =========================================================================
 //
+// ============================ v1.8.14 顺丰同城骑士防护 ============================
+// 场景：TrollStore + TrollFools 把本 dylib 注入顺丰同城骑士 (com.sfic.knight)。
+// 该 App 是本项目实测确认的「列表 hook 冲突」App：24 个 TV/CV 变更类 hook 会破坏
+// 它的列表状态机 → 卡死 / 崩溃（v1.8.11 之前靠 bundle id 硬编码排除，v1.8.11 改成
+// 纯开关控制后，只剩"用户记得关"这一层，而配置是全局的 —— 为别的 App 打开列表
+// 加速会连带把顺丰同城也打开）。
+//
+// 本轮做两件事：
+//  1. [防护] 列表 hook 硬保护名单 SIO_listHardBlocked()：名单内 App 的 ListAccel
+//     恒为 NO，优先级高于全局开关与 App 覆盖，任何配置都打不开。
+//     —— 安全项必须 fail-safe，不接受"忘了关"。
+//  2. [优化] App 级配置覆盖 AppOverrides：允许为指定 Bundle ID 单独设置
+//     倍率/模式/弹簧/转场/列表/保活，互不干扰。这样顺丰同城可以调到比其他 App
+//     更合适的参数，而调其他 App 不会连带影响它。
+//     优先级：硬保护 > App 覆盖 > 全局配置。
+// =========================================================================
+//
 // ============================ v1.8.13 优化加强 ============================
 // [加强] 补齐老式 UIView 动画 API 的时长/延迟接管：
 //   +[UIView setAnimationDuration:] 与 +[UIView setAnimationDelay:]
@@ -130,9 +147,59 @@ static inline void SIO_setTransactionDuration(double d) {
     SIO_setUIViewAnim(was);
 }
 
+// ---------- v1.8.14 App 级配置覆盖 + 列表 hook 硬保护 ----------
+
+static NSString *SIO_bundleID(void) {
+    if (!gSelfBundle) gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    return gSelfBundle;
+}
+
+// AppOverrides 结构：
+//   AppOverrides = { "com.sfic.knight" = { Speed = 8; Mode = 0; Spring = 1; Extra = 1;
+//                                          ListAccel = 0; Enabled = 1;
+//                                          FUBGEnabled = 1; FUBGSceneFake = 1; FUBGAudioKeep = 1; }; }
+// 命中当前进程则返回该字典，否则 nil。优先级：硬保护 > App 覆盖 > 全局。
+static NSDictionary *SIO_appOverride(NSDictionary *root) {
+    if (![root isKindOfClass:[NSDictionary class]]) return nil;
+    id ov = root[@"AppOverrides"];
+    if (![ov isKindOfClass:[NSDictionary class]]) return nil;
+    NSString *bid = SIO_bundleID();
+    if (!bid.length) return nil;
+    id mine = ((NSDictionary *)ov)[bid];
+    return [mine isKindOfClass:[NSDictionary class]] ? (NSDictionary *)mine : nil;
+}
+
+// 列表 hook 硬保护名单。
+// 名单内 App 的 ListAccel 恒为 NO：全局开关、App 覆盖都无法打开。
+// 名单来源为本项目实测记录 —— 这些 App 的列表 UI 与 TV/CV 变更类 hook 冲突，
+// 会破坏列表状态机导致卡死/崩溃。安全项 fail-safe，不接受"忘了关"。
+static BOOL SIO_listHardBlocked(void) {
+    static NSArray *blocked = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        blocked = @[
+            @"com.sfic.knight",   // 顺丰同城骑士（实测确认：列表 hook 导致卡死）
+        ];
+    });
+    NSString *bid = SIO_bundleID();
+    if (!bid.length) return NO;
+    return [blocked containsObject:bid];
+}
+
+// 本进程是否命中 App 覆盖 / 是否被列表硬保护（供启动日志与配置排查）
+static BOOL gHasAppOverride   = NO;
+static BOOL gListHardGuarded  = NO;
+
 static void SIO_reload(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
-    if (!d) { gSelfBlacklisted = NO; return; }
+    if (!d) {
+        gSelfBlacklisted = NO;
+        gHasAppOverride  = NO;
+        // 配置缺失也要执行硬保护，保证"没有配置文件"时顺丰同城同样安全
+        gListHardGuarded = SIO_listHardBlocked();
+        if (gListHardGuarded) gListAccel = NO;
+        return;
+    }
     gEnabled = [d[@"Enabled"] boolValue];
     int mode = [d[@"Mode"] intValue];
     gMode = (mode >= 0 && mode <= 2) ? mode : 0;
@@ -165,6 +232,36 @@ static void SIO_reload(void) {
                            [NSCharacterSet whitespaceCharacterSet]];
             if (s.length && [bid isEqualToString:s]) { gSelfBlacklisted = YES; break; }
         }
+    }
+
+    // ---- v1.8.14：App 级覆盖（在全局之后应用，优先级更高） ----
+    NSDictionary *ovr = SIO_appOverride(d);
+    gHasAppOverride = (ovr != nil);
+    if (ovr) {
+        if (ovr[@"Enabled"])    gEnabled = [ovr[@"Enabled"] boolValue];
+        if (ovr[@"Mode"]) {
+            int m2 = [ovr[@"Mode"] intValue];
+            if (m2 >= 0 && m2 <= 2) gMode = m2;
+        }
+        if (ovr[@"Speed"]) {
+            double s2 = [ovr[@"Speed"] doubleValue];
+            if (s2 >= 1.0 && s2 <= 50.0) gSpeed = s2;
+        }
+        if (ovr[@"SlowFactor"]) {
+            double f2 = [ovr[@"SlowFactor"] doubleValue];
+            if (f2 > 1.0 && f2 <= 10.0) gSlowFactor = f2;
+        }
+        if (ovr[@"Spring"])     gSpring    = [ovr[@"Spring"] boolValue];
+        if (ovr[@"Extra"])      gExtra     = [ovr[@"Extra"] boolValue];
+        if (ovr[@"ListAccel"])  gListAccel = [ovr[@"ListAccel"] boolValue];
+    }
+
+    // ---- v1.8.14：列表 hook 硬保护，必须放在所有覆盖之后，优先级最高 ----
+    gListHardGuarded = SIO_listHardBlocked();
+    if (gListHardGuarded && gListAccel) {
+        NSLog(@"[SIOriginal] ListAccel was ON but hard guard force-disabled it for %@ "
+              @"(list hooks break this app's list state machine)", SIO_bundleID());
+        gListAccel = NO;
     }
 }
 
@@ -914,8 +1011,12 @@ static void SIOriginalInit(void) {
     SIO_installiOS16Extras();
 
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
-    NSLog(@"[SIOriginal] v1.8.13 hooks installed in %@ (enabled=%d mode=%d speed=%.1f spring=%d extra=%d list=%d)",
-          gSelfBundle, gEnabled, gMode, gSpeed, gSpring, gExtra, gListAccel);
+    // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
+    NSLog(@"[SIOriginal] v1.8.14 hooks installed in %@ (enabled=%d mode=%d speed=%.1f spring=%d extra=%d list=%d override=%d listGuard=%d)",
+          gSelfBundle, gEnabled, gMode, gSpeed, gSpring, gExtra, gListAccel, gHasAppOverride, gListHardGuarded);
+    if (gListHardGuarded) {
+        NSLog(@"[SIOriginal] %@ is on the list-hook hard-guard list: ListAccel is forced OFF (safety)", gSelfBundle);
+    }
     } @catch (NSException *e) {
         NSLog(@"[SIOriginal] hook install failed (feature degraded, app unaffected): %@", e);
     }
@@ -1188,6 +1289,13 @@ static void _fbg_loadPref(void) {
                 if (s.length) [clean addObject:s];
             }
             gExclude = clean;
+            // v1.8.14：保活相关的 App 级覆盖（与动画侧共用同一份 AppOverrides）
+            NSDictionary *ovr = SIO_appOverride(d);
+            if (ovr) {
+                if (ovr[@"FUBGEnabled"])   gFUBGEnabled = [ovr[@"FUBGEnabled"] boolValue];
+                if (ovr[@"FUBGSceneFake"]) gSceneFake   = [ovr[@"FUBGSceneFake"] boolValue];
+                if (ovr[@"FUBGAudioKeep"]) gAudioKeep   = [ovr[@"FUBGAudioKeep"] boolValue];
+            }
         }
     } @catch (__unused NSException *e) {}
     if (!gExclude) gExclude = @[];
@@ -1716,8 +1824,8 @@ static void _fbg_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n,
                               const void *obj, CFDictionaryRef info) {
     (void)c; (void)o; (void)n; (void)obj; (void)info;
     _fbg_loadPref();
-    NSLog(@"[FUBG] prefs reloaded: active=%d scene=%d audio=%d ball=%d",
-          gActive, gUseScene, gUseAudio, gShowBall);
+    NSLog(@"[FUBG] prefs reloaded: active=%d scene=%d audio=%d ball=%d override=%d",
+          gActive, gUseScene, gUseAudio, gShowBall, gHasAppOverride);
     // v1.8.10：悬浮球全局禁用，无需刷新
     if (!gUseAudio && gPhysBg) _fbg_stopAudio(NO);
     if (gUseAudio && gPhysBg && (!gPlayer || !gPlayer.isPlaying)) _fbg_startAudio();
@@ -1774,7 +1882,7 @@ static void FUBGEntry(void) {
             // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
         });
 
-        NSLog(@"[FUBG] v2.0.0 (SIOriginal v1.8.13) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.0.0 (SIOriginal v1.8.14) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
