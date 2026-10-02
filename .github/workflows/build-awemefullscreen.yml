@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    name: Build AwemeFullScreen dylib
+    name: Build AwemeFullScreen dylib (+ diag)
     runs-on: macos-15
 
     steps:
@@ -20,36 +20,44 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 
-      # 抖音全屏：纯 ObjC runtime，无 CydiaSubstrate，无配置 App，无任何屏幕文字
-      - name: Build dylib (pure clang)
+      # 抖音全屏：纯 ObjC runtime，无 CydiaSubstrate
+      # 同一份源码编两份：
+      #   AwemeFullScreen.dylib       正式版，无任何屏幕文字
+      #   AwemeFullScreen-Diag.dylib  诊断版（-DAFS_DIAG=1），顶部叠加几何报告
+      - name: Build dylibs (pure clang)
         run: |
           set -e
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           echo "SDK: $SDK"
           mkdir -p artifacts
-          clang -arch arm64 -dynamiclib -O2 \
-            -install_name @rpath/AwemeFullScreen.dylib \
-            -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 \
+          COMMON="-arch arm64 -dynamiclib -O2 -isysroot $SDK -miphoneos-version-min=14.0 \
             -undefined dynamic_lookup -fobjc-arc \
-            -framework Foundation -framework UIKit -framework CoreGraphics -framework CoreFoundation \
-            -o artifacts/AwemeFullScreen.dylib AwemeFullScreen/Tweak/AwemeFullScreen.m
-          codesign --force --sign - artifacts/AwemeFullScreen.dylib
-          lipo -info artifacts/AwemeFullScreen.dylib
-          file artifacts/AwemeFullScreen.dylib
-          echo "dylib size: $(du -h artifacts/AwemeFullScreen.dylib | cut -f1)"
-          echo "--- must NOT link CydiaSubstrate ---"
-          otool -L artifacts/AwemeFullScreen.dylib
+            -framework Foundation -framework UIKit -framework CoreGraphics -framework CoreFoundation"
 
-      - name: Verify artifacts
+          clang $COMMON -install_name @rpath/AwemeFullScreen.dylib \
+            -o artifacts/AwemeFullScreen.dylib AwemeFullScreen/Tweak/AwemeFullScreen.m
+
+          clang $COMMON -DAFS_DIAG=1 -install_name @rpath/AwemeFullScreen-Diag.dylib \
+            -o artifacts/AwemeFullScreen-Diag.dylib AwemeFullScreen/Tweak/AwemeFullScreen.m
+
+          codesign --force --sign - artifacts/AwemeFullScreen.dylib
+          codesign --force --sign - artifacts/AwemeFullScreen-Diag.dylib
+          lipo -info artifacts/AwemeFullScreen.dylib
+          lipo -info artifacts/AwemeFullScreen-Diag.dylib
+          ls -lh artifacts/
+
+      - name: Verify artifacts (must not link CydiaSubstrate)
         run: |
           set -e
-          ls -lh artifacts/
-          file artifacts/AwemeFullScreen.dylib
-          if otool -L artifacts/AwemeFullScreen.dylib | grep -qi substrate; then
-            echo "ERROR: CydiaSubstrate dependency found"; exit 1
-          fi
-          echo "OK: no Substrate dependency"
+          for f in artifacts/AwemeFullScreen.dylib artifacts/AwemeFullScreen-Diag.dylib; do
+            echo "--- $f"
+            file "$f"
+            otool -L "$f"
+            if otool -L "$f" | grep -qi substrate; then
+              echo "ERROR: CydiaSubstrate dependency found in $f"; exit 1
+            fi
+          done
+          echo "OK: no Substrate dependency in either dylib"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -66,4 +74,5 @@ jobs:
           name: AwemeFullScreen ${{ github.ref_name }}
           files: |
             artifacts/AwemeFullScreen.dylib
+            artifacts/AwemeFullScreen-Diag.dylib
           generate_release_notes: true

@@ -1,28 +1,32 @@
-// AwemeFullScreen — 抖音(Aweme) 全屏插件 v2.3.0
+// AwemeFullScreen — 抖音(Aweme) 全屏插件 v2.4.0
 // ============================================================================
-// 本版全部依据「诊断版在抖音 38.0.0 上实测回传的真实数据」，不再有任何猜测：
+// 本版依据「诊断版在抖音 38.0.0 上实测回传的真实数据」，并修正 v2.3.0 的失误。
 //
-//   bid        = com.ss.iphone.ugc.Aweme          ← 之前写的 com.ss.iphone.aweme 完全不对
-//   底栏类名    = AWENormalModeTabBar               （内含 UITabBarButton / _UIBarBackground，属 UITabBar 系）
-//   底栏皮肤    = AWETabBarSkinView                 （父视图 AWETabBarSkinContainerView）
+// 实测事实（38.0.0）：
+//   bid        = com.ss.iphone.ugc.Aweme
+//   底栏        = AWENormalModeTabBar（内含 UITabBarButton / _UIBarBackground）
+//   底栏皮肤    = AWETabBarSkinView（父 AWETabBarSkinContainerView）
 //   VC 链       = AWENormalModeTabBarController_hmd_subfix_
 //                 > AWEBasedRootNavigationController_hmd_subfix_
 //                 > AWEFeedRootViewController_hmd_subfix_
 //                 > ... > AWEFeedTableViewController > AWELiveNewPreStreamViewController
-//   awemeBaseViewController 在 38.0.0 不存在（诊断回传 aweBase=无）
-//   awe_tabBar / awe_blurView / progressSliderUnderView 三个 ivar 在 38.0.0 均不存在
-//   所有类名都带 _hmd_subfix_ 混淆后缀（不影响 strstr 子串匹配）
+//   awemeBaseViewController / awe_tabBar / awe_blurView / progressSliderUnderView 在 38.0.0 均不存在
+//   类名统一带 _hmd_subfix_ 混淆后缀
 //
-// 由此得到两个必须修正的点：
-//   1) bundle id 门禁 —— 用实测值，并保留 CFBundleExecutable == "Aweme" 兜底；
-//   2) 识别与隐藏目标 —— 放弃 ivar/awemeBase 路线，改为：
-//        · 隐藏目标：类名含 NormalModeTabBar / TabBarSkin / TabBar / tabBar / blur 的视图
-//        · 页面判定：VC 链上出现 AWEFeed / AWELive / AWEHPX / AWEAweme 视为「首页/视频/直播区」
-//          其它 Tab（消息/我）不隐藏，并把之前隐藏过的恢复回来。
+// v2.3.0 的教训：
+//   为了消除底栏腾出的黑边，v2.3.0 在定时器里把首页 VC 的 view.frame 强设成整屏。
+//   实测反而让视频区域缩到屏幕上部、下方出现更大的黑区 —— 说明该 VC 的 view 是
+//   Auto Layout 驱动的，直接改 frame 会破坏它内部的约束求解。
+//   所以 v2.4.0 **不再碰任何 frame**，只做“隐藏/恢复底栏”这一件已被验证有效的事；
+//   黑边问题改为先用几何诊断量清楚再动手（见 AFS_DIAG）。
 //
-// 屏幕文字：本实现不显示任何屏幕文字，源码内无中文字符串字面量，
-//          不引用 showText:withCenterPoint:。
-// 环境：纯 ObjC runtime，无 CydiaSubstrate；install name 与外层一致。
+// 行为：
+//   · -[UIView layoutSubviews] 热路径：一次类名缓存命中即早退；命中且当前在首页区
+//     （VC 链上出现 AWEFeed / AWELive / AWEHPX / AWEAweme）→ 隐藏并登记。
+//   · 0.4s 定时兜底：在首页区把登记过的底栏重新压下去；离开首页区则恢复。
+//   · 隐藏登记用 NSHashTable 弱引用，视图释放自动置 nil，无悬垂指针风险。
+//   · 屏幕文字：正式版无任何文字；诊断版（-DAFS_DIAG=1）才在顶部叠加几何报告。
+//   · 纯 ObjC runtime，无 CydiaSubstrate。
 // ============================================================================
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -30,11 +34,13 @@
 #import <notify.h>
 #import <string.h>
 
+#ifndef AFS_DIAG
+#define AFS_DIAG 0
+#endif
+
 #define kAFSPrefPath    @"/var/Managed Preferences/mobile/com.local.awemefullscreen.plist"
 #define kAFSNotifyName  @"com.local.awemefullscreen.settingschanged"
-// v2.3.0：实测的真实 bundle id
 #define kAFSBundleNew   @"com.ss.iphone.ugc.Aweme"
-// 老版本 / 极速版兜底
 #define kAFSBundleOld   @"com.ss.iphone.aweme"
 
 // ---------- 全局状态 ----------
@@ -43,22 +49,16 @@ static BOOL gFullScreen = YES;
 static BOOL gVerbose    = NO;
 static BOOL gIsAweme    = NO;
 static BOOL gActive     = NO;
-static CGRect gScreenBounds;
 static BOOL gFirstHitLogged = NO;
 
-// 直接映射缓存：某 Class 是否属于「需要隐藏的类」
 #define kAFSClsCacheSize 1024
 static Class  gClsKey[kAFSClsCacheSize];
 static int8_t gClsVal[kAFSClsCacheSize];
-
-// 直接映射缓存：某 Class 是否属于「首页/视频/直播区的 VC」
 static Class  gFeedKey[kAFSClsCacheSize];
 static int8_t gFeedVal[kAFSClsCacheSize];
 
-// 我们隐藏过的视图（弱引用，安全自动置 nil）
-static NSHashTable *gHidden = nil;
+static NSHashTable *gHidden = nil;       // 我们隐藏过的视图（弱引用）
 
-// 页面判定的懒计算缓存
 static BOOL           gInFeed = NO;
 static NSTimeInterval gInFeedAt = 0;
 
@@ -93,14 +93,11 @@ static BOOL AFS_detectAweme(void) {
 
 #pragma mark - 类名判定（每个 Class 只做一次 strstr）
 
-// 1 = 底栏类（含皮肤） 2 = 模糊类
 static int8_t AFS_hideVerdictCompute(Class c) {
     const char *cn = class_getName(c);
     if (!cn) return 0;
-    // 实测目标：AWENormalModeTabBar / AWETabBarSkinView
     if (strstr(cn, "NormalModeTabBar")) return 1;
     if (strstr(cn, "TabBarSkin"))       return 1;
-    // 通用兜底（UITabBarButton、_UIBarBackground 等会被父视图一并隐藏）
     if (strstr(cn, "tabBar") || strstr(cn, "TabBar") || strstr(cn, "tabbar")) return 1;
     if (strstr(cn, "blur")   || strstr(cn, "Blur")) return 2;
     return 0;
@@ -116,7 +113,6 @@ static inline int8_t AFS_hideVerdict(Class c) {
     return r;
 }
 
-// 该 VC 是否属于「首页 / 视频 / 直播区」（实测类名 + 老版本兜底）
 static int8_t AFS_feedVerdictCompute(Class c) {
     const char *cn = class_getName(c);
     if (!cn) return 0;
@@ -124,9 +120,7 @@ static int8_t AFS_feedVerdictCompute(Class c) {
     if (strstr(cn, "AWELive"))  return 1;
     if (strstr(cn, "AWEHPX"))   return 1;
     if (strstr(cn, "AWEAweme")) return 1;
-    // 老版本（≤ 某版本）兜底
     if (strstr(cn, "awemeBase") || strstr(cn, "AwemeBase")) return 1;
-    if (strstr(cn, "AWEFamiliar") || strstr(cn, "AWEFollow")) return 1;
     return 0;
 }
 
@@ -144,14 +138,13 @@ static inline BOOL AFS_isFeedVC(id vc) {
     Class c = object_getClass(vc);
     if (!c) return NO;
     if (AFS_feedVerdict(c)) return YES;
-    // ivar / selector 兜底（老版本才有）
-    if (class_getInstanceVariable(c, "awe_tabBar"))    return YES;
-    if (class_getInstanceVariable(c, "awe_blurView"))  return YES;
+    if (class_getInstanceVariable(c, "awe_tabBar"))   return YES;
+    if (class_getInstanceVariable(c, "awe_blurView")) return YES;
     if ([vc respondsToSelector:@selector(isFromGeneralSearchOrVideoSearch)]) return YES;
     return NO;
 }
 
-#pragma mark - 当前 VC 链 / 是否在首页区
+#pragma mark - 窗口 / VC 链
 
 static UIWindowScene *AFS_activeScene(void) {
     for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
@@ -171,24 +164,23 @@ static UIWindow *AFS_keyWindow(void) {
     return nil;
 }
 
-// 遍历 VC 链，返回第一个属于首页区的 VC（同时把整条链都看一遍）
+static UIViewController *AFS_nextVC(UIViewController *vc) {
+    if (!vc) return nil;
+    if (vc.presentedViewController) return vc.presentedViewController;
+    if ([vc isKindOfClass:[UINavigationController class]])
+        return ((UINavigationController *)vc).topViewController;
+    if ([vc isKindOfClass:[UITabBarController class]])
+        return ((UITabBarController *)vc).selectedViewController;
+    NSArray *kids = [vc childViewControllers];
+    return [kids count] ? [kids lastObject] : nil;
+}
+
 static UIViewController *AFS_findFeedVC(void) {
-    UIWindow *kw = AFS_keyWindow();
-    UIViewController *vc = kw.rootViewController;
+    UIViewController *vc = AFS_keyWindow().rootViewController;
     int guard = 0;
     while (vc && guard++ < 16) {
         if (AFS_isFeedVC(vc)) return vc;
-        UIViewController *next = nil;
-        if (vc.presentedViewController) {
-            next = vc.presentedViewController;
-        } else if ([vc isKindOfClass:[UINavigationController class]]) {
-            next = ((UINavigationController *)vc).topViewController;
-        } else if ([vc isKindOfClass:[UITabBarController class]]) {
-            next = ((UITabBarController *)vc).selectedViewController;
-        } else {
-            NSArray *kids = [vc childViewControllers];
-            if ([kids count]) next = [kids lastObject];
-        }
+        UIViewController *next = AFS_nextVC(vc);
         if (!next || next == vc) break;
         vc = next;
     }
@@ -212,7 +204,7 @@ static void AFS_hideTarget(UIView *v) {
     if (!v.hidden) v.hidden = YES;
     if (!gFirstHitLogged) {
         gFirstHitLogged = YES;
-        NSLog(@"[AwemeFullScreen] v2.3.0 first hit: hid %s",
+        NSLog(@"[AwemeFullScreen] v2.4.0 first hit: hid %s",
               class_getName(object_getClass(v)));
     }
 }
@@ -234,40 +226,144 @@ static void (*o_afs_layoutSubviews)(id, SEL);
 static void afs_layoutSubviews(id self, SEL _cmd) {
     if (o_afs_layoutSubviews) o_afs_layoutSubviews(self, _cmd);
     if (!gActive) return;
-
-    // 热路径：一次类名判定缓存命中即可早退，绝大多数视图在这里就返回
-    if (AFS_hideVerdict(object_getClass(self)) == 0) return;
-
-    // 只是当前不在首页区就先不动（切换 Tab 时由定时器统一恢复）
+    if (AFS_hideVerdict(object_getClass(self)) == 0) return;   // 热路径早退
     if (!AFS_inFeedNow()) return;
     AFS_hideTarget((UIView *)self);
 }
 
-#pragma mark - 定时兜底：跟着页面切换 隐藏 / 恢复
+#pragma mark - 定时兜底
 
 static void AFS_tick(__unused NSTimer *t) {
     if (!gActive) return;
     if (AFS_inFeedNow()) {
-        // 首页区：把已记录的底栏重新压下去（抖音可能把它重新显示出来）
         if (gHidden) {
             for (UIView *v in gHidden.allObjects) {
                 if (!v.hidden) v.hidden = YES;
             }
         }
-        // 撑满：命中首页区的那个 VC 的根视图拉到全屏并清背景
-        UIViewController *feed = AFS_findFeedVC();
-        if (feed) {
-            UIView *root = feed.view;
-            if (root) {
-                CGRect sf = gScreenBounds;
-                if (CGRectIsEmpty(sf)) { sf = [UIScreen mainScreen].bounds; gScreenBounds = sf; }
-                if (!CGRectIsEmpty(sf) && !CGRectEqualToRect(root.frame, sf)) root.frame = sf;
-            }
-        }
+        // 注意：v2.4.0 刻意不做任何 frame 调整（v2.3.0 的 frame 强设反而破坏了布局）
     } else {
         AFS_restoreAll();
     }
 }
+
+#if AFS_DIAG
+#pragma mark - 诊断叠加（-DAFS_DIAG=1 才编进来；正式产物无任何文字）
+
+@interface AFSDWindow : UIWindow @end
+@implementation AFSDWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event { return nil; }
+@end
+
+static AFSDWindow *gWin = nil;
+static UILabel    *gLabel = nil;
+
+static NSString *AFSD_short(id obj) {
+    if (!obj) return @"(nil)";
+    NSString *s = [NSString stringWithUTF8String:class_getName(object_getClass(obj))];
+    s = [s stringByReplacingOccurrencesOfString:@"_hmd_subfix_" withString:@""];
+    s = [s stringByReplacingOccurrencesOfString:@"NSKVONotifying_" withString:@"KVO:"];
+    if (s.length > 30) s = [s substringToIndex:30];
+    return s;
+}
+
+static NSString *AFSD_rect(CGRect r) {
+    return [NSString stringWithFormat:@"(%.0f,%.0f,%.0f,%.0f)", r.origin.x, r.origin.y, r.size.width, r.size.height];
+}
+
+// 底部候选（正确的坐标换算：把视图 bounds 转到 window 坐标系）
+static void AFSD_bottom(UIView *v, CGFloat screenH, NSMutableArray *out, int depth) {
+    if (!v || depth > 10 || out.count >= 7) return;
+    if (!v.hidden && v.alpha > 0.01) {
+        CGRect w = [v convertRect:v.bounds toView:nil];
+        CGFloat gap = screenH - (w.origin.y + w.size.height);
+        if (gap >= -1.0 && w.size.height > 8.0 && w.size.width > 80.0) {
+            [out addObject:[NSString stringWithFormat:@"%@ h=%.0f gap=%.0f",
+                            AFSD_short(v), w.size.height, gap]];
+        }
+    }
+    for (UIView *s in v.subviews) AFSD_bottom(s, screenH, out, depth + 1);
+}
+
+// 找第一个 UIScrollView（表格详情页的黑边通常来自它的 frame/inset）
+static UIScrollView *AFSD_firstScroll(UIView *v, int depth) {
+    if (!v || depth > 10) return nil;
+    if ([v isKindOfClass:[UIScrollView class]]) return (UIScrollView *)v;
+    for (UIView *s in v.subviews) {
+        UIScrollView *r = AFSD_firstScroll(s, depth + 1);
+        if (r) return r;
+    }
+    return nil;
+}
+
+static void AFSD_refresh(void) {
+    @try {
+        UIWindow *kw = AFS_keyWindow();
+        if (!kw) return;
+        CGRect sb = kw.bounds;
+        UIEdgeInsets sa = kw.safeAreaInsets;
+        UIViewController *vc = kw.rootViewController;
+
+        NSMutableString *s = [NSMutableString string];
+        [s appendFormat:@"AFS-GEO v2.4.0  screen=%@ safe=(%.0f,%.0f)\n",
+                         AFSD_rect(sb), sa.top, sa.bottom];
+
+        int guard = 0;
+        while (vc && guard++ < 6) {
+            UIView *v = vc.view;
+            [s appendFormat:@"%@ f=%@ ai.b=%.0f sa.b=%.0f\n",
+                AFSD_short(vc), v ? AFSD_rect(v.frame) : @"nil",
+                vc.additionalSafeAreaInsets.bottom, v ? v.safeAreaInsets.bottom : 0];
+            UIViewController *n = AFS_nextVC(vc);
+            if (!n || n == vc) break;
+            vc = n;
+        }
+
+        NSMutableArray *bot = [NSMutableArray array];
+        AFSD_bottom(kw, sb.size.height, bot, 0);
+        [s appendFormat:@"底部可见(%lu):\n", (unsigned long)bot.count];
+        for (NSString *b in bot) [s appendFormat:@"  %@\n", b];
+
+        UIViewController *feed = AFS_findFeedVC();
+        if (feed && feed.view) {
+            UIScrollView *sv = AFSD_firstScroll(feed.view, 0);
+            if (sv) {
+                [s appendFormat:@"scroll %@ f=%@ ci=%@ adj=%@ beh=%ld\n",
+                    AFSD_short(sv), AFSD_rect(sv.frame),
+                    NSStringFromUIEdgeInsets(sv.contentInset),
+                    NSStringFromUIEdgeInsets(sv.adjustedContentInset),
+                    (long)sv.contentInsetAdjustmentBehavior];
+            }
+        }
+        [s appendFormat:@"feedVC=%@ hidden=%lu\n",
+            feed ? AFSD_short(feed) : @"(nil)",
+            (unsigned long)(gHidden ? gHidden.count : 0)];
+
+        dispatch_async(dispatch_get_main_queue(), ^{ gLabel.text = s; });
+    } @catch (__unused NSException *e) {}
+}
+
+static void AFSD_show(void) {
+    UIWindowScene *ws = AFS_activeScene();
+    if (!ws || gWin) return;
+    gWin = [[AFSDWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    gWin.windowScene = ws;
+    gWin.windowLevel = UIWindowLevelAlert + 1;
+    gWin.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.80];
+    gWin.rootViewController = [UIViewController new];
+    gWin.hidden = NO;
+    CGFloat w = [UIScreen mainScreen].bounds.size.width;
+    gLabel = [[UILabel alloc] initWithFrame:CGRectMake(5, 55, w - 10, 430)];
+    gLabel.numberOfLines = 0;
+    gLabel.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
+    gLabel.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.5 alpha:1.0];
+    [gWin.rootViewController.view addSubview:gLabel];
+    AFSD_refresh();
+    NSTimer *t = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES
+                                                block:^(__unused NSTimer *tt){ AFSD_refresh(); }];
+    [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
+}
+#endif
 
 #pragma mark - 安装
 
@@ -276,7 +372,7 @@ static void AFS_swizzle(Class c, SEL sel, IMP newImp, IMP *orig) {
     Method m = class_getInstanceMethod(c, sel);
     if (!m) return;
     IMP cur = method_getImplementation(m);
-    if (cur == newImp) return;                 // 重复安装保护
+    if (cur == newImp) return;
     if (orig) *orig = cur;
     method_setImplementation(m, newImp);
 }
@@ -287,7 +383,6 @@ static void AFS_init(void) {
         gIsAweme = AFS_detectAweme();
         if (!gIsAweme) return;
         AFS_reload();
-        gScreenBounds = [UIScreen mainScreen].bounds;
 
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
             NULL, AFS_notifyCb, (__bridge CFStringRef)kAFSNotifyName, NULL,
@@ -296,16 +391,22 @@ static void AFS_init(void) {
         AFS_swizzle([UIView class], @selector(layoutSubviews),
                     (IMP)afs_layoutSubviews, (IMP *)&o_afs_layoutSubviews);
 
-        NSLog(@"[AwemeFullScreen] v2.3.0 installed in %@ active=%d layoutSubviews=%s "
-              @"(pure runtime, no Substrate, no text)",
-              [[NSBundle mainBundle] bundleIdentifier], gActive,
+        NSLog(@"[AwemeFullScreen] v2.4.0%s installed in %@ active=%d layoutSubviews=%s",
+              AFS_DIAG ? "-diag" : "", [[NSBundle mainBundle] bundleIdentifier], gActive,
               o_afs_layoutSubviews ? "ok" : "FAILED");
 
-        // 定时兜底：0.4s 一次，负责"切 Tab 后恢复"和"底栏被重新显示后再压下去"
         dispatch_async(dispatch_get_main_queue(), ^{
             NSTimer *t = [NSTimer scheduledTimerWithTimeInterval:0.4 repeats:YES
                                                         block:^(NSTimer *tt){ AFS_tick(tt); }];
             [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
+#if AFS_DIAG
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ AFSD_show(); });
+            for (int i = 1; i <= 6; i++) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 2.0 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{ if (!gWin) AFSD_show(); });
+            }
+#endif
         });
     } @catch (NSException *e) {
         NSLog(@"[AwemeFullScreen] install failed (app unaffected): %@", e);
