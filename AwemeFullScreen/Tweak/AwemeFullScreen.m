@@ -66,9 +66,10 @@ static void *gWatch[kAFSWatchMax];
 static int   gWatchCount = 0;
 
 // 类名判定直接映射缓存；冲突就重算，正确性不受影响
+// 键用 Class 类型（不是 void*）：ARC 下 ObjC 指针转 void* 需要桥接，用 Class 免去麻烦
 #define kAFSClsCacheSize 1024
-static const void *gClsKey[kAFSClsCacheSize];
-static int8_t      gClsVal[kAFSClsCacheSize];
+static Class  gClsKey[kAFSClsCacheSize];
+static int8_t gClsVal[kAFSClsCacheSize];
 
 // "当前是否视频页"的懒计算缓存
 static BOOL           gOnVideoPage = NO;
@@ -107,7 +108,7 @@ static BOOL AFS_detectAweme(void) {
 static inline void AFS_watchAdd(UIView *v) {
     void *p = (__bridge void *)v;
     for (int i = 0; i < gWatchCount; i++) if (gWatch[i] == p) return;
-    if (gWatchCount < kAFSWatchMax) { gWatch[kWatchCount++] = p; return; }
+    if (gWatchCount < kAFSWatchMax) { gWatch[gWatchCount++] = p; return; }
     memmove(gWatch, gWatch + 1, sizeof(void *) * (kAFSWatchMax - 1));
     gWatch[kAFSWatchMax - 1] = p;
 }
@@ -236,8 +237,10 @@ static BOOL AFS_hierarchyHasVideoVC(void) {
             next = ((UINavigationController *)vc).topViewController;
         } else if ([vc isKindOfClass:[UITabBarController class]]) {
             next = ((UITabBarController *)vc).selectedViewController;
-        } else if (vc.children.count) {
-            next = vc.children.lastObject;
+        } else {
+            // 用消息语法取子控制器（避免个别 SDK 上 children 属性解析不到的兼容问题）
+            NSArray *kids = [vc childViewControllers];
+            if ([kids count]) next = [kids lastObject];
         }
         if (!next || next == vc) break;
         vc = next;
