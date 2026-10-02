@@ -77,6 +77,22 @@
 //   默认关闭（ZoomAccel=0），因为这一族在微信上出过"预览页卡死"，需要实测再开。
 // =========================================================================
 //
+// ==================== v1.8.16 系统级增强 + SpringBoard 支持 ====================
+// [SpringBoard] 允许把本 dylib 经 TrollFools 注入 com.apple.springboard，接管
+//   桌面/控制中心/通知中心/App 启动退出/App 切换器的动画。两处硬防护：
+//     1. com.apple.springboard 进列表 hook 硬保护名单（SpringBoard 内部有大量
+//        TV/CV，列表 hook 一旦打开会破坏它的状态机 → 黑屏/白苹果）；
+//     2. com.apple.springboard 进内置保活排除名单 —— 保活引擎（音频断言 +
+//        场景伪装）对桌面进程毫无意义，且 SpringBoard 本身就是场景宿主，
+//        在它内部吞掉 scene 更新会影响全局 App 的后台化。这两项都是 fail-safe。
+//
+// [体感加速] 新增两个默认关闭的开关（不属于"改时长"，而是改交互手感）：
+//     FastScroll：UIScrollView.decelerationRate = Fast（滑行距离大幅缩短）
+//     FastTap   ：delaysContentTouches = NO（去掉列表点击约 150ms 延迟）
+//   在 -[UIScrollView didMoveToWindow] 里统一施加，覆盖 nib/storyboard/code
+//   三种来源的滚动视图。
+// =========================================================================
+//
 // ============================ v1.8.13 优化加强 ============================
 // [加强] 补齐老式 UIView 动画 API 的时长/延迟接管：
 //   +[UIView setAnimationDuration:] 与 +[UIView setAnimationDelay:]
@@ -114,6 +130,8 @@ static BOOL     gSpring    = YES;    // CASpring 参数缩放
 static BOOL     gExtra     = YES;    // 导航/模态进阶转场
 static BOOL     gListAccel = NO;     // TV/CV 列表全家桶（v1.8.11 起纯开关控制，默认关）
 static BOOL     gZoomAccel = NO;     // v1.8.15：UIScrollView 缩放动画（setZoomScale:animated: 等），默认关
+static BOOL     gFastScroll = NO;    // v1.8.16：滑行惯性加急（decelerationRate=Fast），默认关
+static BOOL     gFastTap = NO;       // v1.8.16：取消列表点击延迟（delaysContentTouches=NO），默认关
 static BOOL     gIsWeChat  = NO;     // 微信缩放预览守卫用（L104）
 // v1.8.12：黑名单在重载时一次性解析成本进程布尔值，热路径零分配（见 SIO_reload）
 static BOOL     gSelfBlacklisted = NO;
@@ -217,12 +235,26 @@ static BOOL SIO_listHardBlocked(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         blocked = @[
-            @"com.sfic.knight",   // 顺丰同城骑士（实测确认：列表 hook 导致卡死）
+            @"com.sfic.knight",        // 顺丰同城骑士（实测确认：列表 hook 导致卡死）
+            @"com.apple.springboard",  // v1.8.16：桌面进程，内部大量 TV/CV，一旦打开就是黑屏/白苹果
         ];
     });
     NSString *bid = SIO_bundleID();
     if (!bid.length) return NO;
     return [blocked containsObject:bid];
+}
+
+// v1.8.16：内置保活排除名单 —— 这些进程绝不参与真后台保活。
+// SpringBoard 本身就是场景宿主，在它内部吞掉 scene 更新会影响**全局所有 App** 的
+// 后台化行为，而保活（音频断言 + 场景伪装）对桌面进程本身毫无意义。
+static BOOL SIO_fbgBuiltinExcluded(void) {
+    static NSArray *list = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        list = @[ @"com.apple.springboard" ];
+    });
+    NSString *bid = SIO_bundleID();
+    return bid.length && [list containsObject:bid];
 }
 
 // 本进程是否命中 App 覆盖 / 是否被列表硬保护（供启动日志与配置排查）
@@ -254,6 +286,9 @@ static void SIO_reload(void) {
     gListAccel = d[@"ListAccel"] ? [d[@"ListAccel"] boolValue] : NO;
     // v1.8.15：缩放动画加速，缺键默认 NO（同一族在微信上出过「预览页卡死」，必须显式开）
     gZoomAccel = d[@"ZoomAccel"] ? [d[@"ZoomAccel"] boolValue] : NO;
+    // v1.8.16：交互手感开关，缺键默认 NO（会改变操作习惯，必须显式开）
+    gFastScroll = d[@"FastScroll"] ? [d[@"FastScroll"] boolValue] : NO;
+    gFastTap    = d[@"FastTap"]    ? [d[@"FastTap"] boolValue]    : NO;
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     gSelfBlacklisted = NO;
@@ -296,6 +331,8 @@ static void SIO_reload(void) {
         if (ovr[@"Extra"])      gExtra     = [ovr[@"Extra"] boolValue];
         if (ovr[@"ListAccel"])  gListAccel = [ovr[@"ListAccel"] boolValue];
         if (ovr[@"ZoomAccel"])  gZoomAccel = [ovr[@"ZoomAccel"] boolValue];
+        if (ovr[@"FastScroll"]) gFastScroll = [ovr[@"FastScroll"] boolValue];
+        if (ovr[@"FastTap"])    gFastTap    = [ovr[@"FastTap"] boolValue];
     }
 
     // ---- v1.8.14：列表 hook 硬保护，必须放在所有覆盖之后，优先级最高 ----
@@ -451,6 +488,9 @@ static void   (*o_layer_addAnim)(id, SEL, id, NSString *);
 // ---- v1.8.15：UIScrollView 缩放动画 ----
 static void   (*o_sv_setZoomScale)(id, SEL, CGFloat, BOOL);
 static void   (*o_sv_zoomToRect)(id, SEL, CGRect, BOOL);
+
+// ---- v1.8.16：交互手感（滑行惯性 / 点击延迟） ----
+static void   (*o_sv_didMoveToWindow)(id, SEL);
 
 // ---- v1.8.12 新增 hook ----
 static void   (*o_UV_anim_keyframes)(Class, SEL, double, double, NSUInteger, void (^)(void), void (^)(BOOL));
@@ -1061,8 +1101,12 @@ static void SIOriginalInit(void) {
 
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
-    NSLog(@"[SIOriginal] v1.8.15 hooks installed in %@ (enabled=%d mode=%d speed=%.1f spring=%d extra=%d list=%d zoom=%d override=%d listGuard=%d)",
-          gSelfBundle, gEnabled, gMode, gSpeed, gSpring, gExtra, gListAccel, gZoomAccel, gHasAppOverride, gListHardGuarded);
+    NSLog(@"[SIOriginal] v1.8.16 hooks installed in %@ (enabled=%d mode=%d speed=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d override=%d listGuard=%d)",
+          gSelfBundle, gEnabled, gMode, gSpeed, gSpring, gExtra, gListAccel, gZoomAccel,
+          gFastScroll, gFastTap, gHasAppOverride, gListHardGuarded);
+    if (SIO_fbgBuiltinExcluded()) {
+        NSLog(@"[SIOriginal] %@ is a built-in keep-alive exclusion: audio-assertion/scene-fake engine stays OFF", gSelfBundle);
+    }
     if (gListHardGuarded) {
         NSLog(@"[SIOriginal] %@ is on the list-hook hard-guard list: ListAccel is forced OFF (safety)", gSelfBundle);
     }
@@ -1236,6 +1280,35 @@ static void sio_SV_zoomToRect(id self, SEL _cmd, CGRect r, BOOL animated) {
     [CATransaction commit];
 }
 
+#pragma mark - 交互手感：滑行惯性 / 点击延迟（v1.8.16 新增，默认关闭）
+
+// 这一组不改动画时长，改的是"跟手程度"，属于体感加速：
+//   FastScroll —— decelerationRate = UIScrollViewDecelerationRateFast
+//                 松手后滑行距离大幅缩短，浏览长列表明显更快到达目标位置
+//   FastTap    —— delaysContentTouches = NO
+//                 去掉 UIScrollView 判定"这是滚动还是点击"的约 150ms 等待，点按立刻响应
+// 副作用（需实测）：FastTap 打开后，滚动中手指轻微移动可能被判定为点击；
+// FastScroll 会让依赖滑行距离触发"触底加载"的列表更早触发分页。
+//
+// 施加时机选 -[UIScrollView didMoveToWindow]：nib / storyboard / 纯代码创建的
+// 滚动视图都会经过这里，一次覆盖全部来源；且此时视图已完成基本配置，
+// 不会被初始化流程覆盖掉。
+static void sio_SV_didMoveToWindow(id self, SEL _cmd) {
+    SIO_REQUIRE_ORIG(o_sv_didMoveToWindow);
+    o_sv_didMoveToWindow(self, _cmd);
+    if (!gFastScroll && !gFastTap) return;
+    if (SIO_blocked()) return;
+    @try {
+        UIScrollView *sv = (UIScrollView *)self;
+        if (gFastScroll && sv.decelerationRate != UIScrollViewDecelerationRateFast) {
+            sv.decelerationRate = UIScrollViewDecelerationRateFast;
+        }
+        if (gFastTap && sv.delaysContentTouches) {
+            sv.delaysContentTouches = NO;
+        }
+    } @catch (__unused NSException *e) {}
+}
+
 #pragma mark - CALayer addAnimation:forKey:（补 CAAnimation setDuration 盲区）
 
 static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
@@ -1298,6 +1371,9 @@ static void SIO_installiOS16Extras(void) {
                             (IMP)sio_SV_setZoomScale, (IMP *)&o_sv_setZoomScale);
         SIO_swizzleInstance(sv, @selector(zoomToRect:animated:),
                             (IMP)sio_SV_zoomToRect, (IMP *)&o_sv_zoomToRect);
+        // v1.8.16 新增：交互手感（滑行惯性 / 点击延迟），FastScroll / FastTap 控制
+        SIO_swizzleInstance(sv, @selector(didMoveToWindow),
+                            (IMP)sio_SV_didMoveToWindow, (IMP *)&o_sv_didMoveToWindow);
     }
 
     if (layer) {
@@ -1331,6 +1407,8 @@ static NSTimer *gWatchdog = nil;
 #pragma mark - 配置
 
 static BOOL _fbg_isExcluded(void) {
+    // v1.8.16：内置排除（SpringBoard 等）优先级最高，配置无法打开
+    if (SIO_fbgBuiltinExcluded()) return YES;
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     for (NSString *b in gExclude) {
         if ([b isKindOfClass:[NSString class]] && b.length && [bid hasPrefix:b]) return YES;
@@ -1968,7 +2046,7 @@ static void FUBGEntry(void) {
             // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
         });
 
-        NSLog(@"[FUBG] v2.0.0 (SIOriginal v1.8.15) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.0.0 (SIOriginal v1.8.16) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");

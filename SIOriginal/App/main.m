@@ -146,6 +146,9 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"ListAccel"])  d[@"ListAccel"]  = @NO;
     // v1.8.15：缩放动画加速，默认关闭（同一族在微信上出过「预览页卡死」）
     if (!d[@"ZoomAccel"])  d[@"ZoomAccel"]  = @NO;
+    // v1.8.16：交互手感，默认关闭
+    if (!d[@"FastScroll"]) d[@"FastScroll"] = @NO;
+    if (!d[@"FastTap"])    d[@"FastTap"]    = @NO;
     if (!d[@"Blacklist"])  d[@"Blacklist"]  = @[ @"com.tencent.wework" ];
     if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
@@ -162,6 +165,7 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
     if (!merged) merged = [NSMutableDictionary dictionary];
     NSArray *sioKeys = @[ @"Enabled", @"Mode", @"Speed", @"SlowFactor",
                           @"Spring", @"Extra", @"ListAccel", @"Blacklist", @"ZoomAccel",
+                          @"FastScroll", @"FastTap",
                           @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
                           @"FUBGFloatingBall", @"FUBGExcludeApps", @"AppOverrides" ];
     for (NSString *k in sioKeys) {
@@ -192,16 +196,22 @@ static void WriteAx(NSString *key, BOOL val) {
 }
 
 static NSString * const UIKitPath = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
-static BOOL ReadUIKitDrag(void) {
+
+// v1.8.16：全局动画系数改为分档。
+// 原来只有「开/关」且写死 0.0001 —— 那是调试用极端值，等于把所有 UIKit 动画压成 0，
+// 绕过了 dylib 侧精心维护的 0.01s 安全下限（v1.8.12~v1.8.15 修的一整类故障就是
+// "时长被压到极限 → 完成回调配对错乱"）。现在最小档 0.05（≈×20），并提供关闭。
+// 0 表示关闭（移除键），其余为 UIAnimationDragCoefficient 实际写入值。
+static double ReadUIKitDrag(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:UIKitPath];
     NSNumber *v = d[@"UIAnimationDragCoefficient"];
-    return v != nil;
+    return v ? v.doubleValue : 0.0;
 }
-static void WriteUIKitDrag(BOOL enabled) {
+static void WriteUIKitDrag(double coeff) {
     NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:UIKitPath] mutableCopy];
     if (!d) d = [NSMutableDictionary dictionary];
-    if (enabled) {
-        d[@"UIAnimationDragCoefficient"] = @0.0001;
+    if (coeff > 0.0) {
+        d[@"UIAnimationDragCoefficient"] = @(coeff);
     } else {
         [d removeObjectForKey:@"UIAnimationDragCoefficient"];
     }
@@ -209,22 +219,47 @@ static void WriteUIKitDrag(BOOL enabled) {
     mkdir("/var/Managed Preferences/mobile", 0755);
     [d writeToFile:UIKitPath atomically:YES];
 }
+// 分档索引 → 系数：0=关闭 1=×5(0.2) 2=×10(0.1) 3=×20(0.05)
+static double DragCoeffForIndex(int i) {
+    switch (i) {
+        case 1:  return 0.2;
+        case 2:  return 0.1;
+        case 3:  return 0.05;
+        default: return 0.0;
+    }
+}
+// 已存系数 → 分档索引；旧版本写入的 0.0001 等未知值一律回落「关闭」，保存后即被清除
+static int DragIndexForCoeff(double c) {
+    if (c > 0.04 && c < 0.06)  return 3;   // 0.05
+    if (c > 0.08 && c < 0.12)  return 2;   // 0.1
+    if (c > 0.15 && c < 0.25)  return 1;   // 0.2
+    return 0;
+}
+// 系数 → 界面显示倍率（0 = 关闭）。避免依赖 math.h
+static int DragMultiplierForCoeff(double c) {
+    if (c > 0.04 && c < 0.06)  return 20;
+    if (c > 0.08 && c < 0.12)  return 10;
+    if (c > 0.15 && c < 0.25)  return 5;
+    return 0;
+}
 
 @interface SIOVC : UIViewController
 @end
 
 @implementation SIOVC {
-    UISwitch *_swEnabled, *_swSpring, *_swExtra, *_swList, *_swZoom;
+    UISwitch *_swEnabled, *_swSpring, *_swExtra, *_swList, *_swZoom, *_swFastScroll, *_swFastTap;
     UISegmentedControl *_segMode;
     UISlider *_slider;
     UILabel *_sliderLabel;
     UITextView *_blacklist;
     UILabel *_status;
-    UISwitch *_swRM, *_swCF, *_swUIKit;
+    UISwitch *_swRM, *_swCF, *_swRT;
+    UISegmentedControl *_segDrag;
+    UILabel *_dragLabel;
     UISwitch *_swFUBG, *_swFUBGScene, *_swFUBGAudio, *_swFUBGBall;
     // v1.8.14 App 专属覆盖
     UITextField *_ovBundle;
-    UISwitch *_ovOn, *_ovSpring, *_ovExtra, *_ovList, *_ovZoom;
+    UISwitch *_ovOn, *_ovSpring, *_ovExtra, *_ovList, *_ovZoom, *_ovFastScroll, *_ovFastTap;
     UISlider *_ovSpeed;
     UILabel *_ovSpeedLabel, *_ovGuard;
     UISegmentedControl *_ovMode;
@@ -257,7 +292,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.8.15 · 顺丰同城骑士针对性适配" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.8.16 · 系统级增强 + SpringBoard 支持" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -298,18 +333,43 @@ static void WriteUIKitDrag(BOOL enabled) {
     _swZoom = [[UISwitch alloc] init];
     _swZoom.on = [cfg[@"ZoomAccel"] boolValue];
 
+    // v1.8.16：交互手感（不属于改时长，是"跟手"）
+    UILabel *lblFastScroll = [self label:@"滑行惯性加急（松手后滑行距离变短）" size:17 dim:NO];
+    _swFastScroll = [[UISwitch alloc] init];
+    _swFastScroll.on = [cfg[@"FastScroll"] boolValue];
+    UILabel *lblFastTap = [self label:@"点击零延迟（去掉约 150ms 等待）" size:17 dim:NO];
+    _swFastTap = [[UISwitch alloc] init];
+    _swFastTap.on = [cfg[@"FastTap"] boolValue];
+
     UILabel *axTitle = [self label:@"系统动态效果（写入辅助功能，需注销生效）" size:15 dim:YES];
     UILabel *lblRM = [self label:@"减弱动态效果（系统级）" size:17 dim:NO];
     _swRM = [[UISwitch alloc] init];
     _swRM.on = ReadAx(@"ReduceMotionEnabled");
-    UILabel *lblCF = [self label:@"首选交叉淡出过渡效果" size:17 dim:NO];
+    UILabel *lblCF = [self label:@"首选交叉淡出过渡（需先开减弱动态效果）" size:17 dim:NO];
     _swCF = [[UISwitch alloc] init];
     _swCF.on = ReadAx(@"PreferCrossFadeTransitions");
+    // v1.8.16：关掉全系统毛玻璃 → GPU 负载明显下降，滚动/转场更稳（代价：背景不再模糊）
+    UILabel *lblRT = [self label:@"减少透明度（关毛玻璃，降 GPU 负载）" size:17 dim:NO];
+    _swRT = [[UISwitch alloc] init];
+    _swRT.on = ReadAx(@"ReduceTransparencyEnabled");
 
     UILabel *uiKitTitle = [self label:@"UIKit 全局动画系数（写入 com.apple.UIKit，需注销/重启目标 App）" size:15 dim:YES];
-    UILabel *lblUIKit = [self label:@"全局动画近乎瞬切（0.0001）" size:17 dim:NO];
-    _swUIKit = [[UISwitch alloc] init];
-    _swUIKit.on = ReadUIKitDrag();
+    double curDrag = ReadUIKitDrag();
+    int curDragIdx = DragIndexForCoeff(curDrag);
+    _dragLabel = [self label:@"" size:12 dim:YES];
+    _dragLabel.textColor = [UIColor systemOrangeColor];
+    _dragLabel.numberOfLines = 0;
+    if (curDrag > 0.0 && curDragIdx == 0) {
+        _dragLabel.text = [NSString stringWithFormat:
+            @"⚠️ 检测到旧版写入的极端值 %.4f（等于把所有动画压成 0，会绕过 dylib 的 0.01s 安全下限，易触发完成回调配对错乱）。已按「关闭」显示，保存后该键会被清除。", curDrag];
+    } else if (curDragIdx == 0) {
+        _dragLabel.text = @"未启用。要全系统加速请选 ×5 / ×10 / ×20；不建议与 dylib 加速同时开到最大（两个机制会叠加）。";
+    } else {
+        _dragLabel.text = [NSString stringWithFormat:@"当前已启用 %.2f（≈×%d，全系统生效，需注销/重启目标 App）。", curDrag, DragMultiplierForCoeff(curDrag)];
+    }
+    _segDrag = [[UISegmentedControl alloc] initWithItems:@[ @"关闭", @"×5", @"×10", @"×20" ]];
+    _segDrag.selectedSegmentIndex = curDragIdx;
+    [_segDrag addTarget:self action:@selector(dragChanged) forControlEvents:UIControlEventValueChanged];
 
     // === 真后台保活区块 ===
     UILabel *fubgTitle = [self label:@"真后台保活（FUBackground 引擎）" size:15 dim:YES];
@@ -387,6 +447,12 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *lblOvZoom = [self label:@"专属：缩放动画加速（实验）" size:17 dim:NO];
     _ovZoom = [[UISwitch alloc] init];
     _ovZoom.on = NO;
+    UILabel *lblOvFastScroll = [self label:@"专属：滑行惯性加急" size:17 dim:NO];
+    _ovFastScroll = [[UISwitch alloc] init];
+    _ovFastScroll.on = NO;
+    UILabel *lblOvFastTap = [self label:@"专属：点击零延迟" size:17 dim:NO];
+    _ovFastTap = [[UISwitch alloc] init];
+    _ovFastTap.on = NO;
     _ovGuard = [self label:@"" size:12 dim:YES];
     _ovGuard.textColor = [UIColor systemOrangeColor];
     _ovGuard.numberOfLines = 0;
@@ -426,9 +492,9 @@ static void WriteUIKitDrag(BOOL enabled) {
     [rb.heightAnchor constraintEqualToConstant:40].active = YES;
     [rb addTarget:self action:@selector(onReboot) forControlEvents:UIControlEventTouchUpInside];
 
-    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。慢放 = 原版 slowDownFactor 功能，可观察动画细节。瞬切 = 0.01 秒直达。\n\n⚠️ v1.8.15（依据顺丰同城骑士 11.5.0 拆包证据）：① 修正 CAAnimation 残留双重缩放 —— 此前 App「先设时长再 addAnimation」会被连缩两次，实际倍率是 speed²（显示 ×5 其实 ÷25）并频繁撞 0.01s 下限，本 App 的高德地图相机动画（MAMapKeyFrameAnimation）正吃这个 bug；修正后若觉得变慢，把倍率从 5 提到 15–25 即可等价。② 新增缩放动画加速开关「ZoomAccel」（默认关，本 App 的 NXDesign 确实在用 setZoomScale:animated:，但这一族在微信上出过预览卡死，请先小范围试）。③ 倍率上限 20 → 50。\n\n本 App UI 是原生 UIKit + 数百个 nib，动画 hook 正常生效；老式 beginAnimations/setAnimationDuration: 与关键帧动画本 App 都在用。SVGA / Ugen 引擎动画为自驱，无法用改时长加速。" size:12 dim:YES];
+    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。\n\n⚠️ v1.8.16：① 全局动画系数改为分档（关闭/×5/×10/×20）—— 原来写死的 0.0001 是调试用极端值，等于把动画压成 0 并绕过 dylib 的 0.01s 安全下限，正是 v1.8.12~15 修的那类故障的成因，请改用 ×5~×20 档。② 新增「减少透明度」（关毛玻璃，降 GPU 负载，滚动更稳）。③ 新增两个体感开关：滑行惯性加急 + 点击零延迟（默认关，会改变操作习惯）。④ 新增支持把 dylib 注入 com.apple.springboard 加速桌面/控制中心/App 启动动画 —— 该进程已内置列表 hook 硬保护与保活排除，注入后若黑屏，重启进 TrollFools 移除即可。\n\n本 App UI 是原生 UIKit（数百 nib），动画 hook 正常生效。" size:12 dim:YES];
     hint.textAlignment = NSTextAlignmentCenter;
-    UILabel *listHint = [self label:@"列表加速含 24 个 TV/CV hook，默认关闭。⚠️ 顺丰同城骑士 com.sfic.knight 在硬保护名单内，列表加速恒为关闭，任何配置都打不开（该 App 只会走其余 34 个非列表 hook）。淘宝/京东等重列表 App 同样必须保持关闭，否则破坏列表状态机导致卡死。" size:12 dim:YES];
+    UILabel *listHint = [self label:@"列表加速含 24 个 TV/CV hook，默认关闭。⚠️ 硬保护名单：顺丰同城骑士 com.sfic.knight、桌面进程 com.apple.springboard —— 这两者的列表加速恒为关闭，任何配置都打不开（SpringBoard 打开会黑屏/白苹果）。淘宝/京东等重列表 App 同样必须保持关闭。" size:12 dim:YES];
     listHint.textColor = [UIColor systemOrangeColor];
     listHint.numberOfLines = 0;
     _status = [self label:@"" size:13 dim:YES];
@@ -443,11 +509,14 @@ static void WriteUIKitDrag(BOOL enabled) {
         [self row:lblExtra ctrl:_swExtra],
         [self row:lblList ctrl:_swList],
         [self row:lblZoom ctrl:_swZoom],
+        [self row:lblFastScroll ctrl:_swFastScroll],
+        [self row:lblFastTap ctrl:_swFastTap],
         axTitle,
         [self row:lblRM ctrl:_swRM],
         [self row:lblCF ctrl:_swCF],
+        [self row:lblRT ctrl:_swRT],
         uiKitTitle,
-        [self row:lblUIKit ctrl:_swUIKit],
+        _segDrag, _dragLabel,
         fubgTitle,
         [self row:lblFUBG ctrl:_swFUBG],
         [self row:lblFUBGScene ctrl:_swFUBGScene],
@@ -460,6 +529,8 @@ static void WriteUIKitDrag(BOOL enabled) {
         [self row:lblOvExtra ctrl:_ovExtra],
         [self row:lblOvList ctrl:_ovList],
         [self row:lblOvZoom ctrl:_ovZoom],
+        [self row:lblOvFastScroll ctrl:_ovFastScroll],
+        [self row:lblOvFastTap ctrl:_ovFastTap],
         _ovGuard,
         lblBL, _blacklist, save, rs, rb, listHint, hint, _status
     ]];
@@ -511,6 +582,8 @@ static void WriteUIKitDrag(BOOL enabled) {
     _ovExtra.on  = mine[@"Extra"]  ? [mine[@"Extra"] boolValue]  : YES;
     _ovList.on   = mine[@"ListAccel"] ? [mine[@"ListAccel"] boolValue] : NO;
     _ovZoom.on   = mine[@"ZoomAccel"] ? [mine[@"ZoomAccel"] boolValue] : NO;
+    _ovFastScroll.on = mine[@"FastScroll"] ? [mine[@"FastScroll"] boolValue] : NO;
+    _ovFastTap.on    = mine[@"FastTap"]    ? [mine[@"FastTap"] boolValue]    : NO;
 
     BOOL guarded = [HardGuardBundles() containsObject:bid];
     _ovList.enabled = !guarded;
@@ -527,6 +600,18 @@ static void WriteUIKitDrag(BOOL enabled) {
 
 - (void)ovSliderChanged {
     _ovSpeedLabel.text = [NSString stringWithFormat:@"专属倍率（当前 ×%.1f）", _ovSpeed.value];
+}
+
+// v1.8.16：切换全局动画系数档位时同步提示文案
+- (void)dragChanged {
+    int idx = (int)_segDrag.selectedSegmentIndex;
+    double c = DragCoeffForIndex(idx);
+    if (c <= 0.0) {
+        _dragLabel.text = @"已选「关闭」：保存后移除 UIAnimationDragCoefficient，全系统恢复原生动画时长。";
+    } else {
+        _dragLabel.text = [NSString stringWithFormat:
+            @"已选 ×%d（写入 %.2f，全系统生效，需注销/重启目标 App）。不建议与 dylib 加速同时开到最大 —— 两个机制会叠加。", DragMultiplierForCoeff(c), c];
+    }
 }
 
 // 勾选/取消「启用专属配置」时只更新提示，不动控件值
@@ -564,6 +649,8 @@ static void WriteUIKitDrag(BOOL enabled) {
     cfg[@"Extra"] = @(_swExtra.on);
     cfg[@"ListAccel"] = @(_swList.on);
     cfg[@"ZoomAccel"] = @(_swZoom.on);
+    cfg[@"FastScroll"] = @(_swFastScroll.on);
+    cfg[@"FastTap"] = @(_swFastTap.on);
     cfg[@"FUBGEnabled"] = @(_swFUBG.on);
     cfg[@"FUBGSceneFake"] = @(_swFUBGScene.on);
     cfg[@"FUBGAudioKeep"] = @(_swFUBGAudio.on);
@@ -595,6 +682,8 @@ static void WriteUIKitDrag(BOOL enabled) {
                 // 硬保护名单内恒写 NO，避免配置文件里留下一个会被 dylib 忽略的 YES
                 @"ListAccel": @(guarded ? NO : _ovList.on),
                 @"ZoomAccel": @(_ovZoom.on),
+                @"FastScroll": @(_ovFastScroll.on),
+                @"FastTap": @(_ovFastTap.on),
             };
         } else {
             [ovOut removeObjectForKey:ovBid];
@@ -605,7 +694,8 @@ static void WriteUIKitDrag(BOOL enabled) {
     BOOL ok = WriteConfig(cfg);
     WriteAx(@"ReduceMotionEnabled", _swRM.on);
     WriteAx(@"PreferCrossFadeTransitions", _swCF.on);
-    WriteUIKitDrag(_swUIKit.on);
+    WriteAx(@"ReduceTransparencyEnabled", _swRT.on);
+    WriteUIKitDrag(DragCoeffForIndex((int)_segDrag.selectedSegmentIndex));
 
     UINotificationFeedbackGenerator *fg = [[UINotificationFeedbackGenerator alloc] init];
     [fg prepare];
