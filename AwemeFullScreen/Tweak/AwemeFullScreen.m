@@ -1,6 +1,13 @@
-// AwemeFullScreen — 抖音(Aweme) 全屏插件 v2.4.0
+// AwemeFullScreen — 抖音(Aweme) 全屏插件 v2.5.0
 // ============================================================================
 // 本版依据「诊断版在抖音 38.0.0 上实测回传的真实数据」，并修正 v2.3.0 的失误。
+//
+// v2.5.0 新增（几何诊断实测得出）：
+//   隐藏 tabBar 后，UITabBarController **仍然**把 tabBar 高度（实测 83pt）算作子控制器
+//   的底部安全区：诊断回传子 VC 的 sa.b 全是 83，而所有视图 frame 都是整屏、滚动视图
+//   inset 全为 0 —— 所以底部黑边就是这 83pt 安全区逼出来的。
+//   处理：给底栏本体挂一条 0 高约束（优先级 999），安全区贡献归零；
+//         离开首页区时撤销约束并恢复显示。
 //
 // 实测事实（38.0.0）：
 //   bid        = com.ss.iphone.ugc.Aweme
@@ -58,6 +65,13 @@ static Class  gFeedKey[kAFSClsCacheSize];
 static int8_t gFeedVal[kAFSClsCacheSize];
 
 static NSHashTable *gHidden = nil;       // 我们隐藏过的视图（弱引用）
+
+// v2.5.0：底栏的 0 高约束。
+// 几何诊断实测：把 tabBar 设成 hidden=YES 之后，UITabBarController **仍然**把 tabBar
+// 的高度（实测 83pt）作为子控制器的底部安全区 —— 子 VC 的 sa.b 一直是 83，
+// 而所有视图的 frame 又都是整屏、滚动视图 inset 也全是 0，所以底部那条黑边就是
+// 这 83pt 安全区逼出来的。把 tabBar 高度压成 0，安全区贡献即归零。
+static NSLayoutConstraint *gTabBarZeroH = nil;
 
 static BOOL           gInFeed = NO;
 static NSTimeInterval gInFeedAt = 0;
@@ -202,14 +216,28 @@ static void AFS_hideTarget(UIView *v) {
     if (!gHidden) gHidden = [NSHashTable weakObjectsHashTable];
     [gHidden addObject:v];
     if (!v.hidden) v.hidden = YES;
+    // 底栏本体（AWENormalModeTabBar 是 UITabBar 系）：把高度压成 0，
+    // 让 UITabBarController 不再给子控制器留 83pt 底部安全区
+    if ([v isKindOfClass:[UITabBar class]] && !gTabBarZeroH) {
+        @try {
+            gTabBarZeroH = [v.heightAnchor constraintEqualToConstant:0.0];
+            gTabBarZeroH.priority = 999;
+            gTabBarZeroH.active = YES;
+            NSLog(@"[AwemeFullScreen] tabBar height pinned to 0 to drop the bottom safe-area inset");
+        } @catch (__unused NSException *e) { gTabBarZeroH = nil; }
+    }
     if (!gFirstHitLogged) {
         gFirstHitLogged = YES;
-        NSLog(@"[AwemeFullScreen] v2.4.0 first hit: hid %s",
+        NSLog(@"[AwemeFullScreen] v2.5.0 first hit: hid %s",
               class_getName(object_getClass(v)));
     }
 }
 
 static void AFS_restoreAll(void) {
+    if (gTabBarZeroH) {
+        @try { gTabBarZeroH.active = NO; } @catch (__unused NSException *e) {}
+        gTabBarZeroH = nil;
+    }
     if (!gHidden || gHidden.count == 0) return;
     for (UIView *v in gHidden.allObjects) {
         if (v.hidden) v.hidden = NO;
@@ -305,7 +333,7 @@ static void AFSD_refresh(void) {
         UIViewController *vc = kw.rootViewController;
 
         NSMutableString *s = [NSMutableString string];
-        [s appendFormat:@"AFS-GEO v2.4.0  screen=%@ safe=(%.0f,%.0f)\n",
+        [s appendFormat:@"AFS-GEO v2.5.0  screen=%@ safe=(%.0f,%.0f)\n",
                          AFSD_rect(sb), sa.top, sa.bottom];
 
         int guard = 0;
@@ -391,7 +419,7 @@ static void AFS_init(void) {
         AFS_swizzle([UIView class], @selector(layoutSubviews),
                     (IMP)afs_layoutSubviews, (IMP *)&o_afs_layoutSubviews);
 
-        NSLog(@"[AwemeFullScreen] v2.4.0%s installed in %@ active=%d layoutSubviews=%s",
+        NSLog(@"[AwemeFullScreen] v2.5.0%s installed in %@ active=%d layoutSubviews=%s",
               AFS_DIAG ? "-diag" : "", [[NSBundle mainBundle] bundleIdentifier], gActive,
               o_afs_layoutSubviews ? "ok" : "FAILED");
 
