@@ -1,0 +1,61 @@
+name: Build AwemeFullScreen-Diag (diagnostic, dylib only)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'awemefullscreendiag-v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build AwemeFullScreen diagnostic dylib
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      # 诊断版：不 hook 任何方法、不隐藏任何视图，只把探测结果画在屏幕顶部
+      - name: Build diag dylib (pure clang)
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          mkdir -p artifacts
+          clang -arch arm64 -dynamiclib -O2 \
+            -install_name @rpath/AwemeFullScreen-Diag.dylib \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -undefined dynamic_lookup -fobjc-arc \
+            -framework Foundation -framework UIKit -framework CoreGraphics -framework CoreFoundation \
+            -o artifacts/AwemeFullScreen-Diag.dylib AwemeFullScreen/Tweak/AwemeFullScreenDiag.m
+          codesign --force --sign - artifacts/AwemeFullScreen-Diag.dylib
+          lipo -info artifacts/AwemeFullScreen-Diag.dylib
+          file artifacts/AwemeFullScreen-Diag.dylib
+          echo "--- must NOT link CydiaSubstrate ---"
+          otool -L artifacts/AwemeFullScreen-Diag.dylib
+          if otool -L artifacts/AwemeFullScreen-Diag.dylib | grep -qi substrate; then
+            echo "ERROR: CydiaSubstrate dependency found"; exit 1
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AwemeFullScreen-Diag-artifacts
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/awemefullscreendiag-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: AwemeFullScreen-Diag ${{ github.ref_name }}
+          files: |
+            artifacts/AwemeFullScreen-Diag.dylib
+          generate_release_notes: true
