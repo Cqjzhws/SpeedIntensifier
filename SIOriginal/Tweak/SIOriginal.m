@@ -40,6 +40,19 @@
 //   +[UIView performSystemAnimation:onViews:options:animations:completion:]
 // 全部沿用已验证的 CATransaction/时长改写机制，不触碰 TV/CV 列表状态机。
 // =========================================================================
+//
+// ============================ v1.8.13 优化加强 ============================
+// [加强] 补齐老式 UIView 动画 API 的时长/延迟接管：
+//   +[UIView setAnimationDuration:] 与 +[UIView setAnimationDelay:]
+//   这是 beginAnimations:context: / commitAnimations 时代的唯一时长入口。
+//   本支一直缺失（父项目 SpeedIntensifier 的增强层早已包含），而老 SDK、部分
+//   国产 App 内部与第三方库仍在用这套 API —— 它们此前完全不受加速影响。
+//   两个都是纯 setter（只改一个数值），是本项目风险最低的一类 hook。
+//   双重缩放防护：这两个 setter 很可能被 UIKit 落到 CATransaction.setAnimationDuration:
+//   上，或反过来被 animateWithDuration: 内部回调，因此：
+//     · 进入时若已在自己的一次块动画包裹内（SIO_inUIViewAnim）→ 原样透传；
+//     · 调用原 IMP 期间置起同一线程局部标记 → 抑制内部再入。
+// =========================================================================
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -305,6 +318,10 @@ static void   (*o_tab_setVC)(id, SEL, UIViewController *);
 static void   (*o_vc_transitionFrom)(id, SEL, UIViewController *, UIViewController *, double,
                                      UIViewAnimationOptions, void (^)(void), void (^)(BOOL));
 
+// ---- v1.8.13 新增：老式 beginAnimations 动画 API 时长/延迟 ----
+static void   (*o_UV_setAnimDuration)(Class, SEL, double);
+static void   (*o_UV_setAnimDelay)(Class, SEL, double);
+
 #pragma mark - CAAnimation（核心：仅基类，子类自动继承）
 
 static void sio_CAAnim_setDuration(id self, SEL _cmd, double d) {
@@ -418,6 +435,35 @@ static void sio_UV_systemAnim(Class self, SEL _cmd, NSUInteger anim, NSArray *vi
     SIO_setTransactionDuration(SIO_targetDuration(0.35));
     o_UV_systemAnim(self, _cmd, anim, views, o, a, c);
     [CATransaction commit];
+}
+
+// ---- v1.8.13 新增：老式 beginAnimations 动画 API ----
+// 用法： [UIView beginAnimations:nil context:NULL];
+//        [UIView setAnimationDuration:0.3];   ← 这里
+//        [UIView setAnimationDelay:0.1];      ← 和这里
+//        ... 改属性 ...
+//        [UIView commitAnimations];
+// 这套 API 在 iOS 13 起被标记 deprecated，但从未失效，老代码/SDK/第三方库里仍然大量存在；
+// 它不走 animateWithDuration: 系，我们此前的 8 个 UIView 块动画 hook 全部拦不到。
+static void sio_UV_setAnimDuration(Class self, SEL _cmd, double d) {
+    SIO_REQUIRE_ORIG(o_UV_setAnimDuration);
+    // 已在自己的一次块动画/转场包裹内 → 说明这次调用是 UIKit 内部转发出来的，原样透传防止二次缩放
+    if (SIO_blocked() || SIO_inUIViewAnim()) { o_UV_setAnimDuration(self, _cmd, d); return; }
+    // 置起标记后再调原 IMP：若 UIKit 把老式 API 落到 CATransaction.setAnimationDuration:
+    // （或回调本方法自身），那一层会被自己的 hook 跳过，保证只缩放一次。
+    SIO_setUIViewAnim(YES);
+    o_UV_setAnimDuration(self, _cmd, SIO_targetDuration(d));
+    SIO_setUIViewAnim(NO);
+}
+
+static void sio_UV_setAnimDelay(Class self, SEL _cmd, double d) {
+    SIO_REQUIRE_ORIG(o_UV_setAnimDelay);
+    if (SIO_blocked() || SIO_inUIViewAnim()) { o_UV_setAnimDelay(self, _cmd, d); return; }
+    // 延迟与块动画 animateWithDuration:delay: 保持同一套换算：
+    // 加速 → d/speed，慢放 → d×slowFactor，瞬切 → 0
+    SIO_setUIViewAnim(YES);
+    o_UV_setAnimDelay(self, _cmd, SIO_targetDelay(d));
+    SIO_setUIViewAnim(NO);
 }
 
 #pragma mark - CASpring（原版灵魂功能：参数缩放保持物理一致性）
@@ -760,6 +806,11 @@ static void SIOriginalInit(void) {
                      (IMP)sio_UV_anim_keyframes, (IMP *)&o_UV_anim_keyframes);
     SIO_swizzleClass(uv, @selector(performSystemAnimation:onViews:options:animations:completion:),
                      (IMP)sio_UV_systemAnim, (IMP *)&o_UV_systemAnim);
+    // v1.8.13 新增：老式 beginAnimations/commitAnimations 时代的时长与延迟入口
+    SIO_swizzleClass(uv, @selector(setAnimationDuration:),
+                     (IMP)sio_UV_setAnimDuration, (IMP *)&o_UV_setAnimDuration);
+    SIO_swizzleClass(uv, @selector(setAnimationDelay:),
+                     (IMP)sio_UV_setAnimDelay, (IMP *)&o_UV_setAnimDelay);
 
     // 弹簧参数 ×3
     if (spring) {
@@ -863,7 +914,7 @@ static void SIOriginalInit(void) {
     SIO_installiOS16Extras();
 
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
-    NSLog(@"[SIOriginal] v1.8.12 hooks installed in %@ (enabled=%d mode=%d speed=%.1f spring=%d extra=%d list=%d)",
+    NSLog(@"[SIOriginal] v1.8.13 hooks installed in %@ (enabled=%d mode=%d speed=%.1f spring=%d extra=%d list=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gSpring, gExtra, gListAccel);
     } @catch (NSException *e) {
         NSLog(@"[SIOriginal] hook install failed (feature degraded, app unaffected): %@", e);
@@ -1723,7 +1774,7 @@ static void FUBGEntry(void) {
             // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
         });
 
-        NSLog(@"[FUBG] v2.0.0 (SIOriginal v1.8.12) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.0.0 (SIOriginal v1.8.13) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
