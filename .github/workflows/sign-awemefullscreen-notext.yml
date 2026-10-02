@@ -1,0 +1,57 @@
+name: Sign AwemeFullScreen-NoText
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'awemefullscreen-notext-v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  sign:
+    name: Re-sign patched dylib
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Verify patch, then re-sign
+        run: |
+          set -e
+          mkdir -p artifacts
+          SRC="AwemeFullScreen/NoText/AwemeFullScreen-NoText.dylib"
+          echo "--- patched selector must be gone, replacement must be present ---"
+          if strings -a "$SRC" | grep -q 'showText:withCenterPoint:'; then
+            echo "ERROR: old selector still present"; exit 1
+          fi
+          strings -a "$SRC" | grep -c 'isMemberOfClass:' || true
+          cp "$SRC" artifacts/AwemeFullScreen-NoText.dylib
+          codesign --force --sign - artifacts/AwemeFullScreen-NoText.dylib
+          echo "--- signature ---"
+          codesign -dv --verbose=2 artifacts/AwemeFullScreen-NoText.dylib 2>&1 || true
+          codesign --verify --verbose=2 artifacts/AwemeFullScreen-NoText.dylib 2>&1 || true
+          echo "--- dylib deps ---"
+          otool -L artifacts/AwemeFullScreen-NoText.dylib
+          file artifacts/AwemeFullScreen-NoText.dylib
+          ls -l artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AwemeFullScreen-NoText
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/awemefullscreen-notext-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: AwemeFullScreen-NoText ${{ github.ref_name }}
+          files: artifacts/AwemeFullScreen-NoText.dylib
+          generate_release_notes: true
