@@ -239,7 +239,7 @@ static void WriteUIKitDrag(BOOL enabled) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.8.11 · 列表 hook 纯开关控制" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.8.12 · 覆盖补强 + 修复 4 处真 bug" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -341,9 +341,9 @@ static void WriteUIKitDrag(BOOL enabled) {
     [rb.heightAnchor constraintEqualToConstant:40].active = YES;
     [rb addTarget:self action:@selector(onReboot) forControlEvents:UIControlEventTouchUpInside];
 
-    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。慢放 = 原版 slowDownFactor 功能，可观察动画细节。瞬切 = 0.01 秒直达。\n\n⚠️ v1.8.11 起全 App 通用：加速 + 真后台保活在所有注入的 App 中生效，悬浮球已全局禁用，列表 hook 取消硬保护改由开关控制。微信预览放大时动画 hook 自动旁路保护。若预览/手势出现异常请立即反馈。" size:12 dim:YES];
+    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。慢放 = 原版 slowDownFactor 功能，可观察动画细节（v1.8.12 起导航/模态/底部 Tab 转场也真正慢放）。瞬切 = 0.01 秒直达。\n\n⚠️ v1.8.12：新增关键帧动画、UIViewPropertyAnimator 指定初始化器、容器控制器转场、底部 Tab 切换、系统删除动画共 5 处 hook；修复 CALayer 动画双重除速（原来 ×5 实际变成 ÷25）、runningPropertyAnimator 从未生效、黑名单写成字符串会崩溃、慢放转场被强制瞬间完成。全 App 通用，微信预览放大时动画 hook 自动旁路保护。若预览/手势出现异常请立即反馈。" size:12 dim:YES];
     hint.textAlignment = NSTextAlignmentCenter;
-    UILabel *listHint = [self label:@"列表加速含 24 个 TV/CV hook。v1.8.11 起取消 bundleid 硬保护，完全由此开关控制，默认关闭。顺丰骑士/淘宝/京东等重列表 App 必须保持关闭，否则破坏列表状态机导致卡死。" size:12 dim:YES];
+    UILabel *listHint = [self label:@"列表加速含 24 个 TV/CV hook，默认关闭。v1.8.12 起配置项缺失也按关闭处理（fail-safe，旧版本缺键会被误当成开启）。顺丰骑士/淘宝/京东等重列表 App 必须保持关闭，否则破坏列表状态机导致卡死。" size:12 dim:YES];
     listHint.textColor = [UIColor systemOrangeColor];
     listHint.numberOfLines = 0;
     _status = [self label:@"" size:13 dim:YES];

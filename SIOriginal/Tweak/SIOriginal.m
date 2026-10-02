@@ -5,7 +5,41 @@
 //   · 线程局部标记防 CATransaction/UIView 双重除法（原版未处理的问题）
 //   · 慢放（原版 slowDownFactor）与瞬切模式
 //   · Darwin 通知热重载配置，黑名单逐进程判断
-// 不包含任何 SpeedIntensifier / SIFusion / SpeedsterTS 项目代码，无 TV/CV 变更类 hook。
+// 不包含任何 SpeedIntensifier / SIFusion / SpeedsterTS 项目代码。
+//
+// ============================ v1.8.12 优化加强 ============================
+// [真 bug 1] CALayer addAnimation:forKey: 兜底改为调用保存的原始 IMP。
+//   原来用 objc_msgSend(anim, setDuration:) 回写，而 setDuration: 自己已被 hook，
+//   于是 duration 被 SIO_targetDuration 连乘两次（加速 ×5 实际变成 ÷25），
+//   恰好违反本文件声称的「防双重除法」设计。
+// [真 bug 2] runningPropertyAnimatorWithDuration:delay:options:animations:completion:
+//   原来写成 SIO_swizzleClass(object_getClass(pa), …)：class_getClassMethod 内部是
+//   class_getInstanceMethod(object_getClass(cls), sel)，再传元类等于去根元类里找，
+//   必然返回 NULL 静默跳过——该 hook 从上线起从未生效。改为 SIO_swizzleClass(pa, …)。
+// [真 bug 3] Blacklist 兼容 NSString 格式。原来无条件 componentsJoinedByString:，
+//   一旦 plist 里是字符串（手工编辑/旧版本/其他工具写入）即 unrecognized selector，
+//   注入进程启动崩溃。FUBG 侧 v1.8.6 已修，动画侧这次补齐。
+// [真 bug 4] 导航/模态转场时长改为按模式计算 SIO_targetDuration(0.35)。
+//   原来硬编码 setAnimationDuration:0.0 —— 慢放模式下导航/弹窗依旧瞬间完成，
+//   慢放对这类转场等于完全无效；现在慢放真的变慢，加速模式约 0.07s（几乎无感）。
+// [隐患 5] ListAccel 缺键默认由 YES 改为 NO。危险功能不再 fail-open。
+// [隐患 6] FUBGExcludeApps 与 Blacklist 合并。原来排除表赋值后立刻被 Blacklist
+//   无条件覆盖，排除机制实际从未生效。
+// [性能 7] 黑名单在重载时一次性解析为进程布尔值 gSelfBlacklisted。
+//   SIO_blocked() 是全部动画/事务 hook 的必经热路径，原来每次都要
+//   componentsSeparatedByString: 分配数组。
+// [性能 8] 微信预览放大态探测器加 3000 节点上限，超大视图树不再拖慢主线程。
+// [健壮 9] 所有原 IMP 调用前判空；swizzle 增加重复安装保护（绝不把自己的 IMP
+//   存成 orig 导致自递归）；两处 constructor 安装全程 @try 包裹，异常放行原实现。
+// [加强 10] 新增 5 个低风险 hook：
+//   +[UIView animateKeyframesWithDuration:delay:options:animations:completion:]
+//   -[UIViewPropertyAnimator initWithDuration:timingParameters:]（2 参指定初始化器，
+//     带线程局部重入保护，避免与 3 参变体双重缩放）
+//   -[UITabBarController setSelectedIndex:] / setSelectedViewController:
+//   -[UIViewController transitionFromViewController:toViewController:duration:…]
+//   +[UIView performSystemAnimation:onViews:options:animations:completion:]
+// 全部沿用已验证的 CATransaction/时长改写机制，不触碰 TV/CV 列表状态机。
+// =========================================================================
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -31,13 +65,22 @@ static BOOL     gSpring    = YES;    // CASpring 参数缩放
 static BOOL     gExtra     = YES;    // 导航/模态进阶转场
 static BOOL     gListAccel = NO;     // TV/CV 列表全家桶（v1.8.11 起纯开关控制，默认关）
 static BOOL     gIsWeChat  = NO;     // 微信缩放预览守卫用（L104）
-static NSString *gBlacklist = nil;   // 逗号拼接，逐进程缓存
+// v1.8.12：黑名单在重载时一次性解析成本进程布尔值，热路径零分配（见 SIO_reload）
+static BOOL     gSelfBlacklisted = NO;
 static NSString *gSelfBundle = nil;
 
 static pthread_key_t gInUIViewAnimKey;
+static pthread_key_t gInPAInitKey;   // v1.8.12：UIViewPropertyAnimator 初始化重入保护
 
 static inline BOOL SIO_inUIViewAnim(void)   { return (BOOL)(intptr_t)pthread_getspecific(gInUIViewAnimKey); }
 static inline void SIO_setUIViewAnim(BOOL v){ pthread_setspecific(gInUIViewAnimKey, (void *)(intptr_t)(v ? 1 : 0)); }
+static inline BOOL SIO_inPAInit(void)       { return (BOOL)(intptr_t)pthread_getspecific(gInPAInitKey); }
+static inline void SIO_setPAInit(BOOL v)    { pthread_setspecific(gInPAInitKey, (void *)(intptr_t)(v ? 1 : 0)); }
+
+// v1.8.12：原 IMP 判空（红线规则 #4）。方法不存在时 hook 不会被安装，这里是纯防御：
+// 万一 orig 为空，直接放弃本次拦截，绝不对空指针发消息。
+#define SIO_REQUIRE_ORIG(imp)      do { if (__builtin_expect((imp) == NULL, 0)) return; } while (0)
+#define SIO_REQUIRE_ORIG_NIL(imp)  do { if (__builtin_expect((imp) == NULL, 0)) return nil; } while (0)
 
 static inline double SIO_targetDuration(double orig) {
     if (!gEnabled) return orig;
@@ -61,9 +104,22 @@ static inline double SIO_springScale(void) {
     return (gSpeed <= 1.0001) ? 1.0 : gSpeed;
 }
 
+// v1.8.12：设置事务时长的唯一正确入口。
+// 本体代码里凡是自己构造 CATransaction 时长的地方（导航/模态/Tab/列表/滚动/系统动画），
+// 都必须走这里：`[CATransaction setAnimationDuration:X]` 会再次进入已被 swizzle 的
+// setAnimationDuration:，于是同一个 X 被 SIO_targetDuration 缩放第二次
+// （例如期望 0.07s 实际 0.014s，慢放期望 0.7s 实际 1.4s）。
+// 这里借线程局部标记抑制这一层，嵌套时原样恢复。
+static inline void SIO_setTransactionDuration(double d) {
+    BOOL was = SIO_inUIViewAnim();
+    SIO_setUIViewAnim(YES);
+    [CATransaction setAnimationDuration:d];
+    SIO_setUIViewAnim(was);
+}
+
 static void SIO_reload(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
-    if (!d) return;
+    if (!d) { gSelfBlacklisted = NO; return; }
     gEnabled = [d[@"Enabled"] boolValue];
     int mode = [d[@"Mode"] intValue];
     gMode = (mode >= 0 && mode <= 2) ? mode : 0;
@@ -73,8 +129,30 @@ static void SIO_reload(void) {
     gSlowFactor = (sf > 1.0 && sf <= 10.0) ? sf : 2.0;
     gSpring = d[@"Spring"] ? [d[@"Spring"] boolValue] : YES;
     gExtra  = d[@"Extra"]  ? [d[@"Extra"] boolValue]  : YES;
-    gListAccel = d[@"ListAccel"] ? [d[@"ListAccel"] boolValue] : YES;
-    gBlacklist = [d[@"Blacklist"] componentsJoinedByString:@","];
+    // v1.8.12：缺键默认 NO（原来 `: YES`）。配置 plist 一旦缺 ListAccel（旧版本写入的、
+    // 手工编辑过的、被其他工具覆盖过的），原来会静默打开 24 个列表 hook，
+    // 在重列表 App 上直接破坏列表状态机——危险功能必须 fail-safe。
+    gListAccel = d[@"ListAccel"] ? [d[@"ListAccel"] boolValue] : NO;
+
+    // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
+    gSelfBlacklisted = NO;
+    id bl = d[@"Blacklist"];
+    NSArray *items = nil;
+    if ([bl isKindOfClass:[NSArray class]]) {
+        items = bl;
+    } else if ([bl isKindOfClass:[NSString class]]) {
+        // 旧版这里直接对 NSString 调 componentsJoinedByString: → unrecognized selector 崩溃
+        items = [(NSString *)bl componentsSeparatedByString:@","];
+    }
+    NSString *bid = gSelfBundle ?: @"";
+    if (bid.length) {
+        for (id it in items) {
+            if (![it isKindOfClass:[NSString class]]) continue;
+            NSString *s = [(NSString *)it stringByTrimmingCharactersInSet:
+                           [NSCharacterSet whitespaceCharacterSet]];
+            if (s.length && [bid isEqualToString:s]) { gSelfBlacklisted = YES; break; }
+        }
+    }
 }
 
 static void SIO_installiOS16Extras(void); // forward declaration
@@ -123,8 +201,13 @@ static BOOL SIO_wechatZoomPreviewActive(void) {
                 }
             }
             // 迭代 DFS，扫描整个前台视图树
+            // v1.8.12：节点上限保护。超大视图树（长列表 / 复杂 WebView 容器）下
+            // 每 0.25s 一次的全树遍历会拖慢主线程；超过上限即按「未放大」放行，
+            // 宁可少一层保护，不可卡住界面。
             NSMutableArray<UIView *> *stack = roots;
+            NSUInteger visited = 0;
             while (stack.count) {
+                if (++visited > 3000) break;
                 UIView *v = stack.lastObject;
                 [stack removeLastObject];
                 if ([v isKindOfClass:[UIScrollView class]]) {
@@ -145,31 +228,37 @@ static BOOL SIO_wechatZoomPreviewActive(void) {
 }
 
 static inline BOOL SIO_blocked(void) {
+    // v1.8.12：热路径零分配。全部动画/事务 hook 都从这里过，
+    // 顺序按「最便宜、最可能命中」排列：布尔 → 布尔 → 节流后的探测结果。
     if (!gEnabled) return YES;
+    if (gSelfBlacklisted) return YES;
     // v1.8.9：微信动画加速恢复（实验）——预览 bug 真凶已确认为悬浮球（v1.8.7 永久禁用），
     // 动画 hook 恢复生效；v1.8.4 放大态探测器首次真正启用作为安全网
-    if (SIO_wechatZoomPreviewActive()) return YES;   // 微信预览放大态旁路
-    if (!gSelfBundle) gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-    if (gSelfBundle.length == 0) return NO;
-    if (!gBlacklist) return NO;
-    for (NSString *s in [gBlacklist componentsSeparatedByString:@","]) {
-        if ([gSelfBundle isEqualToString:[s stringByTrimmingCharactersInSet:
-                [NSCharacterSet whitespaceCharacterSet]]]) return YES;
-    }
+    if (SIO_wechatZoomPreviewActive()) return YES;   // 微信预览放大态旁路（非微信时立即返回 NO）
     return NO;
 }
 
 // ---------- swizzle 工具 ----------
+// v1.8.12：增加重复安装保护。若目标 IMP 已经是我们的实现（同一 dylib 被重复注入、
+// 或 constructor 被执行两次），绝不能再把它存进 orig —— 否则回调会自递归爆栈。
 static void SIO_swizzleInstance(Class c, SEL sel, IMP newImp, IMP *orig) {
+    if (!c || !sel || !newImp) return;
     Method m = class_getInstanceMethod(c, sel);
     if (!m) return;
-    *orig = method_getImplementation(m);
+    IMP cur = method_getImplementation(m);
+    if (cur == newImp) return;
+    if (orig) *orig = cur;
     method_setImplementation(m, newImp);
 }
+// 注意：必须传「类对象」而不是元类。class_getClassMethod 内部执行的是
+// class_getInstanceMethod(object_getClass(cls), sel)，传元类会去根元类查找并返回 NULL。
 static void SIO_swizzleClass(Class c, SEL sel, IMP newImp, IMP *orig) {
+    if (!c || !sel || !newImp) return;
     Method m = class_getClassMethod(c, sel);
     if (!m) return;
-    *orig = method_getImplementation(m);
+    IMP cur = method_getImplementation(m);
+    if (cur == newImp) return;
+    if (orig) *orig = cur;
     method_setImplementation(m, newImp);
 }
 
@@ -207,9 +296,19 @@ static void   (*o_sv_scrollRect)(id, SEL, CGRect, BOOL);
 // ---- CALayer addAnimation 补盲区 ----
 static void   (*o_layer_addAnim)(id, SEL, id, NSString *);
 
+// ---- v1.8.12 新增 hook ----
+static void   (*o_UV_anim_keyframes)(Class, SEL, double, double, NSUInteger, void (^)(void), void (^)(BOOL));
+static void   (*o_UV_systemAnim)(Class, SEL, NSUInteger, NSArray *, NSUInteger, void (^)(void), void (^)(BOOL));
+static id     (*o_pa_initWithDurTP2)(id, SEL, double, id);
+static void   (*o_tab_setIndex)(id, SEL, NSUInteger);
+static void   (*o_tab_setVC)(id, SEL, UIViewController *);
+static void   (*o_vc_transitionFrom)(id, SEL, UIViewController *, UIViewController *, double,
+                                     UIViewAnimationOptions, void (^)(void), void (^)(BOOL));
+
 #pragma mark - CAAnimation（核心：仅基类，子类自动继承）
 
 static void sio_CAAnim_setDuration(id self, SEL _cmd, double d) {
+    SIO_REQUIRE_ORIG(o_CAAnim_setDuration);
     if (SIO_blocked()) { o_CAAnim_setDuration(self, _cmd, d); return; }
     o_CAAnim_setDuration(self, _cmd, SIO_targetDuration(d));
 }
@@ -217,6 +316,7 @@ static void sio_CAAnim_setDuration(id self, SEL _cmd, double d) {
 #pragma mark - CATransaction
 
 static void sio_CATransaction_setDur(id self, SEL _cmd, double d) {
+    SIO_REQUIRE_ORIG(o_CATransaction_setDur);
     if (SIO_inUIViewAnim() || SIO_blocked()) {
         o_CATransaction_setDur(self, _cmd, d);
         return;
@@ -226,7 +326,20 @@ static void sio_CATransaction_setDur(id self, SEL _cmd, double d) {
 
 #pragma mark - UIView 块动画（class methods）
 
+// v1.8.12：delay 缩放抽成独立函数，供块动画与关键帧动画共用
+static inline double SIO_targetDelay(double delay) {
+    if (!gEnabled) return delay;
+    double f;
+    switch (gMode) {
+        case 1:  f = gSlowFactor;                               break;  // 慢放：延迟同倍放大
+        case 2:  f = 0.0;                                       break;  // 瞬切：延迟归零
+        default: f = (gSpeed <= 1.0001) ? 1.0 : 1.0 / gSpeed;    break;  // 加速：延迟同倍缩短
+    }
+    return delay * f;
+}
+
 static void sio_UV_anim_d(Class self, SEL _cmd, double d, void (^a)(void)) {
+    SIO_REQUIRE_ORIG(o_UV_anim_d);
     if (SIO_blocked()) { o_UV_anim_d(self, _cmd, d, a); return; }
     SIO_setUIViewAnim(YES);
     o_UV_anim_d(self, _cmd, SIO_targetDuration(d), a);
@@ -234,6 +347,7 @@ static void sio_UV_anim_d(Class self, SEL _cmd, double d, void (^a)(void)) {
 }
 
 static void sio_UV_anim_dc(Class self, SEL _cmd, double d, void (^a)(void), void (^c)(BOOL)) {
+    SIO_REQUIRE_ORIG(o_UV_anim_dc);
     if (SIO_blocked()) { o_UV_anim_dc(self, _cmd, d, a, c); return; }
     SIO_setUIViewAnim(YES);
     o_UV_anim_dc(self, _cmd, SIO_targetDuration(d), a, c);
@@ -242,15 +356,16 @@ static void sio_UV_anim_dc(Class self, SEL _cmd, double d, void (^a)(void), void
 
 static void sio_UV_anim_ddoc(Class self, SEL _cmd, double d, double delay, UIViewAnimationOptions o,
                              void (^a)(void), void (^c)(BOOL)) {
+    SIO_REQUIRE_ORIG(o_UV_anim_ddoc);
     if (SIO_blocked()) { o_UV_anim_ddoc(self, _cmd, d, delay, o, a, c); return; }
-    double f = (gMode == 1) ? gSlowFactor : (gMode == 2 ? 0.0 : (gSpeed <= 1.0001 ? 1.0 : 1.0 / gSpeed));
     SIO_setUIViewAnim(YES);
-    o_UV_anim_ddoc(self, _cmd, SIO_targetDuration(d), delay * f, o, a, c);
+    o_UV_anim_ddoc(self, _cmd, SIO_targetDuration(d), SIO_targetDelay(delay), o, a, c);
     SIO_setUIViewAnim(NO);
 }
 
 static void sio_UV_anim_spring(Class self, SEL _cmd, double d, double damp, double vel,
                                UIViewAnimationOptions o, void (^a)(void), void (^c)(BOOL)) {
+    SIO_REQUIRE_ORIG(o_UV_anim_spring);
     if (SIO_blocked()) { o_UV_anim_spring(self, _cmd, d, damp, vel, o, a, c); return; }
     SIO_setUIViewAnim(YES);
     double m = SIO_springScale();
@@ -261,6 +376,7 @@ static void sio_UV_anim_spring(Class self, SEL _cmd, double d, double damp, doub
 
 static void sio_UV_trans(Class self, SEL _cmd, UIView *v, double d, UIViewAnimationOptions o,
                          void (^a)(void), void (^c)(BOOL)) {
+    SIO_REQUIRE_ORIG(o_UV_trans);
     if (SIO_blocked()) { o_UV_trans(self, _cmd, v, d, o, a, c); return; }
     SIO_setUIViewAnim(YES);
     o_UV_trans(self, _cmd, v, SIO_targetDuration(d), o, a, c);
@@ -269,83 +385,164 @@ static void sio_UV_trans(Class self, SEL _cmd, UIView *v, double d, UIViewAnimat
 
 static void sio_UV_transFrom(Class self, SEL _cmd, UIView *a1, UIView *a2, double d,
                              UIViewAnimationOptions o, void (^an)(void), void (^c)(BOOL)) {
+    SIO_REQUIRE_ORIG(o_UV_transFrom);
     if (SIO_blocked()) { o_UV_transFrom(self, _cmd, a1, a2, d, o, an, c); return; }
     SIO_setUIViewAnim(YES);
     o_UV_transFrom(self, _cmd, a1, a2, SIO_targetDuration(d), o, an, c);
     SIO_setUIViewAnim(NO);
 }
 
+// ---- v1.8.12 新增：关键帧动画 ----
+// +[UIView animateKeyframesWithDuration:delay:options:animations:completion:]
+// 关键帧动画（微信/淘宝等大量使用）此前完全未覆盖：它不走 animateWithDuration 系，
+// 也不走 CAAnimation setDuration（内部按相对时间比换算），所以时长必须在这里改。
+// options 参数用 NSUInteger 承接（UIViewKeyframeAnimationOptions 底层即 NSUInteger，ABI 一致）。
+static void sio_UV_anim_keyframes(Class self, SEL _cmd, double d, double delay, NSUInteger o,
+                                  void (^a)(void), void (^c)(BOOL)) {
+    SIO_REQUIRE_ORIG(o_UV_anim_keyframes);
+    if (SIO_blocked()) { o_UV_anim_keyframes(self, _cmd, d, delay, o, a, c); return; }
+    SIO_setUIViewAnim(YES);
+    o_UV_anim_keyframes(self, _cmd, SIO_targetDuration(d), SIO_targetDelay(delay), o, a, c);
+    SIO_setUIViewAnim(NO);
+}
+
+// ---- v1.8.12 新增：系统动画（删除/插入/重排等系统内建动画） ----
+// +[UIView performSystemAnimation:onViews:options:animations:completion:]
+// UISystemAnimation 同为 NSUInteger 枚举。用 CATransaction 覆盖时长，
+// 不改写 animated 语义，避免影响系统对视图生命周期的收尾。
+static void sio_UV_systemAnim(Class self, SEL _cmd, NSUInteger anim, NSArray *views, NSUInteger o,
+                              void (^a)(void), void (^c)(BOOL)) {
+    SIO_REQUIRE_ORIG(o_UV_systemAnim);
+    if (SIO_blocked()) { o_UV_systemAnim(self, _cmd, anim, views, o, a, c); return; }
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_targetDuration(0.35));
+    o_UV_systemAnim(self, _cmd, anim, views, o, a, c);
+    [CATransaction commit];
+}
+
 #pragma mark - CASpring（原版灵魂功能：参数缩放保持物理一致性）
 
 static void sio_CASpring_mass(id self, SEL _cmd, double v) {
+    SIO_REQUIRE_ORIG(o_CASpring_mass);
     if (SIO_blocked() || !gSpring) { o_CASpring_mass(self, _cmd, v); return; }
     double m = SIO_springScale();
     o_CASpring_mass(self, _cmd, m > 0 ? v / (m * m) : v);
 }
 
 static void sio_CASpring_stiff(id self, SEL _cmd, double v) {
+    SIO_REQUIRE_ORIG(o_CASpring_stiff);
     if (SIO_blocked() || !gSpring) { o_CASpring_stiff(self, _cmd, v); return; }
     double m = SIO_springScale();
     o_CASpring_stiff(self, _cmd, v * m * m);
 }
 
 static void sio_CASpring_damp(id self, SEL _cmd, double v) {
+    SIO_REQUIRE_ORIG(o_CASpring_damp);
     if (SIO_blocked() || !gSpring) { o_CASpring_damp(self, _cmd, v); return; }
     o_CASpring_damp(self, _cmd, v * SIO_springScale());
 }
 
-#pragma mark - 导航 / 模态（进阶：零时长事务包裹，转场动画交给事务时长统一控制）
+#pragma mark - 导航 / 模态（进阶：事务时长包裹，转场动画交给事务时长统一控制）
+//
+// v1.8.12 真 bug 修复：这里原来一律 `setAnimationDuration:0.0`，效果是无论
+// 加速/慢放/瞬切，导航与模态转场都被强制瞬间完成——慢放模式对这类转场
+// 等于完全失效（用户开慢放看转场细节，结果转场根本没有）。
+// 现在统一走 SIO_targetDuration(0.35)：
+//   加速 ×5 → 0.07s（肉眼几乎无感，保持原有"秒过"体验）
+//   慢放 ×2 → 0.70s（慢放真正生效）
+//   瞬切    → 0.01s（直达）
+static inline double SIO_transitionDuration(void) { return SIO_targetDuration(0.35); }
 
 static void sio_nav_push(id self, SEL _cmd, UIViewController *vc, BOOL anim) {
+    SIO_REQUIRE_ORIG(o_nav_push);
     if (SIO_blocked() || !gExtra || !anim) { o_nav_push(self, _cmd, vc, anim); return; }
     [CATransaction begin];
-    [CATransaction setAnimationDuration:0.0];
+    SIO_setTransactionDuration(SIO_transitionDuration());
     o_nav_push(self, _cmd, vc, anim);
     [CATransaction commit];
 }
 
 static void sio_nav_pop(id self, SEL _cmd, BOOL anim) {
+    SIO_REQUIRE_ORIG(o_nav_pop);
     if (SIO_blocked() || !gExtra || !anim) { o_nav_pop(self, _cmd, anim); return; }
     [CATransaction begin];
-    [CATransaction setAnimationDuration:0.0];
+    SIO_setTransactionDuration(SIO_transitionDuration());
     o_nav_pop(self, _cmd, anim);
     [CATransaction commit];
 }
 
 static void sio_nav_popTo(id self, SEL _cmd, UIViewController *vc, BOOL anim) {
+    SIO_REQUIRE_ORIG(o_nav_popTo);
     if (SIO_blocked() || !gExtra || !anim) { o_nav_popTo(self, _cmd, vc, anim); return; }
     [CATransaction begin];
-    [CATransaction setAnimationDuration:0.0];
+    SIO_setTransactionDuration(SIO_transitionDuration());
     o_nav_popTo(self, _cmd, vc, anim);
     [CATransaction commit];
 }
 
 static void sio_nav_setVCs(id self, SEL _cmd, NSArray *vcs, BOOL anim) {
+    SIO_REQUIRE_ORIG(o_nav_setVCs);
     if (SIO_blocked() || !gExtra || !anim) { o_nav_setVCs(self, _cmd, vcs, anim); return; }
     [CATransaction begin];
-    [CATransaction setAnimationDuration:0.0];
+    SIO_setTransactionDuration(SIO_transitionDuration());
     o_nav_setVCs(self, _cmd, vcs, anim);
     [CATransaction commit];
 }
 
 static void sio_nav_privDur(id self, SEL _cmd, double d) {
+    SIO_REQUIRE_ORIG(o_nav_privDur);
     if (SIO_blocked() || !gExtra) { o_nav_privDur(self, _cmd, d); return; }
     o_nav_privDur(self, _cmd, SIO_targetDuration(d));
 }
 
 static void sio_vc_present(id self, SEL _cmd, UIViewController *vc, BOOL anim, void (^c)(void)) {
+    SIO_REQUIRE_ORIG(o_vc_present);
     if (SIO_blocked() || !gExtra || !anim) { o_vc_present(self, _cmd, vc, anim, c); return; }
     [CATransaction begin];
-    [CATransaction setAnimationDuration:0.0];
+    SIO_setTransactionDuration(SIO_transitionDuration());
     o_vc_present(self, _cmd, vc, anim, c);
     [CATransaction commit];
 }
 
 static void sio_vc_dismiss(id self, SEL _cmd, BOOL anim, void (^c)(void)) {
+    SIO_REQUIRE_ORIG(o_vc_dismiss);
     if (SIO_blocked() || !gExtra || !anim) { o_vc_dismiss(self, _cmd, anim, c); return; }
     [CATransaction begin];
-    [CATransaction setAnimationDuration:0.0];
+    SIO_setTransactionDuration(SIO_transitionDuration());
     o_vc_dismiss(self, _cmd, anim, c);
+    [CATransaction commit];
+}
+
+// ---- v1.8.12 新增：容器控制器子控制器转场 ----
+// -[UIViewController transitionFromViewController:toViewController:duration:options:animations:completion:]
+// 与已 hook 的 +[UIView transitionFromView:…] 属同一机制，但走的是 VC 容器路径，
+// 此前完全未覆盖（分栏/自研 Tab/向导式页面大量使用）。duration 直接改写。
+static void sio_vc_transitionFrom(id self, SEL _cmd, UIViewController *from, UIViewController *to,
+                                  double d, UIViewAnimationOptions o,
+                                  void (^an)(void), void (^c)(BOOL)) {
+    SIO_REQUIRE_ORIG(o_vc_transitionFrom);
+    if (SIO_blocked() || !gExtra) { o_vc_transitionFrom(self, _cmd, from, to, d, o, an, c); return; }
+    o_vc_transitionFrom(self, _cmd, from, to, SIO_targetDuration(d), o, an, c);
+}
+
+// ---- v1.8.12 新增：底部 Tab 切换转场 ----
+// UITabBarController 的选中切换此前未 hook（父项目 README 把它列为基础层 hook，
+// 但 SIOriginal 这一支一直缺失）。用 CATransaction 覆盖时长，不改动选中语义。
+static void sio_tab_setIndex(id self, SEL _cmd, NSUInteger idx) {
+    SIO_REQUIRE_ORIG(o_tab_setIndex);
+    if (SIO_blocked() || !gExtra) { o_tab_setIndex(self, _cmd, idx); return; }
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_transitionDuration());
+    o_tab_setIndex(self, _cmd, idx);
+    [CATransaction commit];
+}
+
+static void sio_tab_setVC(id self, SEL _cmd, UIViewController *vc) {
+    SIO_REQUIRE_ORIG(o_tab_setVC);
+    if (SIO_blocked() || !gExtra) { o_tab_setVC(self, _cmd, vc); return; }
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_transitionDuration());
+    o_tab_setVC(self, _cmd, vc);
     [CATransaction commit];
 }
 
@@ -357,7 +554,9 @@ static BOOL SIO_listOK(void) { return gListAccel && !SIO_blocked(); }
 
 static void SIO_listWrap(void (^block)(void)) {
     [CATransaction begin];
-    [CATransaction setAnimationDuration:SIO_targetDuration(0.25)];
+    // v1.8.12：改走 SIO_setTransactionDuration。原来直接调 setAnimationDuration:，
+    // 被自己的 hook 再缩放一次（0.25 在 ×5 下变成 0.01 而非预期的 0.05）。
+    SIO_setTransactionDuration(SIO_targetDuration(0.25));
     block();
     [CATransaction commit];
 }
@@ -365,76 +564,91 @@ static void SIO_listWrap(void (^block)(void)) {
 // ---- UITableView ----
 static void (*o_tv_selectRow)(id, SEL, NSIndexPath *, BOOL, UITableViewScrollPosition);
 static void sio_tv_selectRow(id self, SEL _cmd, NSIndexPath *ip, BOOL anim, UITableViewScrollPosition pos) {
+    SIO_REQUIRE_ORIG(o_tv_selectRow);
     if (!SIO_listOK()) { o_tv_selectRow(self, _cmd, ip, anim, pos); return; }
     SIO_listWrap(^{ o_tv_selectRow(self, _cmd, ip, anim, pos); });
 }
 static void (*o_tv_deselectRow)(id, SEL, NSIndexPath *, BOOL);
 static void sio_tv_deselectRow(id self, SEL _cmd, NSIndexPath *ip, BOOL anim) {
+    SIO_REQUIRE_ORIG(o_tv_deselectRow);
     if (!SIO_listOK()) { o_tv_deselectRow(self, _cmd, ip, anim); return; }
     SIO_listWrap(^{ o_tv_deselectRow(self, _cmd, ip, anim); });
 }
 static void (*o_tv_scrollToRow)(id, SEL, NSIndexPath *, UITableViewScrollPosition, BOOL);
 static void sio_tv_scrollToRow(id self, SEL _cmd, NSIndexPath *ip, UITableViewScrollPosition pos, BOOL anim) {
+    SIO_REQUIRE_ORIG(o_tv_scrollToRow);
     if (!SIO_listOK()) { o_tv_scrollToRow(self, _cmd, ip, pos, anim); return; }
     SIO_listWrap(^{ o_tv_scrollToRow(self, _cmd, ip, pos, anim); });
 }
 static void (*o_tv_scrollNearest)(id, SEL, UITableViewScrollPosition, BOOL);
 static void sio_tv_scrollNearest(id self, SEL _cmd, UITableViewScrollPosition pos, BOOL anim) {
+    SIO_REQUIRE_ORIG(o_tv_scrollNearest);
     if (!SIO_listOK()) { o_tv_scrollNearest(self, _cmd, pos, anim); return; }
     SIO_listWrap(^{ o_tv_scrollNearest(self, _cmd, pos, anim); });
 }
 static void (*o_tv_reloadData)(id, SEL);
 static void sio_tv_reloadData(id self, SEL _cmd) {
+    SIO_REQUIRE_ORIG(o_tv_reloadData);
     if (!SIO_listOK()) { o_tv_reloadData(self, _cmd); return; }
     SIO_listWrap(^{ o_tv_reloadData(self, _cmd); });
 }
 static void (*o_tv_reloadRows)(id, SEL, NSArray *, UITableViewRowAnimation);
 static void sio_tv_reloadRows(id self, SEL _cmd, NSArray *ips, UITableViewRowAnimation a) {
+    SIO_REQUIRE_ORIG(o_tv_reloadRows);
     if (!SIO_listOK()) { o_tv_reloadRows(self, _cmd, ips, a); return; }
     SIO_listWrap(^{ o_tv_reloadRows(self, _cmd, ips, a); });
 }
 static void (*o_tv_reloadSections)(id, SEL, NSIndexSet *, UITableViewRowAnimation);
 static void sio_tv_reloadSections(id self, SEL _cmd, NSIndexSet *sec, UITableViewRowAnimation a) {
+    SIO_REQUIRE_ORIG(o_tv_reloadSections);
     if (!SIO_listOK()) { o_tv_reloadSections(self, _cmd, sec, a); return; }
     SIO_listWrap(^{ o_tv_reloadSections(self, _cmd, sec, a); });
 }
 static void (*o_tv_insertRows)(id, SEL, NSArray *, UITableViewRowAnimation);
 static void sio_tv_insertRows(id self, SEL _cmd, NSArray *ips, UITableViewRowAnimation a) {
+    SIO_REQUIRE_ORIG(o_tv_insertRows);
     if (!SIO_listOK()) { o_tv_insertRows(self, _cmd, ips, a); return; }
     SIO_listWrap(^{ o_tv_insertRows(self, _cmd, ips, a); });
 }
 static void (*o_tv_deleteRows)(id, SEL, NSArray *, UITableViewRowAnimation);
 static void sio_tv_deleteRows(id self, SEL _cmd, NSArray *ips, UITableViewRowAnimation a) {
+    SIO_REQUIRE_ORIG(o_tv_deleteRows);
     if (!SIO_listOK()) { o_tv_deleteRows(self, _cmd, ips, a); return; }
     SIO_listWrap(^{ o_tv_deleteRows(self, _cmd, ips, a); });
 }
 static void (*o_tv_moveRow)(id, SEL, NSIndexPath *, NSIndexPath *);
 static void sio_tv_moveRow(id self, SEL _cmd, NSIndexPath *from, NSIndexPath *to) {
+    SIO_REQUIRE_ORIG(o_tv_moveRow);
     if (!SIO_listOK()) { o_tv_moveRow(self, _cmd, from, to); return; }
     SIO_listWrap(^{ o_tv_moveRow(self, _cmd, from, to); });
 }
 static void (*o_tv_insertSections)(id, SEL, NSIndexSet *, UITableViewRowAnimation);
 static void sio_tv_insertSections(id self, SEL _cmd, NSIndexSet *sec, UITableViewRowAnimation a) {
+    SIO_REQUIRE_ORIG(o_tv_insertSections);
     if (!SIO_listOK()) { o_tv_insertSections(self, _cmd, sec, a); return; }
     SIO_listWrap(^{ o_tv_insertSections(self, _cmd, sec, a); });
 }
 static void (*o_tv_deleteSections)(id, SEL, NSIndexSet *, UITableViewRowAnimation);
 static void sio_tv_deleteSections(id self, SEL _cmd, NSIndexSet *sec, UITableViewRowAnimation a) {
+    SIO_REQUIRE_ORIG(o_tv_deleteSections);
     if (!SIO_listOK()) { o_tv_deleteSections(self, _cmd, sec, a); return; }
     SIO_listWrap(^{ o_tv_deleteSections(self, _cmd, sec, a); });
 }
 static void (*o_tv_moveSection)(id, SEL, NSUInteger, NSUInteger);
 static void sio_tv_moveSection(id self, SEL _cmd, NSUInteger from, NSUInteger to) {
+    SIO_REQUIRE_ORIG(o_tv_moveSection);
     if (!SIO_listOK()) { o_tv_moveSection(self, _cmd, from, to); return; }
     SIO_listWrap(^{ o_tv_moveSection(self, _cmd, from, to); });
 }
 static void (*o_tv_setEditing)(id, SEL, BOOL, BOOL);
 static void sio_tv_setEditing(id self, SEL _cmd, BOOL editing, BOOL anim) {
+    SIO_REQUIRE_ORIG(o_tv_setEditing);
     if (!SIO_listOK()) { o_tv_setEditing(self, _cmd, editing, anim); return; }
     SIO_listWrap(^{ o_tv_setEditing(self, _cmd, editing, anim); });
 }
 static void (*o_tv_batchUpdates)(id, SEL, void (^)(void), void (^)(BOOL));
 static void sio_tv_batchUpdates(id self, SEL _cmd, void (^updates)(void), void (^comp)(BOOL)) {
+    SIO_REQUIRE_ORIG(o_tv_batchUpdates);
     if (!SIO_listOK()) { o_tv_batchUpdates(self, _cmd, updates, comp); return; }
     SIO_listWrap(^{ o_tv_batchUpdates(self, _cmd, updates, comp); });
 }
@@ -442,46 +656,55 @@ static void sio_tv_batchUpdates(id self, SEL _cmd, void (^updates)(void), void (
 // ---- UICollectionView ----
 static void (*o_cv_reloadData)(id, SEL);
 static void sio_cv_reloadData(id self, SEL _cmd) {
+    SIO_REQUIRE_ORIG(o_cv_reloadData);
     if (!SIO_listOK()) { o_cv_reloadData(self, _cmd); return; }
     SIO_listWrap(^{ o_cv_reloadData(self, _cmd); });
 }
 static void (*o_cv_reloadItems)(id, SEL, NSArray *);
 static void sio_cv_reloadItems(id self, SEL _cmd, NSArray *ips) {
+    SIO_REQUIRE_ORIG(o_cv_reloadItems);
     if (!SIO_listOK()) { o_cv_reloadItems(self, _cmd, ips); return; }
     SIO_listWrap(^{ o_cv_reloadItems(self, _cmd, ips); });
 }
 static void (*o_cv_reloadSections)(id, SEL, NSArray *);
 static void sio_cv_reloadSections(id self, SEL _cmd, NSArray *secs) {
+    SIO_REQUIRE_ORIG(o_cv_reloadSections);
     if (!SIO_listOK()) { o_cv_reloadSections(self, _cmd, secs); return; }
     SIO_listWrap(^{ o_cv_reloadSections(self, _cmd, secs); });
 }
 static void (*o_cv_insertItems)(id, SEL, NSArray *);
 static void sio_cv_insertItems(id self, SEL _cmd, NSArray *ips) {
+    SIO_REQUIRE_ORIG(o_cv_insertItems);
     if (!SIO_listOK()) { o_cv_insertItems(self, _cmd, ips); return; }
     SIO_listWrap(^{ o_cv_insertItems(self, _cmd, ips); });
 }
 static void (*o_cv_deleteItems)(id, SEL, NSArray *);
 static void sio_cv_deleteItems(id self, SEL _cmd, NSArray *ips) {
+    SIO_REQUIRE_ORIG(o_cv_deleteItems);
     if (!SIO_listOK()) { o_cv_deleteItems(self, _cmd, ips); return; }
     SIO_listWrap(^{ o_cv_deleteItems(self, _cmd, ips); });
 }
 static void (*o_cv_moveItem)(id, SEL, NSIndexPath *, NSIndexPath *);
 static void sio_cv_moveItem(id self, SEL _cmd, NSIndexPath *from, NSIndexPath *to) {
+    SIO_REQUIRE_ORIG(o_cv_moveItem);
     if (!SIO_listOK()) { o_cv_moveItem(self, _cmd, from, to); return; }
     SIO_listWrap(^{ o_cv_moveItem(self, _cmd, from, to); });
 }
 static void (*o_cv_scrollToItem)(id, SEL, NSIndexPath *, UICollectionViewScrollPosition, BOOL);
 static void sio_cv_scrollToItem(id self, SEL _cmd, NSIndexPath *ip, UICollectionViewScrollPosition pos, BOOL anim) {
+    SIO_REQUIRE_ORIG(o_cv_scrollToItem);
     if (!SIO_listOK()) { o_cv_scrollToItem(self, _cmd, ip, pos, anim); return; }
     SIO_listWrap(^{ o_cv_scrollToItem(self, _cmd, ip, pos, anim); });
 }
 static void (*o_cv_selectItem)(id, SEL, NSIndexPath *, BOOL, UICollectionViewScrollPosition);
 static void sio_cv_selectItem(id self, SEL _cmd, NSIndexPath *ip, BOOL anim, UICollectionViewScrollPosition pos) {
+    SIO_REQUIRE_ORIG(o_cv_selectItem);
     if (!SIO_listOK()) { o_cv_selectItem(self, _cmd, ip, anim, pos); return; }
     SIO_listWrap(^{ o_cv_selectItem(self, _cmd, ip, anim, pos); });
 }
 static void (*o_cv_deselectItem)(id, SEL, NSIndexPath *, BOOL);
 static void sio_cv_deselectItem(id self, SEL _cmd, NSIndexPath *ip, BOOL anim) {
+    SIO_REQUIRE_ORIG(o_cv_deselectItem);
     if (!SIO_listOK()) { o_cv_deselectItem(self, _cmd, ip, anim); return; }
     SIO_listWrap(^{ o_cv_deselectItem(self, _cmd, ip, anim); });
 }
@@ -490,7 +713,10 @@ static void sio_cv_deselectItem(id self, SEL _cmd, NSIndexPath *ip, BOOL anim) {
 
 __attribute__((constructor))
 static void SIOriginalInit(void) {
+    // v1.8.12：安装全程 @try 包裹。任何一步异常只丢功能，绝不影响目标 App 启动（红线规则 #2）。
+    @try {
     pthread_key_create(&gInUIViewAnimKey, NULL);
+    pthread_key_create(&gInPAInitKey, NULL);
     gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     gIsWeChat = [gSelfBundle isEqualToString:@"com.tencent.xin"];
     SIO_reload();
@@ -529,6 +755,11 @@ static void SIOriginalInit(void) {
                      (IMP)sio_UV_trans, (IMP *)&o_UV_trans);
     SIO_swizzleClass(uv, @selector(transitionFromView:toView:duration:options:completion:),
                      (IMP)sio_UV_transFrom, (IMP *)&o_UV_transFrom);
+    // v1.8.12 新增：关键帧动画 + 系统动画（同为 UIView 类方法，低风险）
+    SIO_swizzleClass(uv, @selector(animateKeyframesWithDuration:delay:options:animations:completion:),
+                     (IMP)sio_UV_anim_keyframes, (IMP *)&o_UV_anim_keyframes);
+    SIO_swizzleClass(uv, @selector(performSystemAnimation:onViews:options:animations:completion:),
+                     (IMP)sio_UV_systemAnim, (IMP *)&o_UV_systemAnim);
 
     // 弹簧参数 ×3
     if (spring) {
@@ -558,6 +789,18 @@ static void SIOriginalInit(void) {
                             (IMP)sio_vc_present, (IMP *)&o_vc_present);
         SIO_swizzleInstance(vc, @selector(dismissViewControllerAnimated:completion:),
                             (IMP)sio_vc_dismiss, (IMP *)&o_vc_dismiss);
+        // v1.8.12 新增：容器控制器子控制器转场（与 UIView 转场同机制，此前未覆盖）
+        SIO_swizzleInstance(vc, @selector(transitionFromViewController:toViewController:duration:options:animations:completion:),
+                            (IMP)sio_vc_transitionFrom, (IMP *)&o_vc_transitionFrom);
+    }
+
+    // v1.8.12 新增：底部 Tab 切换转场（父项目基础层有，SIOriginal 这一支一直缺失）
+    Class tab = objc_getClass("UITabBarController");
+    if (tab) {
+        SIO_swizzleInstance(tab, @selector(setSelectedIndex:),
+                            (IMP)sio_tab_setIndex, (IMP *)&o_tab_setIndex);
+        SIO_swizzleInstance(tab, @selector(setSelectedViewController:),
+                            (IMP)sio_tab_setVC, (IMP *)&o_tab_setVC);
     }
 
     // TV/CV 列表全家桶 ×24（ListAccel 纯开关控制；重列表 App 默认关闭）
@@ -618,38 +861,81 @@ static void SIOriginalInit(void) {
 
     // iOS 16 优化增强：UIViewPropertyAnimator + UIScrollView + CALayer
     SIO_installiOS16Extras();
+
+    // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
+    NSLog(@"[SIOriginal] v1.8.12 hooks installed in %@ (enabled=%d mode=%d speed=%.1f spring=%d extra=%d list=%d)",
+          gSelfBundle, gEnabled, gMode, gSpeed, gSpring, gExtra, gListAccel);
+    } @catch (NSException *e) {
+        NSLog(@"[SIOriginal] hook install failed (feature degraded, app unaffected): %@", e);
+    }
 }
 
 #pragma mark - UIViewPropertyAnimator（iOS 10+ 现代 App 主流动画 API）
+//
+// v1.8.12 覆盖补强：新增 2 参指定初始化器 initWithDuration:timingParameters:。
+// App 常见写法是 `[[UIViewPropertyAnimator alloc] initWithDuration:tp]` 之后再
+// addAnimations:，这条路径此前完全没被拦到（旧的三个 hook 都是带 animations: 的变体）。
+// 同时 3 参变体内部大概率会回调到 2 参初始化器，所以用线程局部 gInPAInit 做重入保护，
+// 避免同一次初始化被缩放两次（÷speed²）。
 
 // duration setter — 拦截已创建 animator 的时长修改
 static void sio_PA_setDuration(id self, SEL _cmd, double d) {
+    SIO_REQUIRE_ORIG(o_pa_setDuration);
     if (SIO_blocked()) { o_pa_setDuration(self, _cmd, d); return; }
     o_pa_setDuration(self, _cmd, SIO_targetDuration(d));
 }
 
+// v1.8.12：2 参指定初始化器（唯一在 App 代码里直接可见的 duration 入口）
+static id sio_PA_initWithDurTP2(id self, SEL _cmd, double d, id tp) {
+    SIO_REQUIRE_ORIG_NIL(o_pa_initWithDurTP2);
+    if (!SIO_blocked() && !SIO_inPAInit()) d = SIO_targetDuration(d);
+    return o_pa_initWithDurTP2(self, _cmd, d, tp);
+}
+
 // initWithDuration:timingParameters:animations: — CA/CubicTimingParameters init
 static id sio_PA_initWithDurTP(id self, SEL _cmd, double d, id tp, void (^a)(void)) {
-    if (!SIO_blocked()) d = SIO_targetDuration(d);
-    return o_pa_initWithDurTP(self, _cmd, d, tp, a);
+    SIO_REQUIRE_ORIG_NIL(o_pa_initWithDurTP);
+    if (SIO_blocked() || SIO_inPAInit()) return o_pa_initWithDurTP(self, _cmd, d, tp, a);
+    SIO_setPAInit(YES);
+    id r = o_pa_initWithDurTP(self, _cmd, SIO_targetDuration(d), tp, a);
+    SIO_setPAInit(NO);
+    return r;
 }
 
 // initWithDuration:controlPoint1:controlPoint2:animations: — Bezier init
 static id sio_PA_initWithDurCP(id self, SEL _cmd, double d, CGPoint p1, CGPoint p2, void (^a)(void)) {
-    if (!SIO_blocked()) d = SIO_targetDuration(d);
-    return o_pa_initWithDurCP(self, _cmd, d, p1, p2, a);
+    SIO_REQUIRE_ORIG_NIL(o_pa_initWithDurCP);
+    if (SIO_blocked() || SIO_inPAInit()) return o_pa_initWithDurCP(self, _cmd, d, p1, p2, a);
+    SIO_setPAInit(YES);
+    id r = o_pa_initWithDurCP(self, _cmd, SIO_targetDuration(d), p1, p2, a);
+    SIO_setPAInit(NO);
+    return r;
 }
 
 // initWithDuration:springDampingRatio:animations: — Spring init
 static id sio_PA_initWithDurSpring(id self, SEL _cmd, double d, double dr, void (^a)(void)) {
-    if (!SIO_blocked()) d = SIO_targetDuration(d);
-    return o_pa_initWithDurSpring(self, _cmd, d, dr, a);
+    SIO_REQUIRE_ORIG_NIL(o_pa_initWithDurSpring);
+    if (SIO_blocked() || SIO_inPAInit()) return o_pa_initWithDurSpring(self, _cmd, d, dr, a);
+    SIO_setPAInit(YES);
+    id r = o_pa_initWithDurSpring(self, _cmd, SIO_targetDuration(d), dr, a);
+    SIO_setPAInit(NO);
+    return r;
 }
 
 // runningPropertyAnimatorWithDuration:delay:options:animations:completion: — 类方法
+// v1.8.12：真 bug 修复。原来安装处写成 SIO_swizzleClass(object_getClass(pa), …)，
+// class_getClassMethod 内部会再做一次 object_getClass，等于在根元类里找这个方法，
+// 必然返回 NULL —— 该 hook 从未生效。安装处现已改为 SIO_swizzleClass(pa, …)。
+// 同时补上 delay 的同比缩放（原来 delay 完全没动，与块动画行为不一致）。
 static id sio_PA_runningPA(id self, SEL _cmd, double d, double delay, UIViewAnimationOptions opt, void (^a)(void), void (^c)(BOOL)) {
-    if (!SIO_blocked()) d = SIO_targetDuration(d);
-    return o_pa_runningPA(self, _cmd, d, delay, opt, a, c);
+    SIO_REQUIRE_ORIG_NIL(o_pa_runningPA);
+    // 该便捷构造器内部同样会走 initWithDuration:timingParameters:，
+    // 必须加同一把重入锁，否则时长被缩放两次。
+    if (SIO_blocked() || SIO_inPAInit()) return o_pa_runningPA(self, _cmd, d, delay, opt, a, c);
+    SIO_setPAInit(YES);
+    id r = o_pa_runningPA(self, _cmd, SIO_targetDuration(d), SIO_targetDelay(delay), opt, a, c);
+    SIO_setPAInit(NO);
+    return r;
 }
 
 #pragma mark - UIScrollView 滚动动画
@@ -679,6 +965,7 @@ static BOOL SIO_svZoomEngaged(UIScrollView *sv) {
 }
 
 static void sio_SV_setContentOffset(id self, SEL _cmd, CGPoint p, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_sv_setContentOffset);
     if (SIO_blocked() || !animated || SIO_svZoomEngaged((UIScrollView *)self)) {
         o_sv_setContentOffset(self, _cmd, p, animated); return;
     }
@@ -692,12 +979,13 @@ static void sio_SV_setContentOffset(id self, SEL _cmd, CGPoint p, BOOL animated)
     }
     // 加速/慢放：用 CATransaction 包裹改 duration
     [CATransaction begin];
-    [CATransaction setAnimationDuration:SIO_targetDuration(0.35)];
+    SIO_setTransactionDuration(SIO_targetDuration(0.35));
     o_sv_setContentOffset(self, _cmd, p, YES);
     [CATransaction commit];
 }
 
 static void sio_SV_scrollRect(id self, SEL _cmd, CGRect r, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_sv_scrollRect);
     if (SIO_blocked() || !animated || SIO_svZoomEngaged((UIScrollView *)self)) {
         o_sv_scrollRect(self, _cmd, r, animated); return;
     }
@@ -709,7 +997,7 @@ static void sio_SV_scrollRect(id self, SEL _cmd, CGRect r, BOOL animated) {
         return;
     }
     [CATransaction begin];
-    [CATransaction setAnimationDuration:SIO_targetDuration(0.35)];
+    SIO_setTransactionDuration(SIO_targetDuration(0.35));
     o_sv_scrollRect(self, _cmd, r, YES);
     [CATransaction commit];
 }
@@ -717,22 +1005,26 @@ static void sio_SV_scrollRect(id self, SEL _cmd, CGRect r, BOOL animated) {
 #pragma mark - CALayer addAnimation:forKey:（补 CAAnimation setDuration 盲区）
 
 static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
+    SIO_REQUIRE_ORIG(o_layer_addAnim);
     // CAAnimation setDuration 基类 hook 已经覆盖了绝大多数情况，
-    // 但少数 app 在 addAnimation 后才设置 duration（顺序问题），
-    // 这里二次兜底：直接修改传入 anim 的 duration 属性
-    if (!SIO_blocked() && anim) {
-        // 只对 CAAnimation 子类生效
-        if ([anim respondsToSelector:@selector(setDuration:)]) {
-            // 用 performSelector 绕过 AVFoundation setDuration: 歧义
+    // 但少数 app 在 addAnimation 后才设置 duration（顺序问题），这里二次兜底。
+    //
+    // v1.8.12 真 bug 修复：原来用 objc_msgSend(anim, setDuration:, newDur) 回写，
+    // 而 setDuration: 的 IMP 此时已经是我们自己的 sio_CAAnim_setDuration，
+    // 于是同一次时长被 SIO_targetDuration 处理两次（加速 ×5 实际变成 ÷25），
+    // 与文件开头声称的「防双重除法」正好相反。
+    // 正确做法：直接调用 swizzle 时保存下来的原始 IMP，绕过自己的 hook。
+    if (!SIO_blocked() && anim && o_CAAnim_setDuration &&
+        [anim isKindOfClass:[CAAnimation class]]) {
+        @try {
             double origDur = ((CAAnimation *)anim).duration;
             if (origDur > 0) {
                 double newDur = SIO_targetDuration(origDur);
                 if (newDur != origDur) {
-                    SEL sd = @selector(setDuration:);
-                    ((void (*)(id, SEL, double))objc_msgSend)((CAAnimation *)anim, sd, newDur);
+                    o_CAAnim_setDuration(anim, @selector(setDuration:), newDur);
                 }
             }
-        }
+        } @catch (__unused NSException *e) {}
     }
     o_layer_addAnim(self, _cmd, anim, key);
 }
@@ -747,13 +1039,19 @@ static void SIO_installiOS16Extras(void) {
     if (pa) {
         SIO_swizzleInstance(pa, @selector(setDuration:),
                             (IMP)sio_PA_setDuration, (IMP *)&o_pa_setDuration);
+        // v1.8.12 新增：2 参指定初始化器（App 直接使用的时长入口）
+        SIO_swizzleInstance(pa, @selector(initWithDuration:timingParameters:),
+                            (IMP)sio_PA_initWithDurTP2, (IMP *)&o_pa_initWithDurTP2);
         SIO_swizzleInstance(pa, @selector(initWithDuration:timingParameters:animations:),
                             (IMP)sio_PA_initWithDurTP, (IMP *)&o_pa_initWithDurTP);
         SIO_swizzleInstance(pa, @selector(initWithDuration:controlPoint1:controlPoint2:animations:),
                             (IMP)sio_PA_initWithDurCP, (IMP *)&o_pa_initWithDurCP);
         SIO_swizzleInstance(pa, @selector(initWithDuration:springDampingRatio:animations:),
                             (IMP)sio_PA_initWithDurSpring, (IMP *)&o_pa_initWithDurSpring);
-        SIO_swizzleClass(object_getClass(pa), @selector(runningPropertyAnimatorWithDuration:delay:options:animations:completion:),
+        // v1.8.12 真 bug 修复：必须传类对象 pa，不能传 object_getClass(pa)（元类）。
+        // class_getClassMethod 内部会执行 class_getInstanceMethod(object_getClass(cls), sel)，
+        // 传元类等于去根元类查找，必然 NULL —— 原来这一行是静默失效的死代码。
+        SIO_swizzleClass(pa, @selector(runningPropertyAnimatorWithDuration:delay:options:animations:completion:),
                          (IMP)sio_PA_runningPA, (IMP *)&o_pa_runningPA);
     }
 
@@ -816,15 +1114,29 @@ static void _fbg_loadPref(void) {
             if (d[@"FUBGSceneFake"])    gSceneFake = [d[@"FUBGSceneFake"] boolValue];
             if (d[@"FUBGAudioKeep"])    gAudioKeep = [d[@"FUBGAudioKeep"] boolValue];
             if (d[@"FUBGFloatingBall"]) gShowBall  = [d[@"FUBGFloatingBall"] boolValue];
-            id ex = d[@"FUBGExcludeApps"];
-            if ([ex isKindOfClass:[NSArray class]]) gExclude = ex;
+            // v1.8.12 隐患修复：FUBGExcludeApps 与 Blacklist 取并集。
+            // 原实现先赋 FUBGExcludeApps、紧接着被 Blacklist 无条件覆盖——只要配置里
+            // 存在 Blacklist（配置 App 默认就会写入 com.tencent.wework），排除表永久失效。
+            NSMutableArray *ex = [NSMutableArray array];
+            id exRaw = d[@"FUBGExcludeApps"];
+            if ([exRaw isKindOfClass:[NSArray class]]) [ex addObjectsFromArray:exRaw];
             // 复用 SIOriginal 黑名单（v1.8.6：兼容字符串格式，原来只认 NSArray 导致黑名单对 FUBG 永远无效）
             id bl = d[@"Blacklist"];
             if ([bl isKindOfClass:[NSArray class]]) {
-                gExclude = bl;
+                [ex addObjectsFromArray:bl];
             } else if ([bl isKindOfClass:[NSString class]] && [(NSString *)bl length]) {
-                gExclude = [(NSString *)bl componentsSeparatedByString:@","];
+                [ex addObjectsFromArray:[(NSString *)bl componentsSeparatedByString:@","]];
             }
+            // 清洗：只保留非空字符串。_fbg_isExcluded 会对元素调 hasPrefix:，
+            // plist 里一旦混入 NSNumber/NSNull（手工编辑）就会 unrecognized selector 崩溃。
+            NSMutableArray *clean = [NSMutableArray array];
+            for (id it in ex) {
+                if (![it isKindOfClass:[NSString class]]) continue;
+                NSString *s = [(NSString *)it stringByTrimmingCharactersInSet:
+                               [NSCharacterSet whitespaceCharacterSet]];
+                if (s.length) [clean addObject:s];
+            }
+            gExclude = clean;
         }
     } @catch (__unused NSException *e) {}
     if (!gExclude) gExclude = @[];
@@ -1365,6 +1677,8 @@ static void _fbg_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n,
 __attribute__((constructor))
 static void FUBGEntry(void) {
     @autoreleasepool {
+    // v1.8.12：与动画侧同样全程 @try 包裹，保活引擎装不上也不能拖垮目标 App。
+    @try {
         // v1.8.10：全 App 通用保活（场景伪装+音频断言），悬浮球全局禁用。
         // 悬浮球是常驻全屏透明 UIWindow（alert+1 层级），会拦截触摸/抢占状态栏。
         // 场景伪装/音频断言只在后台活跃，不影响前台 UI。
@@ -1409,10 +1723,13 @@ static void FUBGEntry(void) {
             // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
         });
 
-        NSLog(@"[FUBG] v2.0.0 loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.0.0 (SIOriginal v1.8.12) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
+    } @catch (NSException *e) {
+        NSLog(@"[FUBG] keep-alive install failed (app unaffected): %@", e);
+    }
     }
 }
 
