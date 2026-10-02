@@ -77,9 +77,17 @@
 //   默认关闭（ZoomAccel=0），因为这一族在微信上出过"预览页卡死"，需要实测再开。
 // =========================================================================
 //
-// ==================== v1.8.16 系统级增强 + SpringBoard 支持 ====================
-// [SpringBoard] 允许把本 dylib 经 TrollFools 注入 com.apple.springboard，接管
-//   桌面/控制中心/通知中心/App 启动退出/App 切换器的动画。两处硬防护：
+// ==================== v1.8.16 系统级增强 + SpringBoard 防护 ====================
+// [SpringBoard] 更正：纯 TrollStore + TrollFools 环境**无法**把 dylib 注入
+//   SpringBoard。TrollFools 是 in-place injection（insert_dylib + ChOma 重签名），
+//   官方只支持「可移除的系统应用 / 已解密 App Store 应用 / 加密 App Store 应用」，
+//   而 SpringBoard 属不可移除的核心系统应用，位于只读的 SSV 系统卷
+//   （/System/Library/CoreServices/SpringBoard.app），根本写不进去。
+//   桌面动画要在"不注入"前提下加速，走 Managed Preferences 域的
+//   UIAnimationDragCoefficient（配置 App 的 ×5/×10/×20 档）—— SpringBoard 同样
+//   以 mobile 身份运行并读取该域。
+//   下面两道防护只在**越狱路线**（如 Dopamine + ElleKit 指定 SpringBoard）下才会
+//   真正生效；留着零成本，用于自动拦住最危险的两种情况：
 //     1. com.apple.springboard 进列表 hook 硬保护名单（SpringBoard 内部有大量
 //        TV/CV，列表 hook 一旦打开会破坏它的状态机 → 黑屏/白苹果）；
 //     2. com.apple.springboard 进内置保活排除名单 —— 保活引擎（音频断言 +
@@ -91,6 +99,22 @@
 //     FastTap   ：delaysContentTouches = NO（去掉列表点击约 150ms 延迟）
 //   在 -[UIScrollView didMoveToWindow] 里统一施加，覆盖 nib/storyboard/code
 //   三种来源的滚动视图。
+// =========================================================================
+//
+// ==================== v1.8.17 显式动画额外倍率 + 极端档回归 ====================
+// [LayerBoost] v1.8.15 修掉 CAAnimation 双重缩放后，显式动画（转圈/进度/旋转/
+//   地图相机）的时长从 ÷speed² 回到 ÷speed，肉眼明显变慢 —— 用户实测反馈
+//   "APP 加载图标转圈动画变慢了"。新增 LayerBoost（显式动画额外倍率：
+//   1 / 2 / 3 / 5 / 10，默认 1）：
+//     · 只叠加在 CAAnimation setDuration: 与 CALayer addAnimation: 这条路径上；
+//     · **不影响** UIView 块动画、CATransaction、导航/模态/Tab/列表/滚动 hook；
+//     · 因此可以单独把"转圈"调快，而不会像"全局倍率拉到 25"那样把块动画
+//       一起压到 1 帧（那才是真正会触发完成回调配对故障的做法）；
+//     · 仍受同一条 0.01s 下限约束；慢放模式不叠加（慢放是刻意看动画细节）。
+//   设 5 = 精确恢复 v1.8.15 之前的 ÷speed² 手感。
+// [极端档] 配置 App 的全局动画系数恢复"极端"档（0.0001）。旧版本写入的 0.0001
+//   现在**映射到该档并明确警告**，而不是像 v1.8.16 那样被静默清除 ——
+//   后者会把用户既有设置无提示地抹掉，是不对的。
 // =========================================================================
 //
 // ============================ v1.8.13 优化加强 ============================
@@ -132,6 +156,7 @@ static BOOL     gListAccel = NO;     // TV/CV 列表全家桶（v1.8.11 起纯�
 static BOOL     gZoomAccel = NO;     // v1.8.15：UIScrollView 缩放动画（setZoomScale:animated: 等），默认关
 static BOOL     gFastScroll = NO;    // v1.8.16：滑行惯性加急（decelerationRate=Fast），默认关
 static BOOL     gFastTap = NO;       // v1.8.16：取消列表点击延迟（delaysContentTouches=NO），默认关
+static double   gLayerBoost = 1.0;   // v1.8.17：显式动画（CAAnimation/CALayer）额外倍率，默认 1（不额外加速）
 static BOOL     gIsWeChat  = NO;     // 微信缩放预览守卫用（L104）
 // v1.8.12：黑名单在重载时一次性解析成本进程布尔值，热路径零分配（见 SIO_reload）
 static BOOL     gSelfBlacklisted = NO;
@@ -180,6 +205,23 @@ static inline double SIO_targetDuration(double orig) {
             d = orig / gSpeed;         break;              // 加速
     }
     if (d > 0.0 && d < 0.01) d = 0.01;                     // 时长下限 0.01s
+    return d;
+}
+
+// v1.8.17：显式动画（CAAnimation / CALayer）路径专用的时长换算。
+// 在全局倍率之上再叠加 LayerBoost，仅作用于这条路径：
+// 转圈 / 进度 / 旋转 / 地图相机这类动画都走「设时长 → addAnimation」，
+// v1.8.15 修掉双重缩放后它们从 ÷speed² 回到 ÷speed，肉眼明显变慢。
+// 单独给它们加倍率，就不会像"把全局倍率拉到 25"那样把 UIView 块动画一起压到 1 帧。
+// 慢放模式不叠加（慢放是刻意要看动画细节），下限仍是同一条 0.01s。
+static inline double SIO_targetDurationLayer(double orig) {
+    if (!gEnabled) return orig;
+    double d = SIO_targetDuration(orig);
+    if (gMode == 1) return d;
+    if (gLayerBoost > 1.0001 && d > 0.0) {
+        d = d / gLayerBoost;
+        if (d < 0.01) d = 0.01;
+    }
     return d;
 }
 
@@ -289,6 +331,9 @@ static void SIO_reload(void) {
     // v1.8.16：交互手感开关，缺键默认 NO（会改变操作习惯，必须显式开）
     gFastScroll = d[@"FastScroll"] ? [d[@"FastScroll"] boolValue] : NO;
     gFastTap    = d[@"FastTap"]    ? [d[@"FastTap"] boolValue]    : NO;
+    // v1.8.17：显式动画额外倍率，缺键默认 1.0（不额外加速），范围 1.0–10.0
+    double lb = d[@"LayerBoost"] ? [d[@"LayerBoost"] doubleValue] : 1.0;
+    gLayerBoost = (lb >= 1.0 && lb <= 10.0) ? lb : 1.0;
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     gSelfBlacklisted = NO;
@@ -333,6 +378,10 @@ static void SIO_reload(void) {
         if (ovr[@"ZoomAccel"])  gZoomAccel = [ovr[@"ZoomAccel"] boolValue];
         if (ovr[@"FastScroll"]) gFastScroll = [ovr[@"FastScroll"] boolValue];
         if (ovr[@"FastTap"])    gFastTap    = [ovr[@"FastTap"] boolValue];
+        if (ovr[@"LayerBoost"]) {
+            double lb2 = [ovr[@"LayerBoost"] doubleValue];
+            if (lb2 >= 1.0 && lb2 <= 10.0) gLayerBoost = lb2;
+        }
     }
 
     // ---- v1.8.14：列表 hook 硬保护，必须放在所有覆盖之后，优先级最高 ----
@@ -512,7 +561,8 @@ static void sio_CAAnim_setDuration(id self, SEL _cmd, double d) {
     if (SIO_blocked()) { o_CAAnim_setDuration(self, _cmd, d); return; }
     // v1.8.15：显式设时长视为新意图，按传入值缩放并重新打标
     //（不因已有标记而跳过，否则「add 之后再改时长」会被错误忽略）
-    o_CAAnim_setDuration(self, _cmd, SIO_targetDuration(d));
+    // v1.8.17：走 LayerBoost 版本（显式动画可单独加倍率）
+    o_CAAnim_setDuration(self, _cmd, SIO_targetDurationLayer(d));
     SIO_markAnimScaled(self);
 }
 
@@ -1101,8 +1151,8 @@ static void SIOriginalInit(void) {
 
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
-    NSLog(@"[SIOriginal] v1.8.16 hooks installed in %@ (enabled=%d mode=%d speed=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d override=%d listGuard=%d)",
-          gSelfBundle, gEnabled, gMode, gSpeed, gSpring, gExtra, gListAccel, gZoomAccel,
+    NSLog(@"[SIOriginal] v1.8.17 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f spring=%d extra=%d list=%d zoom=%d feel=%d/%d override=%d listGuard=%d)",
+          gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gHasAppOverride, gListHardGuarded);
     if (SIO_fbgBuiltinExcluded()) {
         NSLog(@"[SIOriginal] %@ is a built-in keep-alive exclusion: audio-assertion/scene-fake engine stays OFF", gSelfBundle);
@@ -1325,7 +1375,8 @@ static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
             double origDur = ((CAAnimation *)anim).duration;
             if (origDur > 0) {
                 SIO_markAnimScaled(anim);
-                double newDur = SIO_targetDuration(origDur);
+                // v1.8.17：与 setDuration: 路径共用同一套换算（含 LayerBoost）
+                double newDur = SIO_targetDurationLayer(origDur);
                 if (newDur != origDur) {
                     o_CAAnim_setDuration(anim, @selector(setDuration:), newDur);
                 }
@@ -2046,7 +2097,7 @@ static void FUBGEntry(void) {
             // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
         });
 
-        NSLog(@"[FUBG] v2.0.0 (SIOriginal v1.8.16) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.0.0 (SIOriginal v1.8.17) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");

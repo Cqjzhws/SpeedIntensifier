@@ -149,6 +149,8 @@ static NSMutableDictionary *ReadConfig(void) {
     // v1.8.16：交互手感，默认关闭
     if (!d[@"FastScroll"]) d[@"FastScroll"] = @NO;
     if (!d[@"FastTap"])    d[@"FastTap"]    = @NO;
+    // v1.8.17：显式动画额外倍率，默认 1.0（不额外加速）
+    if (!d[@"LayerBoost"]) d[@"LayerBoost"] = @1.0;
     if (!d[@"Blacklist"])  d[@"Blacklist"]  = @[ @"com.tencent.wework" ];
     if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
@@ -165,7 +167,7 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
     if (!merged) merged = [NSMutableDictionary dictionary];
     NSArray *sioKeys = @[ @"Enabled", @"Mode", @"Speed", @"SlowFactor",
                           @"Spring", @"Extra", @"ListAccel", @"Blacklist", @"ZoomAccel",
-                          @"FastScroll", @"FastTap",
+                          @"FastScroll", @"FastTap", @"LayerBoost",
                           @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
                           @"FUBGFloatingBall", @"FUBGExcludeApps", @"AppOverrides" ];
     for (NSString *k in sioKeys) {
@@ -219,27 +221,49 @@ static void WriteUIKitDrag(double coeff) {
     mkdir("/var/Managed Preferences/mobile", 0755);
     [d writeToFile:UIKitPath atomically:YES];
 }
-// 分档索引 → 系数：0=关闭 1=×5(0.2) 2=×10(0.1) 3=×20(0.05)
+// 分档索引 → 系数：0=关闭 1=×5(0.2) 2=×10(0.1) 3=×20(0.05) 4=极端(0.0001)
 static double DragCoeffForIndex(int i) {
     switch (i) {
         case 1:  return 0.2;
         case 2:  return 0.1;
         case 3:  return 0.05;
+        case 4:  return 0.0001;   // v1.8.17：恢复旧版的极端档
         default: return 0.0;
     }
 }
-// 已存系数 → 分档索引；旧版本写入的 0.0001 等未知值一律回落「关闭」，保存后即被清除
+// 已存系数 → 分档索引。
+// v1.8.17：旧版写入的 0.0001 及更小的值映射到「极端」档，
+// **不再像 v1.8.16 那样回落成「关闭」** —— 那会在保存时把用户既有设置静默抹掉。
 static int DragIndexForCoeff(double c) {
     if (c > 0.04 && c < 0.06)  return 3;   // 0.05
     if (c > 0.08 && c < 0.12)  return 2;   // 0.1
     if (c > 0.15 && c < 0.25)  return 1;   // 0.2
-    return 0;
+    if (c > 0.0 && c < 0.04)   return 4;   // 0.0001 等极端小值 → 极端档
+    return 0;                              // 无 / ≥0.25（近似原生）→ 关闭
 }
-// 系数 → 界面显示倍率（0 = 关闭）。避免依赖 math.h
+// 系数 → 界面显示倍率（0 = 关闭或极端档，倍率对二者不适用）。避免依赖 math.h
 static int DragMultiplierForCoeff(double c) {
     if (c > 0.04 && c < 0.06)  return 20;
     if (c > 0.08 && c < 0.12)  return 10;
     if (c > 0.15 && c < 0.25)  return 5;
+    return 0;
+}
+
+// v1.8.17：显式动画额外倍率分档：0=×1 1=×2 2=×3 3=×5 4=×10
+static double LayerBoostForIndex(int i) {
+    switch (i) {
+        case 1:  return 2.0;
+        case 2:  return 3.0;
+        case 3:  return 5.0;
+        case 4:  return 10.0;
+        default: return 1.0;
+    }
+}
+static int LayerIndexForBoost(double b) {
+    if (b > 1.5 && b < 2.5)  return 1;
+    if (b > 2.5 && b < 4.0)  return 2;
+    if (b > 4.0 && b < 7.0)  return 3;
+    if (b >= 7.0)            return 4;
     return 0;
 }
 
@@ -254,12 +278,13 @@ static int DragMultiplierForCoeff(double c) {
     UITextView *_blacklist;
     UILabel *_status;
     UISwitch *_swRM, *_swCF, *_swRT;
-    UISegmentedControl *_segDrag;
-    UILabel *_dragLabel;
+    UISegmentedControl *_segDrag, *_segLayer;
+    UILabel *_dragLabel, *_layerLabel;
     UISwitch *_swFUBG, *_swFUBGScene, *_swFUBGAudio, *_swFUBGBall;
     // v1.8.14 App 专属覆盖
     UITextField *_ovBundle;
     UISwitch *_ovOn, *_ovSpring, *_ovExtra, *_ovList, *_ovZoom, *_ovFastScroll, *_ovFastTap;
+    UISegmentedControl *_ovLayer;
     UISlider *_ovSpeed;
     UILabel *_ovSpeedLabel, *_ovGuard;
     UISegmentedControl *_ovMode;
@@ -292,7 +317,7 @@ static int DragMultiplierForCoeff(double c) {
     UILabel *title = [self label:@"隔壁老王·王灿专用" size:24 dim:NO];
     title.font = [UIFont boldSystemFontOfSize:24];
     title.textAlignment = NSTextAlignmentCenter;
-    UILabel *sub = [self label:@"v1.8.16 · 系统级增强 + SpringBoard 支持" size:13 dim:YES];
+    UILabel *sub = [self label:@"v1.8.17 · 转圈类动画回补 + 极端档回归" size:13 dim:YES];
     sub.textAlignment = NSTextAlignmentCenter;
 
     _swEnabled = [[UISwitch alloc] init];
@@ -313,6 +338,18 @@ static int DragMultiplierForCoeff(double c) {
     _slider.continuous = YES;
     _slider.value = speed;
     [_slider addTarget:self action:@selector(sliderChanged) forControlEvents:UIControlEventValueChanged];
+
+    // v1.8.17：显式动画（转圈/进度/旋转/地图相机）额外倍率。
+    // 只作用于 CAAnimation / CALayer 路径，不影响 UIView 块动画与导航/模态/Tab，
+    // 因此可以把"转圈"单独调快，而不用把全局倍率拉高（那会把块动画一起压到 1 帧）。
+    UILabel *lblLayer = [self label:@"显式动画额外倍率（转圈/进度/旋转）" size:17 dim:NO];
+    _segLayer = [[UISegmentedControl alloc] initWithItems:@[ @"×1", @"×2", @"×3", @"×5", @"×10" ]];
+    _segLayer.selectedSegmentIndex = LayerIndexForBoost([cfg[@"LayerBoost"] doubleValue]);
+    [_segLayer addTarget:self action:@selector(layerChanged) forControlEvents:UIControlEventValueChanged];
+    _layerLabel = [self label:@"" size:12 dim:YES];
+    _layerLabel.textColor = [UIColor systemOrangeColor];
+    _layerLabel.numberOfLines = 0;
+    [self updateLayerLabel];
 
     UILabel *lblSpring = [self label:@"弹簧参数缩放（保持物理一致性）" size:17 dim:NO];
     _swSpring = [[UISwitch alloc] init];
@@ -359,15 +396,15 @@ static int DragMultiplierForCoeff(double c) {
     _dragLabel = [self label:@"" size:12 dim:YES];
     _dragLabel.textColor = [UIColor systemOrangeColor];
     _dragLabel.numberOfLines = 0;
-    if (curDrag > 0.0 && curDragIdx == 0) {
+    if (curDragIdx == 4) {
         _dragLabel.text = [NSString stringWithFormat:
-            @"⚠️ 检测到旧版写入的极端值 %.4f（等于把所有动画压成 0，会绕过 dylib 的 0.01s 安全下限，易触发完成回调配对错乱）。已按「关闭」显示，保存后该键会被清除。", curDrag];
+            @"⚠️ 极端档（写入 %.4f）：所有 UIKit 动画时长≈归零，等于全系统无动画。它会绕过 dylib 的 0.01s 安全下限，可能触发\"动画完成回调配对错乱\"类故障（例如微信图片预览卡死），并且会与 dylib 加速叠加。只在明确知道代价时使用。", curDrag];
     } else if (curDragIdx == 0) {
         _dragLabel.text = @"未启用。要全系统加速请选 ×5 / ×10 / ×20；不建议与 dylib 加速同时开到最大（两个机制会叠加）。";
     } else {
         _dragLabel.text = [NSString stringWithFormat:@"当前已启用 %.2f（≈×%d，全系统生效，需注销/重启目标 App）。", curDrag, DragMultiplierForCoeff(curDrag)];
     }
-    _segDrag = [[UISegmentedControl alloc] initWithItems:@[ @"关闭", @"×5", @"×10", @"×20" ]];
+    _segDrag = [[UISegmentedControl alloc] initWithItems:@[ @"关闭", @"×5", @"×10", @"×20", @"极端" ]];
     _segDrag.selectedSegmentIndex = curDragIdx;
     [_segDrag addTarget:self action:@selector(dragChanged) forControlEvents:UIControlEventValueChanged];
 
@@ -433,6 +470,10 @@ static int DragMultiplierForCoeff(double c) {
     _ovMode = [[UISegmentedControl alloc] initWithItems:@[ @"加速", @"慢放 ×2", @"瞬切" ]];
     _ovMode.selectedSegmentIndex = 0;
 
+    UILabel *lblOvLayer = [self label:@"专属：显式动画额外倍率" size:17 dim:NO];
+    _ovLayer = [[UISegmentedControl alloc] initWithItems:@[ @"×1", @"×2", @"×3", @"×5", @"×10" ]];
+    _ovLayer.selectedSegmentIndex = 0;
+
     UILabel *lblOvSpring = [self label:@"专属：弹簧参数缩放" size:17 dim:NO];
     _ovSpring = [[UISwitch alloc] init];
     _ovSpring.on = YES;
@@ -492,7 +533,7 @@ static int DragMultiplierForCoeff(double c) {
     [rb.heightAnchor constraintEqualToConstant:40].active = YES;
     [rb addTarget:self action:@selector(onReboot) forControlEvents:UIControlEventTouchUpInside];
 
-    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App；保存后 Darwin 通知热重载，目标 App 内立即生效。\n\n⚠️ v1.8.16：① 全局动画系数改为分档（关闭/×5/×10/×20）—— 原来写死的 0.0001 是调试用极端值，等于把动画压成 0 并绕过 dylib 的 0.01s 安全下限，正是 v1.8.12~15 修的那类故障的成因，请改用 ×5~×20 档。② 新增「减少透明度」（关毛玻璃，降 GPU 负载，滚动更稳）。③ 新增两个体感开关：滑行惯性加急 + 点击零延迟（默认关，会改变操作习惯）。④ 新增支持把 dylib 注入 com.apple.springboard 加速桌面/控制中心/App 启动动画 —— 该进程已内置列表 hook 硬保护与保活排除，注入后若黑屏，重启进 TrollFools 移除即可。\n\n本 App UI 是原生 UIKit（数百 nib），动画 hook 正常生效。" size:12 dim:YES];
+    UILabel *hint = [self label:@"dylib 用 TrollFools 注入目标 App（桌面 SpringBoard 注入不了，TrollFools 只支持可移除的系统应用/App Store 应用）；保存后 Darwin 通知热重载，目标 App 内立即生效。\n\n⚠️ v1.8.17：① 新增「显式动画额外倍率」（×1/×2/×3/×5/×10）—— v1.8.15 修掉 CAAnimation 双重缩放后，转圈/进度/旋转/地图相机这类显式动画从 ÷倍率² 回到 ÷倍率，肉眼会明显变慢；这个倍率只叠加在这条路径上，不影响 UIView 块动画与导航/模态/Tab/列表，设 ×5 约等于恢复旧手感。② 全局动画系数恢复「极端」档（0.0001），旧配置里的 0.0001 现在会映射到该档而不是被清掉（v1.8.16 的做法会静默抹掉你的设置）。③ SpringBoard 的列表 hook 硬保护与保活排除保留。\n\n本 App UI 是原生 UIKit（数百 nib），动画 hook 正常生效。" size:12 dim:YES];
     hint.textAlignment = NSTextAlignmentCenter;
     UILabel *listHint = [self label:@"列表加速含 24 个 TV/CV hook，默认关闭。⚠️ 硬保护名单：顺丰同城骑士 com.sfic.knight、桌面进程 com.apple.springboard —— 这两者的列表加速恒为关闭，任何配置都打不开（SpringBoard 打开会黑屏/白苹果）。淘宝/京东等重列表 App 同样必须保持关闭。" size:12 dim:YES];
     listHint.textColor = [UIColor systemOrangeColor];
@@ -505,6 +546,7 @@ static int DragMultiplierForCoeff(double c) {
         [self row:[self label:@"启用" size:17 dim:NO] ctrl:_swEnabled],
         lblMode, _segMode,
         _sliderLabel, _slider,
+        lblLayer, _segLayer, _layerLabel,
         [self row:lblSpring ctrl:_swSpring],
         [self row:lblExtra ctrl:_swExtra],
         [self row:lblList ctrl:_swList],
@@ -525,6 +567,7 @@ static int DragMultiplierForCoeff(double c) {
         ovTitle, _ovBundle,
         [self row:lblOvOn ctrl:_ovOn],
         _ovSpeedLabel, _ovSpeed, _ovMode,
+        lblOvLayer, _ovLayer,
         [self row:lblOvSpring ctrl:_ovSpring],
         [self row:lblOvExtra ctrl:_ovExtra],
         [self row:lblOvList ctrl:_ovList],
@@ -584,6 +627,7 @@ static int DragMultiplierForCoeff(double c) {
     _ovZoom.on   = mine[@"ZoomAccel"] ? [mine[@"ZoomAccel"] boolValue] : NO;
     _ovFastScroll.on = mine[@"FastScroll"] ? [mine[@"FastScroll"] boolValue] : NO;
     _ovFastTap.on    = mine[@"FastTap"]    ? [mine[@"FastTap"] boolValue]    : NO;
+    _ovLayer.selectedSegmentIndex = LayerIndexForBoost(mine[@"LayerBoost"] ? [mine[@"LayerBoost"] doubleValue] : 1.0);
 
     BOOL guarded = [HardGuardBundles() containsObject:bid];
     _ovList.enabled = !guarded;
@@ -606,12 +650,30 @@ static int DragMultiplierForCoeff(double c) {
 - (void)dragChanged {
     int idx = (int)_segDrag.selectedSegmentIndex;
     double c = DragCoeffForIndex(idx);
-    if (c <= 0.0) {
+    if (idx == 4) {
+        _dragLabel.text = @"已选「极端」（写入 0.0001）：保存并注销后全系统动画≈归零。风险：绕过 dylib 的 0.01s 下限，可能出现完成回调配对错乱；不要与 dylib 加速同时拉满。";
+    } else if (c <= 0.0) {
         _dragLabel.text = @"已选「关闭」：保存后移除 UIAnimationDragCoefficient，全系统恢复原生动画时长。";
     } else {
         _dragLabel.text = [NSString stringWithFormat:
             @"已选 ×%d（写入 %.2f，全系统生效，需注销/重启目标 App）。不建议与 dylib 加速同时开到最大 —— 两个机制会叠加。", DragMultiplierForCoeff(c), c];
     }
+}
+
+// v1.8.17：显式动画额外倍率的说明文案
+- (void)updateLayerLabel {
+    int idx = (int)_segLayer.selectedSegmentIndex;
+    double b = LayerBoostForIndex(idx);
+    if (b <= 1.0001) {
+        _layerLabel.text = @"×1 = 不额外加速（当前默认）。转圈/进度这类显式动画只按全局倍率缩放。";
+    } else {
+        _layerLabel.text = [NSString stringWithFormat:
+            @"×%.0f：转圈/进度/旋转/地图相机这类「显式动画」在全局倍率之上再加速 %.0f 倍（等效 ÷%.0f）。不影响 UIView 块动画、导航/模态/Tab/列表。×5 约等于恢复 v1.8.15 之前的手感。仍受 0.01s 下限；慢放模式不叠加。", b, b, b];
+    }
+}
+
+- (void)layerChanged {
+    [self updateLayerLabel];
 }
 
 // 勾选/取消「启用专属配置」时只更新提示，不动控件值
@@ -651,6 +713,7 @@ static int DragMultiplierForCoeff(double c) {
     cfg[@"ZoomAccel"] = @(_swZoom.on);
     cfg[@"FastScroll"] = @(_swFastScroll.on);
     cfg[@"FastTap"] = @(_swFastTap.on);
+    cfg[@"LayerBoost"] = @(LayerBoostForIndex((int)_segLayer.selectedSegmentIndex));
     cfg[@"FUBGEnabled"] = @(_swFUBG.on);
     cfg[@"FUBGSceneFake"] = @(_swFUBGScene.on);
     cfg[@"FUBGAudioKeep"] = @(_swFUBGAudio.on);
@@ -684,6 +747,7 @@ static int DragMultiplierForCoeff(double c) {
                 @"ZoomAccel": @(_ovZoom.on),
                 @"FastScroll": @(_ovFastScroll.on),
                 @"FastTap": @(_ovFastTap.on),
+                @"LayerBoost": @(LayerBoostForIndex((int)_ovLayer.selectedSegmentIndex)),
             };
         } else {
             [ovOut removeObjectForKey:ovBid];
