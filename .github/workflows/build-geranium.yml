@@ -1,0 +1,92 @@
+name: Build Geranium CN
+
+on:
+  push:
+    tags:
+      - 'geranium-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Setup Theos
+        run: |
+          git clone --depth 1 https://github.com/theos/theos.git $HOME/theos
+          git clone --depth 1 https://github.com/theos/sdks.git $HOME/sdks-repo
+          mkdir -p $HOME/theos/sdks
+          cp -R "$HOME"/sdks-repo/iPhoneOS*.sdk "$HOME/theos/sdks/" 2>/dev/null || true
+          cp -R "$HOME"/sdks-repo/iphoneos*.sdk "$HOME/theos/sdks/" 2>/dev/null || true
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          ls "$HOME/theos/sdks"
+
+      - name: Build RootHelper (Theos)
+        run: |
+          cd "GeraniumCN/src/Geranium-main/RootHelper"
+          LATEST_SDK=$(ls -d "$THEOS"/sdks/iPhoneOS*.sdk | sort -V | tail -1 | sed -E 's/.*iPhoneOS([0-9.]+)\.sdk/\1/')
+          echo "Using SDK $LATEST_SDK"
+          sed -i.bak -E "s/^TARGET := .*/TARGET := iphone:clang:${LATEST_SDK}:14.0/" Makefile
+          make clean || true
+          make
+          file .theos/obj/debug/GeraniumRootHelper
+
+      - name: Build App (xcodebuild)
+        run: |
+          cd "GeraniumCN/src/Geranium-main"
+          xcodebuild -project Geranium.xcodeproj \
+            -scheme Geranium \
+            -configuration Release \
+            -derivedDataPath build/DerivedData \
+            -destination 'generic/platform=iOS' \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Assemble, sign and package
+        run: |
+          cd "GeraniumCN/src/Geranium-main"
+          APP="build/DerivedData/Build/Products/Release-iphoneos/Geranium.app"
+          codesign --remove "$APP" 2>/dev/null || true
+          rm -rf "$APP/_CodeSignature" "$APP/embedded.mobileprovision"
+          cp "RootHelper/.theos/obj/debug/GeraniumRootHelper" "$APP/GeraniumRootHelper"
+          ldid -Sentitlements.plist "$APP/Geranium"
+          APPBIN="$APP/PlugIns/Bookmark Location in Geranium.appex/Bookmark Location in Geranium"
+          [ -f "$APPBIN" ] && ldid -S"Bookmark Location in Geranium/entitlements.plist" "$APPBIN"
+          for DY in "$APP/Geranium.debug.dylib" "$APP/PlugIns/Bookmark Location in Geranium.appex/Bookmark Location in Geranium.debug.dylib"; do
+            if [ -f "$DY" ]; then
+              case "$DY" in
+                *appex*) ldid -S"Bookmark Location in Geranium/entitlements.plist" "$DY" ;;
+                *) ldid -Sentitlements.plist "$DY" ;;
+              esac
+            fi
+          done
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$APP" Payload/Geranium.app
+          zip -qry GeraniumCN.tipa Payload
+          cp GeraniumCN.tipa GeraniumCN.ipa
+          ls -la GeraniumCN.tipa GeraniumCN.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeraniumCN
+          path: |
+            GeraniumCN/src/Geranium-main/GeraniumCN.tipa
+            GeraniumCN/src/Geranium-main/GeraniumCN.ipa
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            GeraniumCN/src/Geranium-main/GeraniumCN.tipa
+            GeraniumCN/src/Geranium-main/GeraniumCN.ipa

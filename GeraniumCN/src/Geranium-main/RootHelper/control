@@ -1,0 +1,9 @@
+Package: ch.cclerc.GeraniumRootHelper
+Name: GeraniumRootHelper
+Version: 1.0
+Architecture: iphoneos-arm
+Description: GeraniumRootHelper
+Maintainer: c22dev
+Author: c22dev
+Section: System
+Tag: role::hacker

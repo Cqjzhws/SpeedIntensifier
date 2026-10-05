@@ -1,0 +1,9 @@
+Geranium.xcodeproj/xcuserdata/*
+Geranium.xcodeproj/project.xcworkspace/xcuserdata/*
+Geranium.xcodeproj/xcuserdata/
+Geranium.xcodeproj/project.xcworkspace/xcuserdata/
+Geranium.xcodeproj/project.xcworkspace/xcuserdata/cclerc.xcuserdatad/UserInterfaceState.xcuserstate
+**/.DS_Store
+build/*
+build/
+*.entitlements
