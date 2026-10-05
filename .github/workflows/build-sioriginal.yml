@@ -52,7 +52,7 @@ jobs:
             -isysroot "$SDK" \
             -miphoneos-version-min=14.0 \
             -fobjc-arc \
-            -framework Foundation -framework UIKit \
+            -framework Foundation -framework UIKit -framework QuartzCore -framework CoreGraphics \
             -o "$APP/SIOriginal" SIOriginal/App/main.m
 
           cp SIOriginal/App/Info.plist "$APP/Info.plist"
