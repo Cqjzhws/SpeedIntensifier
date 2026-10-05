@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     name: Build SIOriginal dylib + IPA
-    runs-on: macos-15
+    runs-on: macos-14
 
     steps:
       - name: Checkout
