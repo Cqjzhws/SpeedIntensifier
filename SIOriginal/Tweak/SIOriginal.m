@@ -117,6 +117,30 @@
 //   后者会把用户既有设置无提示地抹掉，是不对的。
 // =========================================================================
 //
+// ==================== v2.0.0 Max 超强功能版 ====================
+// [FloorDuration] 动画安全下限可调（0.005 / 0.01 / 0.02 / 0.05，默认 0.01）。
+//   旧版 0.01s 在代码里写死；允许追求极致的用户用 0.005（更快，风险自担），
+//   也允许保守用户用 0.02/0.05。瞬切模式同样使用该下限，不再写死 0.01。
+// [TransitionBoost] 进阶转场独立额外倍率（×1 / ×1.5 / ×2 / ×3，默认 ×1）。
+//   与 LayerBoost 同思路：只作用于导航/模态/Tab 转场的 CATransaction 时长，
+//   不影响块动画与显式动画；慢放模式不叠加；受 FloorDuration 下限保护。
+//   想让 push/pop/弹窗再快一倍而不动全局倍率，用它。
+// [FastLongPress] 长按手势加速：hook UILongPressGestureRecognizer 的
+//   initWithTarget:action: 与 setMinimumPressDuration:，把系统默认 0.5s
+//   压到可选的 0.20 / 0.30 / 0.40s（默认 0.30）。App 后续任何二次设置也会被
+//   钳到该值，真正生效（比只在创建时改一次可靠）。
+// [手感强黏] FastScroll / FastTap 改为在 setter 层强制：
+//   setDecelerationRate: / setDelaysContentTouches: 也被接管，App 在
+//   didMoveToWindow 之后再改回去的值会被重新钳回，开关不再"时灵时不灵"。
+// [补盲区] +[UIView transitionFromView:toView:duration:options:completion:]
+//   （无 animations 段的变体）此前未覆盖，本轮补上时长改写。
+// [InAppNotify] 配置热重载时，若目标 App 正在前台，弹一个不接收触摸的顶部
+//   小提示（userInteractionEnabled=NO 的 UIWindow，1.5s 自动消失），
+//   明确显示当前生效模式/倍率，避免"保存了不知道有没有用上"。
+//   它与 v1.8.10 永久禁用的悬浮球完全不同：不拦截任何触摸、不抢状态栏、非常驻。
+// [SlowFactor] 慢放倍率开放配置（×2 / ×3 / ×5 / ×10，引擎早支持，配置器补上）。
+// =========================================================================
+//
 // ============================ v1.8.13 优化加强 ============================
 // [加强] 补齐老式 UIView 动画 API 的时长/延迟接管：
 //   +[UIView setAnimationDuration:] 与 +[UIView setAnimationDelay:]
@@ -157,6 +181,12 @@ static BOOL     gZoomAccel = NO;     // v1.8.15：UIScrollView 缩放动画（se
 static BOOL     gFastScroll = NO;    // v1.8.16：滑行惯性加急（decelerationRate=Fast），默认关
 static BOOL     gFastTap = NO;       // v1.8.16：取消列表点击延迟（delaysContentTouches=NO），默认关
 static double   gLayerBoost = 1.0;   // v1.8.17：显式动画（CAAnimation/CALayer）额外倍率，默认 1（不额外加速）
+// v2.0.0 Max 新增引擎参数
+static double   gFloorDuration = 0.01;  // 动画时长安全下限（瞬切也用它），允许 0.005–0.1，默认 0.01
+static double   gTransBoost = 1.0;      // 进阶转场独立额外倍率，1.0–3.0，默认 1
+static BOOL     gFastLongPress = NO;    // 长按手势加速，默认关
+static double   gLongPressDur = 0.30;   // 长按最短触发时长（秒），0.20–0.40，默认 0.30
+static BOOL     gInAppNotify = YES;     // 配置热重载时在目标 App 内弹顶部提示，默认开
 static BOOL     gIsWeChat  = NO;     // 微信缩放预览守卫用（L104）
 // v1.8.12：黑名单在重载时一次性解析成本进程布尔值，热路径零分配（见 SIO_reload）
 static BOOL     gSelfBlacklisted = NO;
@@ -194,17 +224,23 @@ static inline void SIO_markAnimScaled(id anim) {
                              OBJC_ASSOCIATION_ASSIGN);
 }
 
+// v2.0.0：安全下限可配置（FloorDuration，0.005–0.1，非法值回落 0.01）
+static inline double SIO_floor(void) {
+    return (gFloorDuration >= 0.005 && gFloorDuration <= 0.1) ? gFloorDuration : 0.01;
+}
+
 static inline double SIO_targetDuration(double orig) {
     if (!gEnabled) return orig;
+    double fl = SIO_floor();
     double d;
     switch (gMode) {
         case 1:  d = orig * gSlowFactor; break;            // 慢放
-        case 2:  d = 0.01;               break;            // 瞬切 0.01s
+        case 2:  d = fl;                break;            // 瞬切（v2.0.0：下限可调）
         default:
             if (gSpeed <= 1.0001) return orig;
             d = orig / gSpeed;         break;              // 加速
     }
-    if (d > 0.0 && d < 0.01) d = 0.01;                     // 时长下限 0.01s
+    if (d > 0.0 && d < fl) d = fl;                         // 时长下限
     return d;
 }
 
@@ -220,7 +256,8 @@ static inline double SIO_targetDurationLayer(double orig) {
     if (gMode == 1) return d;
     if (gLayerBoost > 1.0001 && d > 0.0) {
         d = d / gLayerBoost;
-        if (d < 0.01) d = 0.01;
+        double fl = SIO_floor();
+        if (d < fl) d = fl;   // v2.0.0：下限与主路径保持一致（原为写死 0.01）
     }
     return d;
 }
@@ -334,6 +371,17 @@ static void SIO_reload(void) {
     // v1.8.17：显式动画额外倍率，缺键默认 1.0（不额外加速），范围 1.0–10.0
     double lb = d[@"LayerBoost"] ? [d[@"LayerBoost"] doubleValue] : 1.0;
     gLayerBoost = (lb >= 1.0 && lb <= 10.0) ? lb : 1.0;
+    // v2.0.0：安全下限（0.005–0.1，缺键 0.01）、转场独立倍率（1–3，缺键 1）
+    double fd = d[@"FloorDuration"] ? [d[@"FloorDuration"] doubleValue] : 0.01;
+    gFloorDuration = (fd >= 0.005 && fd <= 0.1) ? fd : 0.01;
+    double tb = d[@"TransitionBoost"] ? [d[@"TransitionBoost"] doubleValue] : 1.0;
+    gTransBoost = (tb >= 1.0 && tb <= 3.0) ? tb : 1.0;
+    // v2.0.0：长按加速（缺键关）与长按时长（0.20–0.40，缺键 0.30）
+    gFastLongPress = d[@"FastLongPress"] ? [d[@"FastLongPress"] boolValue] : NO;
+    double lp = d[@"LongPressDuration"] ? [d[@"LongPressDuration"] doubleValue] : 0.30;
+    gLongPressDur = (lp >= 0.20 && lp <= 0.40) ? lp : 0.30;
+    // v2.0.0：热重载顶部提示，缺键默认开（纯展示、不拦截触摸）
+    gInAppNotify = d[@"InAppNotify"] ? [d[@"InAppNotify"] boolValue] : YES;
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     gSelfBlacklisted = NO;
@@ -382,6 +430,20 @@ static void SIO_reload(void) {
             double lb2 = [ovr[@"LayerBoost"] doubleValue];
             if (lb2 >= 1.0 && lb2 <= 10.0) gLayerBoost = lb2;
         }
+        // v2.0.0：专属覆盖里的新参数（只在字典里显式存在时才覆盖全局值）
+        if (ovr[@"FloorDuration"]) {
+            double fd2 = [ovr[@"FloorDuration"] doubleValue];
+            if (fd2 >= 0.005 && fd2 <= 0.1) gFloorDuration = fd2;
+        }
+        if (ovr[@"TransitionBoost"]) {
+            double tb2 = [ovr[@"TransitionBoost"] doubleValue];
+            if (tb2 >= 1.0 && tb2 <= 3.0) gTransBoost = tb2;
+        }
+        if (ovr[@"FastLongPress"]) gFastLongPress = [ovr[@"FastLongPress"] boolValue];
+        if (ovr[@"LongPressDuration"]) {
+            double lp2 = [ovr[@"LongPressDuration"] doubleValue];
+            if (lp2 >= 0.20 && lp2 <= 0.40) gLongPressDur = lp2;
+        }
     }
 
     // ---- v1.8.14：列表 hook 硬保护，必须放在所有覆盖之后，优先级最高 ----
@@ -395,10 +457,106 @@ static void SIO_reload(void) {
 
 static void SIO_installiOS16Extras(void); // forward declaration
 
+#pragma mark - v2.0.0 配置生效顶部提示（不拦截触摸、非常驻）
+
+static __strong UIWindow *sioToastWindow = nil;
+
+static NSString *SIO_modeSummary(void) {
+    NSString *m;
+    switch (gMode) {
+        case 1:  m = [NSString stringWithFormat:@"慢放 ×%.0f", gSlowFactor]; break;
+        case 2:  m = @"瞬切"; break;
+        default: m = [NSString stringWithFormat:@"加速 ×%.0f", gSpeed]; break;
+    }
+    // 只在非默认值时附加额外档位，提示尽量短
+    NSMutableString *s = [NSMutableString stringWithFormat:@"SIOriginal · %@", m];
+    if (gLayerBoost > 1.0001) [s appendFormat:@" · 显式×%.0f", gLayerBoost];
+    if (gTransBoost > 1.0001) [s appendFormat:@" · 转场×%.1f", gTransBoost];
+    if (fabs(gFloorDuration - 0.01) > 0.0001)
+        [s appendFormat:@" · 下限%.3fs", gFloorDuration];
+    return s;
+}
+
+static void SIO_dismissToast(void) {
+    if (!sioToastWindow) return;
+    UIWindow *w = sioToastWindow;
+    [UIView animateWithDuration:0.2 animations:^{
+        w.alpha = 0;
+        w.transform = CGAffineTransformMakeTranslation(0, -20);
+    } completion:^(BOOL finished) {
+        w.hidden = YES;
+        if (sioToastWindow == w) sioToastWindow = nil;
+    }];
+}
+
+static void SIO_showToast(void) {
+    if (!gInAppNotify) return;
+    // 只在目标 App 自己处于前台激活态时提示；SpringBoard/后台不打扰
+    UIApplication *app = [UIApplication sharedApplication];
+    if (app.applicationState != UIApplicationStateActive) return;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            // 已在显示：先撤掉旧的，避免叠窗
+            if (sioToastWindow) { sioToastWindow.hidden = YES; sioToastWindow = nil; }
+
+            CGRect sb = UIScreen.mainScreen.bounds;
+            UIWindow *w = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, sb.size.width, 64)];
+            // iOS 13+ 多场景：尽量挂到当前激活的 windowScene
+            if ([w respondsToSelector:@selector(setWindowScene:)]) {
+                for (UIScene *sc in app.connectedScenes) {
+                    if (sc.activationState == UISceneActivationStateForegroundActive &&
+                        [sc isKindOfClass:[UIWindowScene class]]) {
+                        w.windowScene = (UIWindowScene *)sc;
+                        break;
+                    }
+                }
+            }
+            w.windowLevel = UIWindowLevelStatusBar + 1;
+            w.backgroundColor = [UIColor clearColor];
+            w.rootViewController = [UIViewController new];
+            w.rootViewController.view.backgroundColor = [UIColor clearColor];
+            // 关键：整窗不接收任何触摸，与悬浮球有本质区别
+            w.userInteractionEnabled = NO;
+
+            UIView *card = [[UIView alloc] initWithFrame:CGRectMake(12, 8, sb.size.width - 24, 46)];
+            card.backgroundColor = [UIColor colorWithRed:0.09 green:0.10 blue:0.13 alpha:0.92];
+            card.layer.cornerRadius = 14;
+            card.layer.masksToBounds = YES;
+            card.userInteractionEnabled = NO;
+            card.alpha = 0;
+            card.transform = CGAffineTransformMakeTranslation(0, -12);
+
+            UILabel *label = [[UILabel alloc] initWithFrame:card.bounds];
+            label.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            label.text = gEnabled ? SIO_modeSummary() : @"SIOriginal · 已暂停";
+            label.textColor = [UIColor colorWithRed:0.49 green:0.91 blue:0.58 alpha:1.0];
+            label.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+            label.textAlignment = NSTextAlignmentCenter;
+            label.numberOfLines = 1;
+            label.userInteractionEnabled = NO;
+            [card addSubview:label];
+            [w.rootViewController.view addSubview:card];
+
+            w.hidden = NO;
+            sioToastWindow = w;
+            [UIView animateWithDuration:0.22 animations:^{
+                card.alpha = 1;
+                card.transform = CGAffineTransformIdentity;
+            }];
+            // 1.5s 自动消失；新一轮保存会立刻替换它
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ SIO_dismissToast(); });
+        } @catch (__unused NSException *e) {}
+    });
+}
+
 static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
                                 CFNotificationName name, const void *object,
                                 CFDictionaryRef userInfo) {
     SIO_reload();
+    // v2.0.0：热重载成功后在目标 App 内给出短暂、不拦截触摸的生效提示
+    SIO_showToast();
 }
 
 // ---------- 微信图片预览「放大态」全局旁路（v1.8.4） ----------
@@ -554,6 +712,18 @@ static void   (*o_vc_transitionFrom)(id, SEL, UIViewController *, UIViewControll
 static void   (*o_UV_setAnimDuration)(Class, SEL, double);
 static void   (*o_UV_setAnimDelay)(Class, SEL, double);
 
+// ---- v2.0.0 新增 ----
+// 无 animations 段的视图转场变体：
+// +[UIView transitionFromView:toView:duration:options:completion:]
+static void   (*o_UV_transFromNoAnim)(Class, SEL, UIView *, UIView *, double,
+                                      UIViewAnimationOptions, void (^)(BOOL));
+// UIScrollView 手感 setter 强黏（App 后续改值也会被钳回）
+static void   (*o_sv_setDecelRate)(id, SEL, CGFloat);
+static void   (*o_sv_setDelaysTouches)(id, SEL, BOOL);
+// UILongPressGestureRecognizer 长按加速
+static id     (*o_lpg_init)(id, SEL, id, id);
+static void   (*o_lpg_setMinPress)(id, SEL, NSTimeInterval);
+
 #pragma mark - CAAnimation（核心：仅基类，子类自动继承）
 
 static void sio_CAAnim_setDuration(id self, SEL _cmd, double d) {
@@ -645,6 +815,18 @@ static void sio_UV_transFrom(Class self, SEL _cmd, UIView *a1, UIView *a2, doubl
     SIO_setUIViewAnim(NO);
 }
 
+// v2.0.0 新增：无 animations 段的转场便捷变体
+// +[UIView transitionFromView:toView:duration:options:completion:]
+// 旧代码/部分定制转场只用 completion 变体；与带动画段版本同机制，直接改写时长。
+static void sio_UV_transFromNoAnim(Class self, SEL _cmd, UIView *a1, UIView *a2, double d,
+                                   UIViewAnimationOptions o, void (^c)(BOOL)) {
+    SIO_REQUIRE_ORIG(o_UV_transFromNoAnim);
+    if (SIO_blocked()) { o_UV_transFromNoAnim(self, _cmd, a1, a2, d, o, c); return; }
+    SIO_setUIViewAnim(YES);
+    o_UV_transFromNoAnim(self, _cmd, a1, a2, SIO_targetDuration(d), o, c);
+    SIO_setUIViewAnim(NO);
+}
+
 // ---- v1.8.12 新增：关键帧动画 ----
 // +[UIView animateKeyframesWithDuration:delay:options:animations:completion:]
 // 关键帧动画（微信/淘宝等大量使用）此前完全未覆盖：它不走 animateWithDuration 系，
@@ -733,7 +915,17 @@ static void sio_CASpring_damp(id self, SEL _cmd, double v) {
 //   加速 ×5 → 0.07s（肉眼几乎无感，保持原有"秒过"体验）
 //   慢放 ×2 → 0.70s（慢放真正生效）
 //   瞬切    → 0.01s（直达）
-static inline double SIO_transitionDuration(void) { return SIO_targetDuration(0.35); }
+// v2.0.0：在全局模式换算之后，再叠加转场独立倍率 TransitionBoost（仅加速/瞬切，
+// 慢放不叠加），同样受 FloorDuration 下限保护。
+static inline double SIO_transitionDuration(void) {
+    double d = SIO_targetDuration(0.35);
+    if (gEnabled && gMode != 1 && gTransBoost > 1.0001 && d > 0.0) {
+        d = d / gTransBoost;
+        double fl = SIO_floor();
+        if (d < fl) d = fl;
+    }
+    return d;
+}
 
 static void sio_nav_push(id self, SEL _cmd, UIViewController *vc, BOOL anim) {
     SIO_REQUIRE_ORIG(o_nav_push);
@@ -1035,8 +1227,11 @@ static void SIOriginalInit(void) {
                      (IMP)sio_UV_anim_spring, (IMP *)&o_UV_anim_spring);
     SIO_swizzleClass(uv, @selector(transitionWithView:duration:options:animations:completion:),
                      (IMP)sio_UV_trans, (IMP *)&o_UV_trans);
-    SIO_swizzleClass(uv, @selector(transitionFromView:toView:duration:options:completion:),
+    SIO_swizzleClass(uv, @selector(transitionFromView:toView:duration:options:animations:completion:),
                      (IMP)sio_UV_transFrom, (IMP *)&o_UV_transFrom);
+    // v2.0.0 新增：无 animations 段的转场变体
+    SIO_swizzleClass(uv, @selector(transitionFromView:toView:duration:options:completion:),
+                     (IMP)sio_UV_transFromNoAnim, (IMP *)&o_UV_transFromNoAnim);
     // v1.8.12 新增：关键帧动画 + 系统动画（同为 UIView 类方法，低风险）
     SIO_swizzleClass(uv, @selector(animateKeyframesWithDuration:delay:options:animations:completion:),
                      (IMP)sio_UV_anim_keyframes, (IMP *)&o_UV_anim_keyframes);
@@ -1151,9 +1346,12 @@ static void SIOriginalInit(void) {
 
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
-    NSLog(@"[SIOriginal] v1.8.17 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f spring=%d extra=%d list=%d zoom=%d feel=%d/%d override=%d listGuard=%d)",
-          gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gSpring, gExtra, gListAccel, gZoomAccel,
-          gFastScroll, gFastTap, gHasAppOverride, gListHardGuarded);
+    // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
+    NSLog(@"[SIOriginal] v2.0.0 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
+          gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
+          gSpring, gExtra, gListAccel, gZoomAccel,
+          gFastScroll, gFastTap, gFastLongPress, gLongPressDur, gInAppNotify,
+          gHasAppOverride, gListHardGuarded);
     if (SIO_fbgBuiltinExcluded()) {
         NSLog(@"[SIOriginal] %@ is a built-in keep-alive exclusion: audio-assertion/scene-fake engine stays OFF", gSelfBundle);
     }
@@ -1359,6 +1557,47 @@ static void sio_SV_didMoveToWindow(id self, SEL _cmd) {
     } @catch (__unused NSException *e) {}
 }
 
+// v2.0.0：手感 setter 强黏。didMoveToWindow 只在进窗口时施加一次，App 之后
+// （例如某个列表页 viewDidAppear）再把 decelerationRate / delaysContentTouches
+// 改回去，旧版就"时灵时不灵"。setter 层钳回，开关真正全程生效。
+static void sio_SV_setDecelRate(id self, SEL _cmd, CGFloat rate) {
+    SIO_REQUIRE_ORIG(o_sv_setDecelRate);
+    if (!SIO_blocked() && gFastScroll) rate = UIScrollViewDecelerationRateFast;
+    o_sv_setDecelRate(self, _cmd, rate);
+}
+
+static void sio_SV_setDelaysTouches(id self, SEL _cmd, BOOL b) {
+    SIO_REQUIRE_ORIG(o_sv_setDelaysTouches);
+    if (!SIO_blocked() && gFastTap) b = NO;
+    o_sv_setDelaysTouches(self, _cmd, b);
+}
+
+#pragma mark - 长按手势加速（v2.0.0 新增，默认关闭）
+
+// 系统 UILongPressGestureRecognizer 默认 minimumPressDuration = 0.5s。
+// 两个入口都接管：
+//   · initWithTarget:action: —— 手势创建后立刻压到目标值（覆盖系统默认）；
+//   · setMinimumPressDuration: —— App 自定义时长一律钳到 ≤ 目标值
+//     （App 想设 1s 也会被压短；想要更长就关闭本开关）。
+// 纯数值 setter，不改动手势状态机，风险很低。
+static void sio_LPG_setMinPress(id self, SEL _cmd, NSTimeInterval d) {
+    SIO_REQUIRE_ORIG(o_lpg_setMinPress);
+    if (!SIO_blocked() && gFastLongPress && d > gLongPressDur) d = gLongPressDur;
+    o_lpg_setMinPress(self, _cmd, d);
+}
+
+static id sio_LPG_init(id self, SEL _cmd, id target, id action) {
+    SIO_REQUIRE_ORIG_NIL(o_lpg_init);
+    id r = o_lpg_init(self, _cmd, target, action);
+    if (!SIO_blocked() && gFastLongPress) {
+        @try {
+            // 走被 hook 的 setter：与 App 自定义路径共用同一把钳制逻辑
+            o_lpg_setMinPress(self, _cmd, gLongPressDur);
+        } @catch (__unused NSException *e) {}
+    }
+    return r;
+}
+
 #pragma mark - CALayer addAnimation:forKey:（补 CAAnimation setDuration 盲区）
 
 static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
@@ -1425,6 +1664,20 @@ static void SIO_installiOS16Extras(void) {
         // v1.8.16 新增：交互手感（滑行惯性 / 点击延迟），FastScroll / FastTap 控制
         SIO_swizzleInstance(sv, @selector(didMoveToWindow),
                             (IMP)sio_SV_didMoveToWindow, (IMP *)&o_sv_didMoveToWindow);
+        // v2.0.0：setter 层强黏，App 后续改值也钳回
+        SIO_swizzleInstance(sv, @selector(setDecelerationRate:),
+                            (IMP)sio_SV_setDecelRate, (IMP *)&o_sv_setDecelRate);
+        SIO_swizzleInstance(sv, @selector(setDelaysContentTouches:),
+                            (IMP)sio_SV_setDelaysTouches, (IMP *)&o_sv_setDelaysTouches);
+    }
+
+    // v2.0.0：长按手势加速（纯数值钳制，默认关闭，由 FastLongPress 控制）
+    Class lpg = objc_getClass("UILongPressGestureRecognizer");
+    if (lpg) {
+        SIO_swizzleInstance(lpg, @selector(initWithTarget:action:),
+                            (IMP)sio_LPG_init, (IMP *)&o_lpg_init);
+        SIO_swizzleInstance(lpg, @selector(setMinimumPressDuration:),
+                            (IMP)sio_LPG_setMinPress, (IMP *)&o_lpg_setMinPress);
     }
 
     if (layer) {
@@ -2097,7 +2350,7 @@ static void FUBGEntry(void) {
             // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
         });
 
-        NSLog(@"[FUBG] v2.0.0 (SIOriginal v1.8.17) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.0.0 (SIOriginal v2.0.0) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
