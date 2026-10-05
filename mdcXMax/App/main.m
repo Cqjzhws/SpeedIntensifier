@@ -201,28 +201,38 @@ static void MdxStoreWrite(NSDictionary *snapshot) {
 }
 
 #pragma mark - 渐变头卡
+// 用 drawRect: + CGGradient 实现，不依赖 QuartzCore.framework
+//（v2.0.0 官方 IPA 只链接 UIKit/Foundation/CoreFoundation，本地 Theos 构建环境同样没有 QuartzCore）
 
 @interface MdxGradientView : UIView
-@property (nonatomic, strong) CAGradientLayer *gl;
 @end
 
 @implementation MdxGradientView
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
-        _gl = [CAGradientLayer layer];
-        _gl.colors = @[(id)[UIColor systemPurpleColor].CGColor, (id)[UIColor systemBlueColor].CGColor];
-        _gl.startPoint = CGPointMake(0, 0);
-        _gl.endPoint = CGPointMake(1, 1);
         self.layer.cornerRadius = 16;
         self.layer.masksToBounds = YES;
-        [self.layer insertSublayer:_gl atIndex:0];
+        self.opaque = NO;
+        self.backgroundColor = [UIColor clearColor];
     }
     return self;
 }
-- (void)layoutSubviews {
-    [super layoutSubviews];
-    _gl.frame = self.bounds;
+- (void)drawRect:(CGRect)rect {
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    // systemPurple -> systemBlue 对角渐变
+    UIColor *c1 = [UIColor systemPurpleColor];
+    UIColor *c2 = [UIColor systemBlueColor];
+    CGFloat r1=0,g1=0,b1=0,a1=0,r2=0,g2=0,b2=0,a2=0;
+    [c1 getRed:&r1 green:&g1 blue:&b1 alpha:&a1];
+    [c2 getRed:&r2 green:&g2 blue:&b2 alpha:&a2];
+    CGFloat comps[8] = { (CGFloat)r1,(CGFloat)g1,(CGFloat)b1,1.0, (CGFloat)r2,(CGFloat)g2,(CGFloat)b2,1.0 };
+    CGFloat locs[2] = { 0.0, 1.0 };
+    CGGradientRef grad = CGGradientCreateWithColorComponents(space, comps, locs, 2);
+    CGContextDrawLinearGradient(ctx, grad, CGPointMake(0,0), CGPointMake(rect.size.width, rect.size.height), 0);
+    CGGradientRelease(grad);
+    CGColorSpaceRelease(space);
 }
 @end
 
@@ -391,25 +401,12 @@ static void MdxStoreWrite(NSDictionary *snapshot) {
                                                    target:self action:@selector(applyAll)];
     self.navigationItem.rightBarButtonItem = _applyAllBtn;
 
-    UIAction *actRescan = [UIAction actionWithTitle:@"重新扫描状态"
-                                              image:[UIImage systemImageNamed:@"arrow.clockwise"]
-                                         identifier:nil handler:^(__unused UIAction *a) { [self rescan]; }];
-    UIAction *actCopy = [UIAction actionWithTitle:@"复制日志"
-                                            image:[UIImage systemImageNamed:@"doc.on.doc"]
-                                       identifier:nil handler:^(__unused UIAction *a) { [self copyLog]; }];
-    UIAction *actClear = [UIAction actionWithTitle:@"清空状态记录"
-                                             image:[UIImage systemImageNamed:@"trash"]
-                                        identifier:nil attributes:UIMenuElementAttributesDestructive
-                                           handler:^(__unused UIAction *a) { [self confirmClearStates]; }];
-    UIAction *actRespring = [UIAction actionWithTitle:@"根 Respring"
-                                                image:[UIImage systemImageNamed:@"bolt.fill"]
-                                           identifier:nil attributes:UIMenuElementAttributesDestructive
-                                              handler:^(__unused UIAction *a) { [self onRespring]; }];
-    UIMenu *danger = [UIMenu menuWithTitle:@"" image:nil identifier:nil
-                                   options:UIMenuOptionsDisplayInline children:@[actClear, actRespring]];
+    // 左上菜单：不用 iOS 14 SDK 的 initWithTitle:image:primaryAction:menu:（Theos 旧 SDK 编译不过），
+    // 改为普通按钮 + UIAlertController actionSheet（iOS 8 起，任何 SDK 可编）
     self.navigationItem.leftBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:nil image:[UIImage systemImageNamed:@"ellipsis.circle"]
-                               primaryAction:nil menu:[UIMenu menuWithChildren:@[actRescan, actCopy, danger]]];
+        [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"ellipsis.circle"]
+                                         style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(showMenu:)];
 
     [self log:@"mdcX Max 启动，引擎自检中…"];
 
@@ -676,6 +673,24 @@ static void MdxStoreWrite(NSDictionary *snapshot) {
         if (self->_logView.text.length)
             [self->_logView scrollRangeToVisible:NSMakeRange(self->_logView.text.length, 0)];
     });
+}
+
+// 替代 iOS 14 UIMenu 的 action sheet
+- (void)showMenu:(UIBarButtonItem *)sender {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:nil message:nil
+                                                          preferredStyle:UIAlertControllerStyleActionSheet];
+    [ac addAction:[UIAlertAction actionWithTitle:@"重新扫描状态" style:UIAlertActionStyleDefault
+                                         handler:^(__unused UIAlertAction *a) { [self rescan]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"复制日志" style:UIAlertActionStyleDefault
+                                         handler:^(__unused UIAlertAction *a) { [self copyLog]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"清空状态记录" style:UIAlertActionStyleDestructive
+                                         handler:^(__unused UIAlertAction *a) { [self confirmClearStates]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"根 Respring" style:UIAlertActionStyleDestructive
+                                         handler:^(__unused UIAlertAction *a) { [self onRespring]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    // Info.plist 声明 UIDeviceFamily 含 iPad：actionSheet 在 iPad 上必须锚点，否则崩溃
+    ac.popoverPresentationController.barButtonItem = sender;
+    [self presentViewController:ac animated:YES completion:nil];
 }
 
 - (void)copyLog {
