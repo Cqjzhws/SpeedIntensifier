@@ -22,6 +22,7 @@ jobs:
       - name: Setup Theos
         run: |
           git clone --depth 1 https://github.com/theos/theos.git $HOME/theos
+          rm -rf $HOME/theos/vendor
           git clone --depth 1 https://github.com/theos/vendor.git $HOME/theos/vendor
           git clone --depth 1 https://github.com/theos/sdks.git $HOME/sdks-repo
           mkdir -p $HOME/theos/sdks
