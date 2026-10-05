@@ -2,6 +2,7 @@
 // 重制版配套配置器：写 Managed Preferences plist + 发 Darwin 通知热重载。
 // v2.0.0：Tab 卡片式 UI、一键预设、配置导入/导出、注入环境自检、新引擎参数。
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <spawn.h>
 #import <sys/wait.h>
 #import <sys/stat.h>
@@ -392,14 +393,24 @@ static UILabel *SIOSectionTitle(NSString *t) {
     return l;
 }
 
-// 渐变头部（drawRect 线性渐变，避免 CAGradientLayer 兼容问题）
-@interface SIOGradientHeader : UIView
+// 渐变头部（CAGradientLayer 子层；QuartzCore 在 App 链接框架内，避免裸 CoreGraphics 符号）
+@interface SIOGradientHeader : UIView {
+    CAGradientLayer *_grad;
+}
 @end
 @implementation SIOGradientHeader
 - (instancetype)initWithFrame:(CGRect)frame {
     if ((self = [super initWithFrame:frame])) {
         self.layer.cornerRadius = 20;
         self.layer.masksToBounds = YES;
+        _grad = [CAGradientLayer layer];
+        _grad.colors = @[
+            (id)[UIColor colorWithRed:0.10 green:0.45 blue:0.32 alpha:1.0].CGColor,
+            (id)[UIColor colorWithRed:0.03 green:0.07 blue:0.16 alpha:1.0].CGColor,
+        ];
+        _grad.startPoint = CGPointMake(0, 0);
+        _grad.endPoint = CGPointMake(0, 1);
+        [self.layer insertSublayer:_grad atIndex:0];
         UILabel *t = SIOLabel(@"隔壁老王 · 王灿专用", 24, [UIColor whiteColor]);
         t.font = [UIFont systemFontOfSize:24 weight:UIFontWeightBold];
         UILabel *s = SIOLabel([NSString stringWithFormat:@"SIOriginal %@ · 动画加速超强版", SIO_VERSION],
@@ -417,16 +428,9 @@ static UILabel *SIOSectionTitle(NSString *t) {
     }
     return self;
 }
-- (void)drawRect:(CGRect)rect {
-    CGContextRef ctx = UIGraphicsGetCurrentContext();
-    CGColorSpaceRef sp = CGColorSpaceCreateDeviceRGB();
-    CGFloat comps[] = { 0.10, 0.45, 0.32, 1.0,   0.03, 0.07, 0.16, 1.0 };
-    CGFloat locs[]  = { 0.0, 1.0 };
-    CGGradientRef g = CGGradientCreateWithColorComponents(sp, comps, locs, 2);
-    CGContextDrawLinearGradient(ctx, g, CGPointMake(0, 0),
-                                CGPointMake(0, rect.size.height), 0);
-    CGGradientRelease(g);
-    CGColorSpaceRelease(sp);
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    _grad.frame = self.bounds;
 }
 @end
 
