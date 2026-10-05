@@ -22,8 +22,7 @@ jobs:
       - name: Setup Theos
         run: |
           git clone --depth 1 https://github.com/theos/theos.git $HOME/theos
-          rm -rf $HOME/theos/vendor
-          git clone --depth 1 https://github.com/theos/vendor.git $HOME/theos/vendor
+          git -C $HOME/theos submodule update --init --depth 1 vendor/include vendor/lib
           git clone --depth 1 https://github.com/theos/sdks.git $HOME/sdks-repo
           mkdir -p $HOME/theos/sdks
           cp -R "$HOME"/sdks-repo/iPhoneOS*.sdk "$HOME/theos/sdks/" 2>/dev/null || true
