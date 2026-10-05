@@ -33,7 +33,7 @@ jobs:
             -isysroot "$SDK" \
             -miphoneos-version-min=14.0 \
             -fobjc-arc -fmodules \
-            -framework Foundation -framework UIKit \
+            -framework Foundation -framework UIKit -framework CoreGraphics -framework QuartzCore \
             -o "$APP/mdcXMax" mdcXMax/App/main.m mdcXMax/App/exploit.c
 
           cp mdcXMax/App/Info.plist "$APP/Info.plist"
