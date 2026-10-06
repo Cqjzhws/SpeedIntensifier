@@ -162,9 +162,9 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"LongPressDuration"])d[@"LongPressDuration"]= @0.30;
     if (!d[@"InAppNotify"])      d[@"InAppNotify"]      = @YES;
     if (!d[@"Blacklist"])  d[@"Blacklist"]  = @[ @"com.tencent.wework" ];
-    if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
-    if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
-    if (!d[@"FUBGAudioKeep"])    d[@"FUBGAudioKeep"]    = @YES;
+    if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @NO;
+    if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @NO;
+    if (!d[@"FUBGAudioKeep"])    d[@"FUBGAudioKeep"]    = @NO;
     if (!d[@"FUBGFloatingBall"]) d[@"FUBGFloatingBall"] = @NO;
     if (!d[@"AppOverrides"])     d[@"AppOverrides"]     = @{};
     return d;
@@ -714,6 +714,10 @@ static UILabel *SIOSectionTitle(NSString *t) {
     self.segSlow.selectedSegmentIndex = 0;
     self.slSpeed.value = 5.0f;
     self.swNotify.on = YES;
+    // v2.0.1：预设统一关闭保活引擎，避免注入后目标 App 闪退
+    self.swFUBG.on = NO;
+    self.swFUBGScene.on = NO;
+    self.swFUBGAudio.on = NO;
 
     switch (i) {
         case 0: // 极速

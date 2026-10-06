@@ -1691,10 +1691,10 @@ static void SIO_installiOS16Extras(void) {
 static NSString *const kFBGLocalOff = @"fubg_local_off";
 
 // ---- 全局状态 ----
-static BOOL    gFUBGEnabled    = YES;
-static BOOL    gSceneFake  = YES;
-static BOOL    gAudioKeep  = YES;
-static BOOL    gShowBall   = YES;
+static BOOL    gFUBGEnabled    = NO;     // v2.0.1：默认关闭保活引擎（场景伪装+音频断言），避免注入后目标 App 闪退
+static BOOL    gSceneFake  = NO;         // v2.0.1：默认关闭场景伪装
+static BOOL    gAudioKeep  = NO;         // v2.0.1：默认关闭音频断言
+static BOOL    gShowBall   = NO;         // v2.0.1：默认关闭悬浮球
 static NSArray *gExclude   = nil;
 static BOOL    gLocalOff   = NO;
 
@@ -1869,6 +1869,12 @@ static void _fbg_unSetDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDel
 }
 
 static void _fbg_installSceneHooks(void) {
+    // v2.0.1：场景伪装未激活时不安装任何 hook，避免对目标 App 产生不必要的副作用
+    if (!gUseScene) {
+        NSLog(@"[FUBG] scene fake disabled, skipping hook installation");
+        return;
+    }
+
     Class wsClass = objc_getClass("FBSWorkspaceScenesClient");
     Method sceneM = wsClass ? class_getInstanceMethod(
         wsClass, @selector(sceneID:updateWithSettingsDiff:transitionContext:completion:)) : NULL;
