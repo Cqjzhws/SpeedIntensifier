@@ -175,11 +175,11 @@ static int      gMode      = 0;      // 0=加速 1=慢放 2=瞬切
 static double   gSpeed     = 5.0;    // 加速倍率（时长 ÷ 倍率）
 static double   gSlowFactor = 2.0;   // 慢放倍率（时长 × 因子）
 static BOOL     gSpring    = YES;    // CASpring 参数缩放
-static BOOL     gExtra     = YES;    // 导航/模态进阶转场
+static BOOL     gExtra     = NO;     // 导航/模态进阶转场（v2.0.5：初始值与 SIO_reload 缺省一致）
 static BOOL     gListAccel = NO;     // TV/CV 列表全家桶（v1.8.11 起纯开关控制，默认关）
 static BOOL     gZoomAccel = NO;     // v1.8.15：UIScrollView 缩放动画（setZoomScale:animated: 等），默认关
-static BOOL     gFastScroll = NO;    // v1.8.16：滑行惯性加急（decelerationRate=Fast），默认关
-static BOOL     gFastTap = NO;       // v1.8.16：取消列表点击延迟（delaysContentTouches=NO），默认关
+static BOOL     gFastScroll = YES;    // v2.0.5：默认开启滑行惯性加急（decelerationRate=Fast）
+static BOOL     gFastTap = YES;       // v2.0.5：默认开启取消列表点击延迟（delaysContentTouches=NO）
 static double   gLayerBoost = 1.0;   // v1.8.17：显式动画（CAAnimation/CALayer）额外倍率，默认 1（不额外加速）
 // v2.0.0 Max 新增引擎参数
 static double   gFloorDuration = 0.01;  // 动画时长安全下限（瞬切也用它），允许 0.005–0.1，默认 0.01
@@ -366,9 +366,9 @@ static void SIO_reload(void) {
     gListAccel = d[@"ListAccel"] ? [d[@"ListAccel"] boolValue] : NO;
     // v1.8.15：缩放动画加速，缺键默认 NO（同一族在微信上出过「预览页卡死」，必须显式开）
     gZoomAccel = d[@"ZoomAccel"] ? [d[@"ZoomAccel"] boolValue] : NO;
-    // v1.8.16：交互手感开关，缺键默认 NO（会改变操作习惯，必须显式开）
-    gFastScroll = d[@"FastScroll"] ? [d[@"FastScroll"] boolValue] : NO;
-    gFastTap    = d[@"FastTap"]    ? [d[@"FastTap"] boolValue]    : NO;
+    // v2.0.5：交互手感开关，缺键默认 YES（安全、体感提升明显）
+    gFastScroll = d[@"FastScroll"] ? [d[@"FastScroll"] boolValue] : YES;
+    gFastTap    = d[@"FastTap"]    ? [d[@"FastTap"] boolValue]    : YES;
     // v1.8.17：显式动画额外倍率，缺键默认 1.0（不额外加速），范围 1.0–10.0
     double lb = d[@"LayerBoost"] ? [d[@"LayerBoost"] doubleValue] : 1.0;
     gLayerBoost = (lb >= 1.0 && lb <= 10.0) ? lb : 1.0;
@@ -851,9 +851,12 @@ static void sio_UV_systemAnim(Class self, SEL _cmd, NSUInteger anim, NSArray *vi
     SIO_REQUIRE_ORIG(o_UV_systemAnim);
     if (SIO_blocked()) { o_UV_systemAnim(self, _cmd, anim, views, o, a, c); return; }
     [CATransaction begin];
-    SIO_setTransactionDuration(SIO_targetDuration(0.35));
-    o_UV_systemAnim(self, _cmd, anim, views, o, a, c);
-    [CATransaction commit];
+    @try {
+        SIO_setTransactionDuration(SIO_targetDuration(0.35));
+        o_UV_systemAnim(self, _cmd, anim, views, o, a, c);
+    } @finally {
+        [CATransaction commit];
+    }
 }
 
 // ---- v1.8.13 新增：老式 beginAnimations 动画 API ----
@@ -928,40 +931,76 @@ static inline double SIO_transitionDuration(void) {
     return d;
 }
 
+// v2.0.5：WKWebView 导航安全守卫。微信等 App 的内部链接点击走 WKWebView →
+// UINavigationController push 路径，CATransaction 包裹会干扰 WKWebView 的
+// navigation delegate 回调时序导致闪退。检测 topVC 是否为 WKWebView 的后代，
+// 若是则跳过 CATransaction 包裹，原样透传。
+static BOOL SIO_navIsWebViewTransition(UINavigationController *nc) {
+    @try {
+        UIViewController *topVC = nc.topViewController;
+        if (!topVC) return NO;
+        Class wkClass = objc_getClass("WKWebView");
+        if (!wkClass) return NO;
+        for (UIView *v in topVC.view.subviews) {
+            if ([v isKindOfClass:wkClass]) return YES;
+            for (UIView *sv in v.subviews) {
+                if ([sv isKindOfClass:wkClass]) return YES;
+            }
+        }
+    } @catch (__unused NSException *e) {}
+    return NO;
+}
+
 static void sio_nav_push(id self, SEL _cmd, UIViewController *vc, BOOL anim) {
     SIO_REQUIRE_ORIG(o_nav_push);
     if (SIO_blocked() || !gExtra || !anim) { o_nav_push(self, _cmd, vc, anim); return; }
+    // v2.0.5：WKWebView 转场跳过 CATransaction，修复微信链接点击闪退
+    if (SIO_navIsWebViewTransition((UINavigationController *)self)) {
+        o_nav_push(self, _cmd, vc, anim); return;
+    }
     [CATransaction begin];
-    SIO_setTransactionDuration(SIO_transitionDuration());
-    o_nav_push(self, _cmd, vc, anim);
-    [CATransaction commit];
+    @try {
+        SIO_setTransactionDuration(SIO_transitionDuration());
+        o_nav_push(self, _cmd, vc, anim);
+    } @finally {
+        [CATransaction commit];
+    }
 }
 
 static void sio_nav_pop(id self, SEL _cmd, BOOL anim) {
     SIO_REQUIRE_ORIG(o_nav_pop);
     if (SIO_blocked() || !gExtra || !anim) { o_nav_pop(self, _cmd, anim); return; }
     [CATransaction begin];
-    SIO_setTransactionDuration(SIO_transitionDuration());
-    o_nav_pop(self, _cmd, anim);
-    [CATransaction commit];
+    @try {
+        SIO_setTransactionDuration(SIO_transitionDuration());
+        o_nav_pop(self, _cmd, anim);
+    } @finally {
+        [CATransaction commit];
+    }
 }
 
 static void sio_nav_popTo(id self, SEL _cmd, UIViewController *vc, BOOL anim) {
     SIO_REQUIRE_ORIG(o_nav_popTo);
     if (SIO_blocked() || !gExtra || !anim) { o_nav_popTo(self, _cmd, vc, anim); return; }
     [CATransaction begin];
-    SIO_setTransactionDuration(SIO_transitionDuration());
-    o_nav_popTo(self, _cmd, vc, anim);
-    [CATransaction commit];
+    @try {
+        SIO_setTransactionDuration(SIO_transitionDuration());
+        o_nav_popTo(self, _cmd, vc, anim);
+    } @finally {
+        [CATransaction commit];
+    }
 }
 
 static void sio_nav_setVCs(id self, SEL _cmd, NSArray *vcs, BOOL anim) {
     SIO_REQUIRE_ORIG(o_nav_setVCs);
     if (SIO_blocked() || !gExtra || !anim) { o_nav_setVCs(self, _cmd, vcs, anim); return; }
     [CATransaction begin];
-    SIO_setTransactionDuration(SIO_transitionDuration());
-    o_nav_setVCs(self, _cmd, vcs, anim);
-    [CATransaction commit];
+    @try {
+        SIO_setTransactionDuration(SIO_transitionDuration());
+        o_nav_setVCs(self, _cmd, vcs, anim);
+    } @finally {
+        [CATransaction commit];
+    }
 }
 
 static void sio_nav_privDur(id self, SEL _cmd, double d) {
@@ -974,18 +1013,24 @@ static void sio_vc_present(id self, SEL _cmd, UIViewController *vc, BOOL anim, v
     SIO_REQUIRE_ORIG(o_vc_present);
     if (SIO_blocked() || !gExtra || !anim) { o_vc_present(self, _cmd, vc, anim, c); return; }
     [CATransaction begin];
-    SIO_setTransactionDuration(SIO_transitionDuration());
-    o_vc_present(self, _cmd, vc, anim, c);
-    [CATransaction commit];
+    @try {
+        SIO_setTransactionDuration(SIO_transitionDuration());
+        o_vc_present(self, _cmd, vc, anim, c);
+    } @finally {
+        [CATransaction commit];
+    }
 }
 
 static void sio_vc_dismiss(id self, SEL _cmd, BOOL anim, void (^c)(void)) {
     SIO_REQUIRE_ORIG(o_vc_dismiss);
     if (SIO_blocked() || !gExtra || !anim) { o_vc_dismiss(self, _cmd, anim, c); return; }
     [CATransaction begin];
-    SIO_setTransactionDuration(SIO_transitionDuration());
-    o_vc_dismiss(self, _cmd, anim, c);
-    [CATransaction commit];
+    @try {
+        SIO_setTransactionDuration(SIO_transitionDuration());
+        o_vc_dismiss(self, _cmd, anim, c);
+    } @finally {
+        [CATransaction commit];
+    }
 }
 
 // ---- v1.8.12 新增：容器控制器子控制器转场 ----
@@ -1007,18 +1052,24 @@ static void sio_tab_setIndex(id self, SEL _cmd, NSUInteger idx) {
     SIO_REQUIRE_ORIG(o_tab_setIndex);
     if (SIO_blocked() || !gExtra) { o_tab_setIndex(self, _cmd, idx); return; }
     [CATransaction begin];
-    SIO_setTransactionDuration(SIO_transitionDuration());
-    o_tab_setIndex(self, _cmd, idx);
-    [CATransaction commit];
+    @try {
+        SIO_setTransactionDuration(SIO_transitionDuration());
+        o_tab_setIndex(self, _cmd, idx);
+    } @finally {
+        [CATransaction commit];
+    }
 }
 
 static void sio_tab_setVC(id self, SEL _cmd, UIViewController *vc) {
     SIO_REQUIRE_ORIG(o_tab_setVC);
     if (SIO_blocked() || !gExtra) { o_tab_setVC(self, _cmd, vc); return; }
     [CATransaction begin];
-    SIO_setTransactionDuration(SIO_transitionDuration());
-    o_tab_setVC(self, _cmd, vc);
-    [CATransaction commit];
+    @try {
+        SIO_setTransactionDuration(SIO_transitionDuration());
+        o_tab_setVC(self, _cmd, vc);
+    } @finally {
+        [CATransaction commit];
+    }
 }
 
 #pragma mark - TV/CV 列表全家桶（ListAccel 纯开关控制）
@@ -1029,11 +1080,14 @@ static BOOL SIO_listOK(void) { return gListAccel && !SIO_blocked(); }
 
 static void SIO_listWrap(void (^block)(void)) {
     [CATransaction begin];
-    // v1.8.12：改走 SIO_setTransactionDuration。原来直接调 setAnimationDuration:，
-    // 被自己的 hook 再缩放一次（0.25 在 ×5 下变成 0.01 而非预期的 0.05）。
-    SIO_setTransactionDuration(SIO_targetDuration(0.25));
-    block();
-    [CATransaction commit];
+    @try {
+        // v1.8.12：改走 SIO_setTransactionDuration。原来直接调 setAnimationDuration:，
+        // 被自己的 hook 再缩放一次（0.25 在 ×5 下变成 0.01 而非预期的 0.05）。
+        SIO_setTransactionDuration(SIO_targetDuration(0.25));
+        block();
+    } @finally {
+        [CATransaction commit];
+    }
 }
 
 // ---- UITableView ----
@@ -1348,8 +1402,8 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    // v2.0.4：默认关闭导航 hook，修复全部 APP 闪退
-    NSLog(@"[SIOriginal] v2.0.4 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
+    // v2.0.5：WKWebView 守卫 + FastTap/FastScroll 默认开
+    NSLog(@"[SIOriginal] v2.0.5 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gFastLongPress, gLongPressDur, gInAppNotify,
@@ -1467,16 +1521,22 @@ static void sio_SV_setContentOffset(id self, SEL _cmd, CGPoint p, BOOL animated)
     // 瞬切模式下直接跳过动画（性能最优）
     if (gEnabled && gMode == 2) {
         [CATransaction begin];
-        [CATransaction setValue:(id)kCFBooleanTrue forKey:kCATransactionDisableActions];
-        o_sv_setContentOffset(self, _cmd, p, NO);
-        [CATransaction commit];
+        @try {
+            [CATransaction setValue:(id)kCFBooleanTrue forKey:kCATransactionDisableActions];
+            o_sv_setContentOffset(self, _cmd, p, NO);
+        } @finally {
+            [CATransaction commit];
+        }
         return;
     }
     // 加速/慢放：用 CATransaction 包裹改 duration
     [CATransaction begin];
-    SIO_setTransactionDuration(SIO_targetDuration(0.35));
-    o_sv_setContentOffset(self, _cmd, p, YES);
-    [CATransaction commit];
+    @try {
+        SIO_setTransactionDuration(SIO_targetDuration(0.35));
+        o_sv_setContentOffset(self, _cmd, p, YES);
+    } @finally {
+        [CATransaction commit];
+    }
 }
 
 static void sio_SV_scrollRect(id self, SEL _cmd, CGRect r, BOOL animated) {
@@ -1486,15 +1546,21 @@ static void sio_SV_scrollRect(id self, SEL _cmd, CGRect r, BOOL animated) {
     }
     if (gEnabled && gMode == 2) {
         [CATransaction begin];
-        [CATransaction setValue:(id)kCFBooleanTrue forKey:kCATransactionDisableActions];
-        o_sv_scrollRect(self, _cmd, r, NO);
-        [CATransaction commit];
+        @try {
+            [CATransaction setValue:(id)kCFBooleanTrue forKey:kCATransactionDisableActions];
+            o_sv_scrollRect(self, _cmd, r, NO);
+        } @finally {
+            [CATransaction commit];
+        }
         return;
     }
     [CATransaction begin];
-    SIO_setTransactionDuration(SIO_targetDuration(0.35));
-    o_sv_scrollRect(self, _cmd, r, YES);
-    [CATransaction commit];
+    @try {
+        SIO_setTransactionDuration(SIO_targetDuration(0.35));
+        o_sv_scrollRect(self, _cmd, r, YES);
+    } @finally {
+        [CATransaction commit];
+    }
 }
 
 #pragma mark - UIScrollView 缩放动画（v1.8.15 新增，默认关闭）
@@ -2358,7 +2424,7 @@ static void FUBGEntry(void) {
             // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
         });
 
-        NSLog(@"[FUBG] v2.0.0 (SIOriginal v2.0.0) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.0.5 (SIOriginal v2.0.5) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
