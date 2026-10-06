@@ -927,9 +927,19 @@ static inline double SIO_transitionDuration(void) {
     return d;
 }
 
+// v2.0.2：微信 WebView 导航保护。微信点链接会 push WebView 容器，
+// 包裹 CATransaction 改时长会导致崩溃。检测 VC 类名含 WebView/Web 即跳过。
+static inline BOOL SIO_isWeChatWebViewNav(UIViewController *vc) {
+    if (!gIsWeChat || !vc) return NO;
+    NSString *cls = NSStringFromClass([vc class]);
+    return ([cls rangeOfString:@"WebView"].location != NSNotFound ||
+            [cls rangeOfString:@"WebVC"].location != NSNotFound ||
+            [cls rangeOfString:@"MMWebView"].location != NSNotFound);
+}
+
 static void sio_nav_push(id self, SEL _cmd, UIViewController *vc, BOOL anim) {
     SIO_REQUIRE_ORIG(o_nav_push);
-    if (SIO_blocked() || !gExtra || !anim) { o_nav_push(self, _cmd, vc, anim); return; }
+    if (SIO_blocked() || !gExtra || !anim || SIO_isWeChatWebViewNav(vc)) { o_nav_push(self, _cmd, vc, anim); return; }
     [CATransaction begin];
     SIO_setTransactionDuration(SIO_transitionDuration());
     o_nav_push(self, _cmd, vc, anim);
@@ -971,7 +981,7 @@ static void sio_nav_privDur(id self, SEL _cmd, double d) {
 
 static void sio_vc_present(id self, SEL _cmd, UIViewController *vc, BOOL anim, void (^c)(void)) {
     SIO_REQUIRE_ORIG(o_vc_present);
-    if (SIO_blocked() || !gExtra || !anim) { o_vc_present(self, _cmd, vc, anim, c); return; }
+    if (SIO_blocked() || !gExtra || !anim || SIO_isWeChatWebViewNav(vc)) { o_vc_present(self, _cmd, vc, anim, c); return; }
     [CATransaction begin];
     SIO_setTransactionDuration(SIO_transitionDuration());
     o_vc_present(self, _cmd, vc, anim, c);
