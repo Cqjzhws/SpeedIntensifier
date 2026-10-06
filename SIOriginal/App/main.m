@@ -29,7 +29,7 @@ extern int reboot(int);
 static NSString * const PrefPath  = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
 static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.0.0 Max";
+static NSString * const SIO_VERSION = @"v2.0.2 Max";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 static NSArray *HardGuardBundles(void) {
