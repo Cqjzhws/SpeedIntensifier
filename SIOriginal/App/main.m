@@ -29,7 +29,7 @@ extern int reboot(int);
 static NSString * const PrefPath  = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
 static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.0.2 Max";
+static NSString * const SIO_VERSION = @"v2.0.4 Max";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 static NSArray *HardGuardBundles(void) {
@@ -149,7 +149,7 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"Speed"])      d[@"Speed"]      = @5.0;
     if (!d[@"SlowFactor"]) d[@"SlowFactor"] = @2.0;
     if (!d[@"Spring"])     d[@"Spring"]     = @YES;
-    if (!d[@"Extra"])      d[@"Extra"]      = @YES;
+    if (!d[@"Extra"])      d[@"Extra"]      = @NO;  // v2.0.4：默认关闭导航 hook
     if (!d[@"ListAccel"])  d[@"ListAccel"]  = @NO;
     if (!d[@"ZoomAccel"])  d[@"ZoomAccel"]  = @NO;
     if (!d[@"FastScroll"]) d[@"FastScroll"] = @NO;

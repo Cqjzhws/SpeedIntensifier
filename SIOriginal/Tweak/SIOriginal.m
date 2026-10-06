@@ -358,7 +358,8 @@ static void SIO_reload(void) {
     double sf = [d[@"SlowFactor"] doubleValue];
     gSlowFactor = (sf > 1.0 && sf <= 10.0) ? sf : 2.0;
     gSpring = d[@"Spring"] ? [d[@"Spring"] boolValue] : YES;
-    gExtra  = d[@"Extra"]  ? [d[@"Extra"] boolValue]  : YES;
+    // v2.0.4：默认关闭 Extra（导航 hook），避免全部 APP 闪退
+    gExtra  = d[@"Extra"]  ? [d[@"Extra"] boolValue]  : NO;
     // v1.8.12：缺键默认 NO（原来 `: YES`）。配置 plist 一旦缺 ListAccel（旧版本写入的、
     // 手工编辑过的、被其他工具覆盖过的），原来会静默打开 24 个列表 hook，
     // 在重列表 App 上直接破坏列表状态机——危险功能必须 fail-safe。
@@ -1347,8 +1348,8 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    // v2.0.2：修复微信点链接闪退
-    NSLog(@"[SIOriginal] v2.0.2 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
+    // v2.0.4：默认关闭导航 hook，修复全部 APP 闪退
+    NSLog(@"[SIOriginal] v2.0.4 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gFastLongPress, gLongPressDur, gInAppNotify,
