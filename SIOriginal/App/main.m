@@ -469,7 +469,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
 @property (strong) UISwitch *ovFastScroll, *ovFastTap, *ovLongPress;
 @property (strong) UISlider *ovSpeed;
 @property (strong) UILabel *ovSpeedLabel, *ovGuard;
-@property (strong) UISegmentedControl *ovMode, *ovLayer, *ovFloor, *ovTrans;
+@property (strong) UISegmentedControl *ovMode, *ovLayer, *ovFloor, *ovTrans, *ovLPDur;
 // 高级页：黑名单
 @property (strong) UITextView *blacklist;
 
@@ -579,6 +579,8 @@ static UILabel *SIOSectionTitle(NSString *t) {
     self.ovFastScroll.on = mine[@"FastScroll"] ? [mine[@"FastScroll"] boolValue] : NO;
     self.ovFastTap.on    = mine[@"FastTap"]    ? [mine[@"FastTap"] boolValue]    : NO;
     self.ovLongPress.on  = mine[@"FastLongPress"] ? [mine[@"FastLongPress"] boolValue] : NO;
+    self.ovLPDur.selectedSegmentIndex = LPIndexForDur(mine[@"LongPressDuration"] ? [mine[@"LongPressDuration"] doubleValue] : 0.30);
+    self.ovLPDur.enabled = self.ovLongPress.on;
     self.ovLayer.selectedSegmentIndex = LayerIndexForBoost(mine[@"LayerBoost"] ? [mine[@"LayerBoost"] doubleValue] : 1.0);
     self.ovFloor.selectedSegmentIndex = FloorIndexFor(mine[@"FloorDuration"] ? [mine[@"FloorDuration"] doubleValue] : 0.01);
     self.ovTrans.selectedSegmentIndex = TransIndexFor(mine[@"TransitionBoost"] ? [mine[@"TransitionBoost"] doubleValue] : 1.0);
@@ -658,7 +660,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
                 @"FloorDuration":   @(FloorForIndex((int)self.ovFloor.selectedSegmentIndex)),
                 @"TransitionBoost": @(TransForIndex((int)self.ovTrans.selectedSegmentIndex)),
                 @"FastLongPress":   @(self.ovLongPress.on),
-                @"LongPressDuration": @(LPDurForIndex((int)self.segLPDur.selectedSegmentIndex)),
+                @"LongPressDuration": @(LPDurForIndex((int)self.ovLPDur.selectedSegmentIndex)),
             };
         } else {
             [ovOut removeObjectForKey:ovBid];
@@ -888,6 +890,9 @@ static UILabel *SIOSectionTitle(NSString *t) {
     UIScrollView *scroll = [[UIScrollView alloc] init];
     scroll.translatesAutoresizingMaskIntoConstraints = NO;
     scroll.alwaysBounceVertical = YES;
+    scroll.delaysContentTouches = NO;
+    scroll.canCancelContentTouches = YES;
+    scroll.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
     [self.view addSubview:scroll];
 
     self.stack = [[UIStackView alloc] init];
@@ -1114,11 +1119,22 @@ static UILabel *SIOSectionTitle(NSString *t) {
 
     UILabel *blacklistTitle = SIOSectionTitle(@"黑名单（每行一个 Bundle ID，命中则完全不加速）");
     m.blacklist = [[UITextView alloc] init];
+    m.blacklist.translatesAutoresizingMaskIntoConstraints = NO;
+    m.blacklist.editable = YES;
+    m.blacklist.selectable = YES;
+    m.blacklist.scrollEnabled = YES;
     m.blacklist.font = [UIFont systemFontOfSize:14];
+    m.blacklist.textColor = [UIColor labelColor];
+    m.blacklist.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     m.blacklist.layer.borderColor = [UIColor separatorColor].CGColor;
     m.blacklist.layer.borderWidth = 0.5;
     m.blacklist.layer.cornerRadius = 10;
-    [m.blacklist.heightAnchor constraintEqualToConstant:110].active = YES;
+    m.blacklist.textContainerInset = UIEdgeInsetsMake(10, 8, 10, 8);
+    m.blacklist.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    m.blacklist.autocorrectionType = UITextAutocorrectionTypeNo;
+    m.blacklist.spellCheckingType = UITextSpellCheckingTypeNo;
+    m.blacklist.keyboardType = UIKeyboardTypeURL;
+    [m.blacklist.heightAnchor constraintEqualToConstant:120].active = YES;
     [self.stack addArrangedSubview:blacklistTitle];
     [self.stack addArrangedSubview:m.blacklist];
 }
@@ -1203,6 +1219,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     // ---- App 专属覆盖 ----
     [self.stack addArrangedSubview:SIOSectionTitle(@"App 专属覆盖（只影响该 Bundle ID）")];
     m.ovBundle = [[UITextField alloc] init];
+    m.ovBundle.translatesAutoresizingMaskIntoConstraints = NO;
     m.ovBundle.placeholder = @"com.sfic.knight";
     m.ovBundle.borderStyle = UITextBorderStyleRoundedRect;
     m.ovBundle.font = [UIFont systemFontOfSize:14];
@@ -1236,6 +1253,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     m.ovFastScroll = [[UISwitch alloc] init];
     m.ovFastTap = [[UISwitch alloc] init];
     m.ovLongPress = [[UISwitch alloc] init];
+    m.ovLPDur = [[UISegmentedControl alloc] initWithItems:@[ @"0.20s", @"0.30s", @"0.40s" ]];
     m.ovGuard = SIOLabel(@"", 12, [UIColor secondaryLabelColor]);
 
     [self.stack addArrangedSubview:SIOCard(@[
@@ -1253,6 +1271,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
         SIORow(@"滑行惯性加急", m.ovFastScroll, nil),
         SIORow(@"点击零延迟", m.ovFastTap, nil),
         SIORow(@"长按手势加速", m.ovLongPress, nil),
+        SIOLabel(@"专属长按时长", 15, [UIColor labelColor]), m.ovLPDur,
         m.ovGuard,
     ], 10)];
 
