@@ -178,8 +178,8 @@ static BOOL     gSpring    = YES;    // CASpring 参数缩放
 static BOOL     gExtra     = NO;     // 导航/模态进阶转场（v2.0.5：初始值与 SIO_reload 缺省一致）
 static BOOL     gListAccel = NO;     // TV/CV 列表全家桶（v1.8.11 起纯开关控制，默认关）
 static BOOL     gZoomAccel = NO;     // v1.8.15：UIScrollView 缩放动画（setZoomScale:animated: 等），默认关
-static BOOL     gFastScroll = YES;    // v2.0.5：默认开启滑行惯性加急（decelerationRate=Fast）
-static BOOL     gFastTap = YES;       // v2.0.5：默认开启取消列表点击延迟（delaysContentTouches=NO）
+static BOOL     gFastScroll = NO;    // v2.0.6：回退默认关闭（排查闪退）
+static BOOL     gFastTap = NO;       // v2.0.6：回退默认关闭（排查闪退）
 static double   gLayerBoost = 1.0;   // v1.8.17：显式动画（CAAnimation/CALayer）额外倍率，默认 1（不额外加速）
 // v2.0.0 Max 新增引擎参数
 static double   gFloorDuration = 0.01;  // 动画时长安全下限（瞬切也用它），允许 0.005–0.1，默认 0.01
@@ -366,9 +366,9 @@ static void SIO_reload(void) {
     gListAccel = d[@"ListAccel"] ? [d[@"ListAccel"] boolValue] : NO;
     // v1.8.15：缩放动画加速，缺键默认 NO（同一族在微信上出过「预览页卡死」，必须显式开）
     gZoomAccel = d[@"ZoomAccel"] ? [d[@"ZoomAccel"] boolValue] : NO;
-    // v2.0.5：交互手感开关，缺键默认 YES（安全、体感提升明显）
-    gFastScroll = d[@"FastScroll"] ? [d[@"FastScroll"] boolValue] : YES;
-    gFastTap    = d[@"FastTap"]    ? [d[@"FastTap"] boolValue]    : YES;
+    // v2.0.6：回退默认关闭（排查全部 APP 闪退）
+    gFastScroll = d[@"FastScroll"] ? [d[@"FastScroll"] boolValue] : NO;
+    gFastTap    = d[@"FastTap"]    ? [d[@"FastTap"] boolValue]    : NO;
     // v1.8.17：显式动画额外倍率，缺键默认 1.0（不额外加速），范围 1.0–10.0
     double lb = d[@"LayerBoost"] ? [d[@"LayerBoost"] doubleValue] : 1.0;
     gLayerBoost = (lb >= 1.0 && lb <= 10.0) ? lb : 1.0;
@@ -1402,8 +1402,8 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    // v2.0.5：WKWebView 守卫 + FastTap/FastScroll 默认开
-    NSLog(@"[SIOriginal] v2.0.5 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
+    // v2.0.6：回退 FastTap/FastScroll 默认值，排查全部 APP 闪退
+    NSLog(@"[SIOriginal] v2.0.6 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gFastLongPress, gLongPressDur, gInAppNotify,
@@ -2424,7 +2424,7 @@ static void FUBGEntry(void) {
             // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
         });
 
-        NSLog(@"[FUBG] v2.0.5 (SIOriginal v2.0.5) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.0.6 (SIOriginal v2.0.6) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
