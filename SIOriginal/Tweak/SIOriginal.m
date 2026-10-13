@@ -396,10 +396,10 @@ static BOOL SIO_fbgBuiltinExcluded(void) {
     return bid.length && [list containsObject:bid];
 }
 
-// v2.1.7 fix：FastTap 保护名单。这些 App 依赖 UIScrollView 的 delaysContentTouches=YES
-// 来正确识别长按手势（如微信聊天长按弹复制菜单）。FastTap 把它强制设为 NO 会导致
-// 长按手势无法触发，因此对这些 App 跳过 FastTap。
-static BOOL SIO_fastTapProtected(void) {
+// v2.1.7 fix：手感模块保护名单。这些 App 依赖 UIScrollView 的原生触摸行为
+// （delaysContentTouches、decelerationRate）来正确识别长按/选择等手势。
+// 整个手感模块（FastScroll + FastTap + setter 强黏）对这些 App 全部跳过。
+static BOOL SIO_feelProtected(void) {
     static NSArray *list = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -821,9 +821,18 @@ static void sio_CAAnim_setDuration(id self, SEL _cmd, double d) {
     SIO_REQUIRE_ORIG(o_CAAnim_setDuration);
     if (SIO_blocked()) { o_CAAnim_setDuration(self, _cmd, d); return; }
     // v2.1.7 fix：CAKeyframeAnimation（含高德 MAMapKeyFrameAnimation）按时序播放多帧，
-    // 压缩时长会丢帧导致地图黑屏/路径动画断裂，原样透传。
+    // 压到 FloorDuration（0.01s）会丢帧导致地图黑屏。改为用更高下限 0.1s 加速，
+    // 既保持加速效果又保证每帧都有足够时间渲染。
     if ([self isKindOfClass:[CAKeyframeAnimation class]]) {
-        o_CAAnim_setDuration(self, _cmd, d);
+        double target;
+        switch (gMode) {
+            case 1:  target = d * gSlowFactor; break;
+            case 2:  target = 0.1;             break;  // 瞬切对 keyframe 用 0.1s 保证渲染
+            default: target = (gSpeed > 1.0001) ? (d / gSpeed) : d;
+        }
+        if (target < 0.1) target = 0.1;     // keyframe 专用下限：0.1s 足够渲染
+        o_CAAnim_setDuration(self, _cmd, target);
+        SIO_markAnimScaled(self);
         return;
     }
     // v1.8.15：显式设时长视为新意图，按传入值缩放并重新打标
@@ -1657,14 +1666,14 @@ static void sio_SV_didMoveToWindow(id self, SEL _cmd) {
     o_sv_didMoveToWindow(self, _cmd);
     if (!gFastScroll && !gFastTap) return;
     if (SIO_blocked()) return;
+    // v2.1.7 fix：对依赖长按/原生手势的 App（微信等）整个手感模块跳过。
+    if (SIO_feelProtected()) return;
     @try {
         UIScrollView *sv = (UIScrollView *)self;
         if (gFastScroll && sv.decelerationRate != UIScrollViewDecelerationRateFast) {
             sv.decelerationRate = UIScrollViewDecelerationRateFast;
         }
-        // v2.1.7 fix：FastTap 把 delaysContentTouches 设为 NO 会破坏微信等 App 的
-        // 长按手势识别（长按不弹出复制菜单）。对依赖长按的 App 跳过 FastTap。
-        if (gFastTap && !SIO_fastTapProtected() && sv.delaysContentTouches) {
+        if (gFastTap && sv.delaysContentTouches) {
             sv.delaysContentTouches = NO;
         }
     } @catch (__unused NSException *e) {}
@@ -1675,15 +1684,13 @@ static void sio_SV_didMoveToWindow(id self, SEL _cmd) {
 // 改回去，旧版就"时灵时不灵"。setter 层钳回，开关真正全程生效。
 static void sio_SV_setDecelRate(id self, SEL _cmd, CGFloat rate) {
     SIO_REQUIRE_ORIG(o_sv_setDecelRate);
-    if (!SIO_blocked() && gFastScroll) rate = UIScrollViewDecelerationRateFast;
+    if (!SIO_blocked() && gFastScroll && !SIO_feelProtected()) rate = UIScrollViewDecelerationRateFast;
     o_sv_setDecelRate(self, _cmd, rate);
 }
 
 static void sio_SV_setDelaysTouches(id self, SEL _cmd, BOOL b) {
     SIO_REQUIRE_ORIG(o_sv_setDelaysTouches);
-    // v2.1.7 fix：对依赖长按手势的 App（如微信）不强制 delaysContentTouches=NO，
-    // 否则长按复制菜单无法弹出。
-    if (!SIO_blocked() && gFastTap && !SIO_fastTapProtected()) b = NO;
+    if (!SIO_blocked() && gFastTap && !SIO_feelProtected()) b = NO;
     o_sv_setDelaysTouches(self, _cmd, b);
 }
 
@@ -1697,21 +1704,28 @@ static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
     // sio_CAAnim_setDuration 处理（带标记），这里必须跳过，否则同一个值被缩两次。
     if (!SIO_blocked() && anim && o_CAAnim_setDuration &&
         [anim isKindOfClass:[CAAnimation class]] && !SIO_animScaled(anim)) {
-        // v2.1.7 fix：CAKeyframeAnimation（地图相机动画等）按时序播放多帧，
-        // 压缩时长会丢帧导致地图黑屏，跳过。
-        if (![anim isKindOfClass:[CAKeyframeAnimation class]]) {
-            @try {
-                double origDur = ((CAAnimation *)anim).duration;
-                if (origDur > 0) {
-                    SIO_markAnimScaled(anim);
-                    // v1.8.17：与 setDuration: 路径共用同一套换算（含 LayerBoost）
-                    double newDur = SIO_targetDurationLayer(origDur);
-                    if (newDur != origDur) {
-                        o_CAAnim_setDuration(anim, @selector(setDuration:), newDur);
+        @try {
+            double origDur = ((CAAnimation *)anim).duration;
+            if (origDur > 0) {
+                SIO_markAnimScaled(anim);
+                double newDur;
+                if ([anim isKindOfClass:[CAKeyframeAnimation class]]) {
+                    // v2.1.7 fix：CAKeyframeAnimation 用 0.1s 下限加速（不丢帧）
+                    switch (gMode) {
+                        case 1:  newDur = origDur * gSlowFactor; break;
+                        case 2:  newDur = 0.1;                    break;
+                        default: newDur = (gSpeed > 1.0001) ? (origDur / gSpeed) : origDur;
                     }
+                    if (newDur < 0.1) newDur = 0.1;
+                } else {
+                    // v1.8.17：与 setDuration: 路径共用同一套换算（含 LayerBoost）
+                    newDur = SIO_targetDurationLayer(origDur);
                 }
-            } @catch (__unused NSException *e) {}
-        }
+                if (newDur != origDur) {
+                    o_CAAnim_setDuration(anim, @selector(setDuration:), newDur);
+                }
+            }
+        } @catch (__unused NSException *e) {}
     }
     o_layer_addAnim(self, _cmd, anim, key);
 }
