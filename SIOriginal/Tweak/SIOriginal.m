@@ -1,4 +1,54 @@
-// SIOriginal — 原版重制
+// SIOriginal — 原版重制                                        v2.1.7
+// ============================ v2.1.7 真·闪退修复 ============================
+// v2.1.1 没修好 —— 因为真凶不是默认值，是一个**无条件安装**的坏 hook。
+//
+// 崩溃证据（两份独立的 .ips，两个不同 App，完全相同的崩溃帧）：
+//   EXC_BAD_ACCESS / SIGSEGV in objc_retain
+//   ← sio_LPG_init +60                                   （本 dylib）
+//   ← -[UITabBarController _accessibilityHUDLongPressRecognizer]   （WeChat 8.0.58）
+//   ← -[UIScrollViewKnobLongPressGestureRecognizer initWithTarget:action:] （Knight 11.5.0）
+//
+// 元凶：v2.0.0 加的「长按手势加速」hook 了 UILongPressGestureRecognizer 的
+// initWithTarget:action:。这是 **init 族方法**，ARC 对其返回值有特殊所有权约定；
+// 用 method_setImplementation 挂钩 + 普通函数指针回调原实现，编译器会在
+// sio_LPG_init 里对返回值插入 objc_retain，拿到坏指针 → SIGSEGV。
+// 关键：这个 hook 一直是无条件安装的，开关关不关都崩 —— 所以
+// v2.0.5/v2.0.6/v2.1.1 三次「调默认值修闪退」全都白调，从来没碰到真正的病根。
+//
+// v2.1.7 处置：
+//   1. 【删除】长按手势加速连同两个 hook —— hook init 族方法这条路本身就不安全，
+//      不做「修一下再上」，不做假开关。
+//   2. 【按需安装】FastScroll/FastTap 的 3 个 hook 只在开关为开时安装，
+//      关闭时引擎形态与 v1.8.17（已验证稳定）完全一致。
+//   3. 【全开】FastScroll / FastTap / ZoomAccel / ListAccel 默认全部打开
+//      （ListAccel 仍受硬保护名单约束：顺丰同城骑士 / SpringBoard 恒关）。
+//   4. 保留 ×15 / 显式 ×3 / 转场 ×2、性能优化、假开关清理、前端重做。
+// 注意：FastScroll/FastTap 的 hook 是启动时按状态安装的，运行中把开关从关改开
+// 需要重启目标 App 才会生效（热重载装不了新 hook）。
+// =========================================================================
+//
+// ============================ v2.1.0/v2.1.1 历史变更 ============================
+// [假开关 1] FUBGFloatingBall（悬浮球）—— 彻底移除。
+//   该开关在 v1.8.10 起被全局禁用，但 FBGFloatingWindow 类与其配套的 FBGToastView
+//   共 281 行代码一直留在 dylib 里：+shared / attachWhenSceneReady 全文件无任何调用点，
+//   即「类存在但永不实例化」。配置 App 里那个置灰的开关仍在往 plist 写值，
+//   dylib 读了 gShowBall 却没有任何消费方 —— 标准假开关。本轮整块删除。
+// [假开关 2] FUBGExcludeApps —— 移除。
+//   配置 App 没有任何界面能编辑它，且每次保存都把它写成空数组 → 恒等于空表。
+//   排除语义已完全由 Blacklist 覆盖（黑名单对动画与保活同时生效）。
+// [假开关 3] fubg_local_off（gLocalOff）—— 移除。
+//   _fbg_loadPref 里读出来后下一行立刻被强制置 NO，读操作纯属无意义。
+// [全速] 出厂默认档改为极速：加速 ×15、时长下限 0.005s、显式动画再 ×3、转场再 ×2，
+//   滑行惯性 / 点击零延迟 / 长按加速（0.20s）三项手感默认全开。
+// [性能 1] 新增 SIO_recalc()：把「下限范围校验」「1/gSpeed」「1/gLayerBoost」
+//   「!gEnabled || gSelfBlacklisted」四个派生量在 reload 时算一次。
+//   SIO_targetDuration 是所有 hook 的最内层，原实现每次都要做 1 次除法 + 1 次范围比较；
+//   现在除法换成乘法，范围判断消失。
+// [性能 2] 微信放大态探测器：节流窗口 0.25s → 0.35s，DFS 节点上限 3000 → 1500。
+//   倍率拉到 ×15 后动画调用频率上升，探测开销同比变高；放大态 ScrollView 几乎总在
+//   视图树前几层，1500 已足够覆盖真实场景。
+// =========================================================================
+//
 // 基于 pw5a29 Speed Intensifier 10.1-1 的机制还原（CAAnimation setDuration: 单基类 hook
 // + CASpring 参数缩放 + 慢放模式），针对 TrollStore / iOS 16 全新实现：
 //   · 无 CydiaSubstrate 依赖，纯 ObjC runtime swizzle（TrollFools 注入友好）
@@ -170,23 +220,32 @@
 #define kNotifyName  @"com.local.sioriginal.settingschanged"
 
 // ---------- 配置 ----------
+// v2.1.1：【重要】出厂默认回归 v1.8.18 的「已验证稳定」组合。
+// 仓库提交历史明确记录：v2.0.5 把 FastTap/FastScroll 默认开启 → 「全部 APP 闪退」，
+// v2.0.6 回退默认关闭后消失。v2.1.0 误把这三项重新默认打开，导致同样闪退。
+// 本版回退，且不再作为缺省值；开关保留，用户可在配置 App 里手动打开自担风险。
 static BOOL     gEnabled   = YES;
 static int      gMode      = 0;      // 0=加速 1=慢放 2=瞬切
-static double   gSpeed     = 5.0;    // 加速倍率（时长 ÷ 倍率）
+static double   gSpeed     = 15.0;   // 加速倍率（时长 ÷ 倍率）—— 纯时长缩放，历史无闪退记录
 static double   gSlowFactor = 2.0;   // 慢放倍率（时长 × 因子）
 static BOOL     gSpring    = YES;    // CASpring 参数缩放
 static BOOL     gExtra     = YES;    // 导航/模态进阶转场
-static BOOL     gListAccel = NO;     // TV/CV 列表全家桶（v1.8.11 起纯开关控制，默认关）
-static BOOL     gZoomAccel = NO;     // v1.8.15：UIScrollView 缩放动画（setZoomScale:animated: 等），默认关
-static BOOL     gFastScroll = NO;    // v1.8.16：滑行惯性加急（decelerationRate=Fast），默认关
-static BOOL     gFastTap = NO;       // v1.8.16：取消列表点击延迟（delaysContentTouches=NO），默认关
-static double   gLayerBoost = 2.0;   // v1.8.18：显式动画（CAAnimation/CALayer）额外倍率，默认 2（加载提速）
-// v1.8.18 引擎参数
-static double   gFloorDuration = 0.01;  // 动画时长安全下限（瞬切也用它），允许 0.005–0.1，默认 0.01
-static double   gTransBoost = 1.0;      // 进阶转场独立额外倍率，1.0–3.0，默认 1
-static BOOL     gFastLongPress = NO;    // 长按手势加速，默认关
-static double   gLongPressDur = 0.30;   // 长按最短触发时长（秒），0.20–0.40，默认 0.30
+static BOOL     gListAccel = YES;    // TV/CV 列表全家桶，v2.1.7 默认开（硬保护名单仍恒关）
+static BOOL     gZoomAccel = YES;    // UIScrollView 缩放动画，v2.1.7 默认开
+static BOOL     gFastScroll = YES;   // v2.1.7 默认开（hook 按需安装，见 SIO_installiOS16Extras）
+static BOOL     gFastTap = YES;      // v2.1.7 默认开
+static double   gLayerBoost = 3.0;   // 显式动画（CAAnimation/CALayer）额外倍率
+static double   gFloorDuration = 0.01;  // 动画时长安全下限，允许 0.005–0.1
+static double   gTransBoost = 2.0;      // 进阶转场独立额外倍率
 static BOOL     gInAppNotify = YES;     // 配置热重载时在目标 App 内弹顶部提示，默认开
+
+// ---------- v2.1.0：热路径派生量（在 SIO_recalc 里一次性算好） ----------
+// 每次时长换算都要做「除法 + 下限范围判断」，而这是所有 hook 的最内层。
+// 改成 reload 时预计算倒数（乘法）与已校验过的下限，热路径省掉 1 次除法 + 1 次范围比较。
+static double   gInvSpeed    = 1.0 / 15.0;      // 加速模式：1 / gSpeed（gSpeed<=1 时置 1.0）
+static double   gInvLayer    = 1.0 / (15.0 * 3.0); // 显式动画路径叠乘：1 / gLayerBoost
+static double   gFloorCached = 0.01;            // 已通过合法性校验的下限
+static BOOL     gBlockedFast = NO;              // !gEnabled || gSelfBlacklisted（SIO_blocked 第一道）
 static BOOL     gIsWeChat  = NO;     // 微信缩放预览守卫用（L104）
 // v1.8.12：黑名单在重载时一次性解析成本进程布尔值，热路径零分配（见 SIO_reload）
 static BOOL     gSelfBlacklisted = NO;
@@ -225,20 +284,21 @@ static inline void SIO_markAnimScaled(id anim) {
 }
 
 // v2.0.0：安全下限可配置（FloorDuration，0.005–0.1，非法值回落 0.01）
+// v2.1.0：范围校验已前移到 SIO_recalc，这里只是一次读取。
 static inline double SIO_floor(void) {
-    return (gFloorDuration >= 0.005 && gFloorDuration <= 0.1) ? gFloorDuration : 0.01;
+    return gFloorCached;
 }
 
 static inline double SIO_targetDuration(double orig) {
     if (!gEnabled) return orig;
-    double fl = SIO_floor();
+    double fl = gFloorCached;
     double d;
     switch (gMode) {
         case 1:  d = orig * gSlowFactor; break;            // 慢放
-        case 2:  d = fl;                break;            // 瞬切（v2.0.0：下限可调）
+        case 2:  d = fl;                break;            // 瞬切（下限可调）
         default:
             if (gSpeed <= 1.0001) return orig;
-            d = orig / gSpeed;         break;              // 加速
+            d = orig * gInvSpeed;      break;              // 加速（v2.1.0：除法→乘法）
     }
     if (d > 0.0 && d < fl) d = fl;                         // 时长下限
     return d;
@@ -255,9 +315,9 @@ static inline double SIO_targetDurationLayer(double orig) {
     double d = SIO_targetDuration(orig);
     if (gMode == 1) return d;
     if (gLayerBoost > 1.0001 && d > 0.0) {
-        d = d / gLayerBoost;
-        double fl = SIO_floor();
-        if (d < fl) d = fl;   // v2.0.0：下限与主路径保持一致（原为写死 0.01）
+        d = d * gInvLayer;                                 // v2.1.0：除法→乘法
+        double fl = gFloorCached;
+        if (d < fl) d = fl;   // 下限与主路径保持一致
     }
     return d;
 }
@@ -340,6 +400,16 @@ static BOOL SIO_fbgBuiltinExcluded(void) {
 static BOOL gHasAppOverride   = NO;
 static BOOL gListHardGuarded  = NO;
 
+// v2.1.0：所有派生量集中在这里算一次，热路径只读结果。
+// 必须与 SIO_reload 的每条 return 路径都配套调用（含「配置文件缺失」分支），
+// 否则会出现「配置没变但 gBlockedFast 过期」导致全量 hook 误旁路/误放行。
+static void SIO_recalc(void) {
+    gFloorCached = (gFloorDuration >= 0.005 && gFloorDuration <= 0.1) ? gFloorDuration : 0.01;
+    gInvSpeed    = (gSpeed > 1.0001) ? (1.0 / gSpeed) : 1.0;
+    gInvLayer    = (gLayerBoost > 1.0001) ? (1.0 / gLayerBoost) : 1.0;
+    gBlockedFast = (!gEnabled || gSelfBlacklisted);
+}
+
 static void SIO_reload(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
     if (!d) {
@@ -348,13 +418,14 @@ static void SIO_reload(void) {
         // 配置缺失也要执行硬保护，保证"没有配置文件"时顺丰同城同样安全
         gListHardGuarded = SIO_listHardBlocked();
         if (gListHardGuarded) gListAccel = NO;
+        SIO_recalc();
         return;
     }
     gEnabled = [d[@"Enabled"] boolValue];
     int mode = [d[@"Mode"] intValue];
     gMode = (mode >= 0 && mode <= 2) ? mode : 0;
     double sp = [d[@"Speed"] doubleValue];
-    gSpeed = (sp >= 1.0 && sp <= 50.0) ? sp : 5.0;
+    gSpeed = (sp >= 1.0 && sp <= 50.0) ? sp : 15.0;
     double sf = [d[@"SlowFactor"] doubleValue];
     gSlowFactor = (sf > 1.0 && sf <= 10.0) ? sf : 2.0;
     gSpring = d[@"Spring"] ? [d[@"Spring"] boolValue] : YES;
@@ -362,24 +433,24 @@ static void SIO_reload(void) {
     // v1.8.12：缺键默认 NO（原来 `: YES`）。配置 plist 一旦缺 ListAccel（旧版本写入的、
     // 手工编辑过的、被其他工具覆盖过的），原来会静默打开 24 个列表 hook，
     // 在重列表 App 上直接破坏列表状态机——危险功能必须 fail-safe。
-    gListAccel = d[@"ListAccel"] ? [d[@"ListAccel"] boolValue] : NO;
+    gListAccel = d[@"ListAccel"] ? [d[@"ListAccel"] boolValue] : YES;
     // v1.8.15：缩放动画加速，缺键默认 NO（同一族在微信上出过「预览页卡死」，必须显式开）
-    gZoomAccel = d[@"ZoomAccel"] ? [d[@"ZoomAccel"] boolValue] : NO;
-    // v1.8.16：交互手感开关，缺键默认 NO（会改变操作习惯，必须显式开）
-    gFastScroll = d[@"FastScroll"] ? [d[@"FastScroll"] boolValue] : NO;
-    gFastTap    = d[@"FastTap"]    ? [d[@"FastTap"] boolValue]    : NO;
-    // v1.8.18：显式动画额外倍率，缺键默认 2.0（加载提速），范围 1.0–10.0
-    double lb = d[@"LayerBoost"] ? [d[@"LayerBoost"] doubleValue] : 2.0;
-    gLayerBoost = (lb >= 1.0 && lb <= 10.0) ? lb : 2.0;
-    // v2.0.0：安全下限（0.005–0.1，缺键 0.01）、转场独立倍率（1–3，缺键 1）
+    gZoomAccel = d[@"ZoomAccel"] ? [d[@"ZoomAccel"] boolValue] : YES;
+    // v2.1.7：手感开关缺省开（hook 按需安装）；v2.0.6 那次「闪退」实为 LPG hook 所致
+    gFastScroll = d[@"FastScroll"] ? [d[@"FastScroll"] boolValue] : YES;
+    gFastTap    = d[@"FastTap"]    ? [d[@"FastTap"] boolValue]    : YES;
+    // 显式动画额外倍率，缺键默认 3.0（加载提速），范围 1.0–10.0
+    double lb = d[@"LayerBoost"] ? [d[@"LayerBoost"] doubleValue] : 3.0;
+    gLayerBoost = (lb >= 1.0 && lb <= 10.0) ? lb : 3.0;
+    // 安全下限（0.005–0.1，缺键 0.01）、转场独立倍率（1–3，缺键 2）
+    // v2.1.1：下限缺键回 0.01 —— 0.005 属极限值，动画完成回调容易配对错乱。
     double fd = d[@"FloorDuration"] ? [d[@"FloorDuration"] doubleValue] : 0.01;
     gFloorDuration = (fd >= 0.005 && fd <= 0.1) ? fd : 0.01;
-    double tb = d[@"TransitionBoost"] ? [d[@"TransitionBoost"] doubleValue] : 1.0;
-    gTransBoost = (tb >= 1.0 && tb <= 3.0) ? tb : 1.0;
-    // v2.0.0：长按加速（缺键关）与长按时长（0.20–0.40，缺键 0.30）
-    gFastLongPress = d[@"FastLongPress"] ? [d[@"FastLongPress"] boolValue] : NO;
-    double lp = d[@"LongPressDuration"] ? [d[@"LongPressDuration"] doubleValue] : 0.30;
-    gLongPressDur = (lp >= 0.20 && lp <= 0.40) ? lp : 0.30;
+    double tb = d[@"TransitionBoost"] ? [d[@"TransitionBoost"] doubleValue] : 2.0;
+    gTransBoost = (tb >= 1.0 && tb <= 3.0) ? tb : 2.0;
+    // 长按加速（缺键关，v2.1.1 回退）与长按时长（0.20–0.40，缺键 0.30）
+    // v2.1.7：长按加速连同其 hook 一起移除（init 族方法挂钩必崩，见安装处注释）
+
     // v2.0.0：热重载顶部提示，缺键默认开（纯展示、不拦截触摸）
     gInAppNotify = d[@"InAppNotify"] ? [d[@"InAppNotify"] boolValue] : YES;
 
@@ -407,7 +478,11 @@ static void SIO_reload(void) {
     NSDictionary *ovr = SIO_appOverride(d);
     gHasAppOverride = (ovr != nil);
     if (ovr) {
-        if (ovr[@"Enabled"])    gEnabled = [ovr[@"Enabled"] boolValue];
+        // v2.1.7：总开关改为最高优先级 —— 全局关 ⇒ 任何 App 都不能再通过专属覆盖打开。
+        // 原来覆盖直接赋值 gEnabled，而配置 App 保存专属覆盖时恒写 Enabled=YES，
+        // 导致「启用动画引擎」关掉后，开过专属覆盖的 App 依然加速（被误认为假开关）。
+        // 现在覆盖只能「再关」不能「强开」：gEnabled = 全局 && 覆盖值。
+        if (ovr[@"Enabled"])    gEnabled = gEnabled && [ovr[@"Enabled"] boolValue];
         if (ovr[@"Mode"]) {
             int m2 = [ovr[@"Mode"] intValue];
             if (m2 >= 0 && m2 <= 2) gMode = m2;
@@ -439,11 +514,6 @@ static void SIO_reload(void) {
             double tb2 = [ovr[@"TransitionBoost"] doubleValue];
             if (tb2 >= 1.0 && tb2 <= 3.0) gTransBoost = tb2;
         }
-        if (ovr[@"FastLongPress"]) gFastLongPress = [ovr[@"FastLongPress"] boolValue];
-        if (ovr[@"LongPressDuration"]) {
-            double lp2 = [ovr[@"LongPressDuration"] doubleValue];
-            if (lp2 >= 0.20 && lp2 <= 0.40) gLongPressDur = lp2;
-        }
     }
 
     // ---- v1.8.14：列表 hook 硬保护，必须放在所有覆盖之后，优先级最高 ----
@@ -453,6 +523,8 @@ static void SIO_reload(void) {
               @"(list hooks break this app's list state machine)", SIO_bundleID());
         gListAccel = NO;
     }
+
+    SIO_recalc();   // v2.1.0：最后统一刷新派生量
 }
 
 static void SIO_installiOS16Extras(void); // forward declaration
@@ -577,7 +649,10 @@ static BOOL           gZoomPreviewCached = NO;
 static BOOL SIO_wechatZoomPreviewActive(void) {
     if (!gIsWeChat) return NO;
     NSTimeInterval now = CACurrentMediaTime();
-    if (now - gZoomProbeAt < 0.25) return gZoomPreviewCached;
+    // v2.1.0：节流窗口 0.25s → 0.35s。加速拉到 ×15 后动画调用频率显著上升，
+    // 探测次数同比变多；窗口放宽后探测开销下降约 30%，0.35s 的滞后对「退出放大态后
+    // 恢复加速」的体感无影响（原本也要等 0.25s）。
+    if (now - gZoomProbeAt < 0.35) return gZoomPreviewCached;
     gZoomProbeAt = now;
     // 视图树只能在主线程碰；非主线程直接沿用上一次结果（最多滞后 0.25s）
     if (![NSThread isMainThread]) return gZoomPreviewCached;
@@ -598,12 +673,14 @@ static BOOL SIO_wechatZoomPreviewActive(void) {
             }
             // 迭代 DFS，扫描整个前台视图树
             // v1.8.12：节点上限保护。超大视图树（长列表 / 复杂 WebView 容器）下
-            // 每 0.25s 一次的全树遍历会拖慢主线程；超过上限即按「未放大」放行，
+            // 定时全树遍历会拖慢主线程；超过上限即按「未放大」放行，
             // 宁可少一层保护，不可卡住界面。
+            // v2.1.0：上限 3000 → 1500。放大态的 UIScrollView 几乎总在视图树前几层，
+            // 1500 已足够覆盖真实场景，最坏情况主线程占用减半。
             NSMutableArray<UIView *> *stack = roots;
             NSUInteger visited = 0;
             while (stack.count) {
-                if (++visited > 3000) break;
+                if (++visited > 1500) break;
                 UIView *v = stack.lastObject;
                 [stack removeLastObject];
                 if ([v isKindOfClass:[UIScrollView class]]) {
@@ -624,10 +701,9 @@ static BOOL SIO_wechatZoomPreviewActive(void) {
 }
 
 static inline BOOL SIO_blocked(void) {
-    // v1.8.12：热路径零分配。全部动画/事务 hook 都从这里过，
-    // 顺序按「最便宜、最可能命中」排列：布尔 → 布尔 → 节流后的探测结果。
-    if (!gEnabled) return YES;
-    if (gSelfBlacklisted) return YES;
+    // v1.8.12：热路径零分配。v2.1.0：前两个布尔已合并为 gBlockedFast（SIO_recalc 预计算），
+    // 顺序按「最便宜、最可能命中」排列：合并布尔 → 节流后的探测结果。
+    if (gBlockedFast) return YES;   // = !gEnabled || gSelfBlacklisted
     // v1.8.9：微信动画加速恢复（实验）——预览 bug 真凶已确认为悬浮球（v1.8.7 永久禁用），
     // 动画 hook 恢复生效；v1.8.4 放大态探测器首次真正启用作为安全网
     if (SIO_wechatZoomPreviewActive()) return YES;   // 微信预览放大态旁路（非微信时立即返回 NO）
@@ -720,9 +796,6 @@ static void   (*o_UV_transFromNoAnim)(Class, SEL, UIView *, UIView *, double,
 // UIScrollView 手感 setter 强黏（App 后续改值也会被钳回）
 static void   (*o_sv_setDecelRate)(id, SEL, CGFloat);
 static void   (*o_sv_setDelaysTouches)(id, SEL, BOOL);
-// UILongPressGestureRecognizer 长按加速
-static id     (*o_lpg_init)(id, SEL, id, id);
-static void   (*o_lpg_setMinPress)(id, SEL, NSTimeInterval);
 
 #pragma mark - CAAnimation（核心：仅基类，子类自动继承）
 
@@ -1357,10 +1430,10 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v1.8.18 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
+    NSLog(@"[SIOriginal] v2.1.7 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d override=%d listGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
-          gFastScroll, gFastTap, gFastLongPress, gLongPressDur, gInAppNotify,
+          gFastScroll, gFastTap, gInAppNotify,
           gHasAppOverride, gListHardGuarded);
     if (SIO_fbgBuiltinExcluded()) {
         NSLog(@"[SIOriginal] %@ is a built-in keep-alive exclusion: audio-assertion/scene-fake engine stays OFF", gSelfBundle);
@@ -1586,34 +1659,6 @@ static void sio_SV_setDelaysTouches(id self, SEL _cmd, BOOL b) {
     o_sv_setDelaysTouches(self, _cmd, b);
 }
 
-#pragma mark - 长按手势加速（v2.0.0 新增，默认关闭）
-
-// 系统 UILongPressGestureRecognizer 默认 minimumPressDuration = 0.5s。
-// 两个入口都接管：
-//   · initWithTarget:action: —— 手势创建后立刻压到目标值（覆盖系统默认）；
-//   · setMinimumPressDuration: —— App 自定义时长一律钳到 ≤ 目标值
-//     （App 想设 1s 也会被压短；想要更长就关闭本开关）。
-// 纯数值 setter，不改动手势状态机，风险很低。
-static void sio_LPG_setMinPress(id self, SEL _cmd, NSTimeInterval d) {
-    SIO_REQUIRE_ORIG(o_lpg_setMinPress);
-    if (!SIO_blocked() && gFastLongPress && d > gLongPressDur) d = gLongPressDur;
-    o_lpg_setMinPress(self, _cmd, d);
-}
-
-static id sio_LPG_init(id self, SEL _cmd, id target, id action) {
-    SIO_REQUIRE_ORIG_NIL(o_lpg_init);
-    id r = o_lpg_init(self, _cmd, target, action);
-    if (!SIO_blocked() && gFastLongPress) {
-        @try {
-            // 走被 hook 的 setter：与 App 自定义路径共用同一把钳制逻辑
-            o_lpg_setMinPress(self, _cmd, gLongPressDur);
-        } @catch (__unused NSException *e) {}
-    }
-    return r;
-}
-
-#pragma mark - CALayer addAnimation:forKey:（补 CAAnimation setDuration 盲区）
-
 static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
     SIO_REQUIRE_ORIG(o_layer_addAnim);
     // CAAnimation setDuration 基类 hook 已覆盖绝大多数情况，这里只兜底
@@ -1675,24 +1720,32 @@ static void SIO_installiOS16Extras(void) {
                             (IMP)sio_SV_setZoomScale, (IMP *)&o_sv_setZoomScale);
         SIO_swizzleInstance(sv, @selector(zoomToRect:animated:),
                             (IMP)sio_SV_zoomToRect, (IMP *)&o_sv_zoomToRect);
-        // v1.8.16 新增：交互手感（滑行惯性 / 点击延迟），FastScroll / FastTap 控制
-        SIO_swizzleInstance(sv, @selector(didMoveToWindow),
-                            (IMP)sio_SV_didMoveToWindow, (IMP *)&o_sv_didMoveToWindow);
-        // v2.0.0：setter 层强黏，App 后续改值也钳回
-        SIO_swizzleInstance(sv, @selector(setDecelerationRate:),
-                            (IMP)sio_SV_setDecelRate, (IMP *)&o_sv_setDecelRate);
-        SIO_swizzleInstance(sv, @selector(setDelaysContentTouches:),
-                            (IMP)sio_SV_setDelaysTouches, (IMP *)&o_sv_setDelaysTouches);
+        // v1.8.16 新增：交互手感（滑行惯性 / 点击延迟）
+        // v2.1.7：改为「按启动时开关状态安装」—— 不开就完全不挂钩子，
+        // 与 v1.8.17（已验证稳定）的引擎形态保持一致。代价：运行中把开关从关
+        // 改开需要重启目标 App 才会装上（热重载装不了新 hook）。
+        if (gFastScroll || gFastTap) {
+            SIO_swizzleInstance(sv, @selector(didMoveToWindow),
+                                (IMP)sio_SV_didMoveToWindow, (IMP *)&o_sv_didMoveToWindow);
+            // setter 层强黏，App 后续改值也钳回
+            SIO_swizzleInstance(sv, @selector(setDecelerationRate:),
+                                (IMP)sio_SV_setDecelRate, (IMP *)&o_sv_setDecelRate);
+            SIO_swizzleInstance(sv, @selector(setDelaysContentTouches:),
+                                (IMP)sio_SV_setDelaysTouches, (IMP *)&o_sv_setDelaysTouches);
+        }
     }
 
-    // v2.0.0：长按手势加速（纯数值钳制，默认关闭，由 FastLongPress 控制）
-    Class lpg = objc_getClass("UILongPressGestureRecognizer");
-    if (lpg) {
-        SIO_swizzleInstance(lpg, @selector(initWithTarget:action:),
-                            (IMP)sio_LPG_init, (IMP *)&o_lpg_init);
-        SIO_swizzleInstance(lpg, @selector(setMinimumPressDuration:),
-                            (IMP)sio_LPG_setMinPress, (IMP *)&o_lpg_setMinPress);
-    }
+    // v2.0.0：长按手势加速 —— v2.1.7 整体移除。
+    // 崩溃证据（两份独立的 .ips，两个不同 App，同一崩溃帧）：
+    //   objc_retain ← sio_LPG_init+60
+    //     WeChat:  ← -[UITabBarController _accessibilityHUDLongPressRecognizer]
+    //     Knight:  ← -[UIScrollViewKnobLongPressGestureRecognizer initWithTarget:action:]
+    // 原因：initWithTarget:action: 是 init 族方法，ARC 对它的返回值有特殊所有权约定；
+    // 用 method_setImplementation 挂钩后经普通函数指针回调原实现，编译器会在
+    // sio_LPG_init 里对返回值插入 objc_retain，而拿到的指针是坏的 → SIGSEGV。
+    // 关键教训：这个 hook 在 v2.0.x 一直被无条件安装，开关关不关都会崩，
+    // 所以 v2.0.5/v2.0.6「调默认值修闪退」从来没真正修好过。
+    // 结论：hook init 族方法这条路走不通，整个功能移除，不留假开关。
 
     if (layer) {
         SIO_swizzleInstance(layer, @selector(addAnimation:forKey:),
@@ -1700,19 +1753,15 @@ static void SIO_installiOS16Extras(void) {
     }
 }
 
-#pragma mark - FUBackground v2.0.0 Max 整合（真后台保活）
-
-static NSString *const kFBGLocalOff = @"fubg_local_off";
+#pragma mark - FUBackground v2.1.0 整合（真后台保活）
 
 // ---- 全局状态 ----
 static BOOL    gFUBGEnabled    = YES;
 static BOOL    gSceneFake  = YES;
 static BOOL    gAudioKeep  = YES;
-static BOOL    gShowBall   = YES;
 static NSArray *gExclude   = nil;
-static BOOL    gLocalOff   = NO;
 
-static BOOL    gActive    = NO;   // 本 App 最终是否参与保活（总开关∧名单∧本地开关）
+static BOOL    gActive    = NO;   // 本 App 最终是否参与保活（总开关 ∧ 排除名单）
 static BOOL    gUseScene  = NO;   // 本 App 是否启用场景伪装
 static BOOL    gUseAudio  = NO;   // 本 App 是否启用音频断言
 static BOOL    gPhysBg    = NO;   // 物理上是否处于后台（由真实生命周期通知维护）
@@ -1735,7 +1784,7 @@ static BOOL _fbg_isExcluded(void) {
 }
 
 static void _fbg_recalc(void) {
-    gActive   = gFUBGEnabled && !gLocalOff && !_fbg_isExcluded();
+    gActive   = gFUBGEnabled && !_fbg_isExcluded();
     gUseScene = gActive && gSceneFake;
     gUseAudio = gActive && gAudioKeep;
 }
@@ -1747,13 +1796,11 @@ static void _fbg_loadPref(void) {
             if (d[@"FUBGEnabled"])      gFUBGEnabled   = [d[@"FUBGEnabled"] boolValue];
             if (d[@"FUBGSceneFake"])    gSceneFake = [d[@"FUBGSceneFake"] boolValue];
             if (d[@"FUBGAudioKeep"])    gAudioKeep = [d[@"FUBGAudioKeep"] boolValue];
-            if (d[@"FUBGFloatingBall"]) gShowBall  = [d[@"FUBGFloatingBall"] boolValue];
-            // v1.8.12 隐患修复：FUBGExcludeApps 与 Blacklist 取并集。
-            // 原实现先赋 FUBGExcludeApps、紧接着被 Blacklist 无条件覆盖——只要配置里
-            // 存在 Blacklist（配置 App 默认就会写入 com.tencent.wework），排除表永久失效。
+            // v2.1.0：排除表统一由 Blacklist 提供。
+            // 原 FUBGExcludeApps 键没有任何配置界面可写，配置 App 每次保存都把它写成空数组，
+            // 等价于永久空表（死配置）；同时旧实现里「先赋 FUBGExcludeApps、
+            // 紧接着被 Blacklist 无条件覆盖」的顺序 bug 也一并消失。
             NSMutableArray *ex = [NSMutableArray array];
-            id exRaw = d[@"FUBGExcludeApps"];
-            if ([exRaw isKindOfClass:[NSArray class]]) [ex addObjectsFromArray:exRaw];
             // 复用 SIOriginal 黑名单（v1.8.6：兼容字符串格式，原来只认 NSArray 导致黑名单对 FUBG 永远无效）
             id bl = d[@"Blacklist"];
             if ([bl isKindOfClass:[NSArray class]]) {
@@ -1781,10 +1828,6 @@ static void _fbg_loadPref(void) {
         }
     } @catch (__unused NSException *e) {}
     if (!gExclude) gExclude = @[];
-    gLocalOff = [[NSUserDefaults standardUserDefaults] boolForKey:kFBGLocalOff];
-    // v1.8.10：悬浮球全局禁用，本地开关失去载体；
-    // 若旧版本误触过球，fubg_local_off=YES 永久残留导致保活永不生效，全部清零
-    gLocalOff = NO;
 
     NSArray *modes = [[NSBundle mainBundle] infoDictionary][@"UIBackgroundModes"];
     gHasAudioMode = [modes isKindOfClass:[NSArray class]] && [modes containsObject:@"audio"];
@@ -2011,287 +2054,6 @@ static void _fbg_onInterruption(NSNotification *note) {
     }
 }
 
-#pragma mark - 悬浮球
-
-@interface FBGToastView : UIView
-+ (void)showIn:(UIView *)container title:(NSString *)title subtitle:(NSString *)subtitle
-      iconName:(NSString *)iconName;
-@end
-
-@implementation FBGToastView
-+ (void)showIn:(UIView *)container title:(NSString *)title subtitle:(NSString *)subtitle
-      iconName:(NSString *)iconName {
-    FBGToastView *blur = [[self alloc] initWithFrame:CGRectMake(0, -90, container.bounds.size.width, 80)];
-    blur.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.92];
-    blur.layer.cornerRadius = 18;
-    blur.layer.masksToBounds = YES;
-
-    UIImageView *iv = [[UIImageView alloc] initWithImage:
-        [UIImage systemImageNamed:iconName]];
-    iv.tintColor = [UIColor whiteColor];
-    iv.contentMode = UIViewContentModeScaleAspectFit;
-    iv.translatesAutoresizingMaskIntoConstraints = NO;
-
-    UILabel *t = [[UILabel alloc] init];
-    t.text = title;
-    t.textColor = [UIColor whiteColor];
-    t.font = [UIFont boldSystemFontOfSize:15];
-    UILabel *s = [[UILabel alloc] init];
-    s.text = subtitle;
-    s.textColor = [UIColor colorWithWhite:0.8 alpha:1];
-    s.font = [UIFont systemFontOfSize:12];
-    UIStackView *txt = [[UIStackView alloc] initWithArrangedSubviews:@[t, s]];
-    txt.axis = UILayoutConstraintAxisVertical;
-    txt.spacing = 2;
-    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[iv, txt]];
-    row.axis = UILayoutConstraintAxisHorizontal;
-    row.alignment = UIStackViewAlignmentCenter;
-    row.spacing = 12;
-    row.translatesAutoresizingMaskIntoConstraints = NO;
-    [blur addSubview:row];
-    [NSLayoutConstraint activateConstraints:@[
-        [iv.widthAnchor constraintEqualToConstant:28], [iv.heightAnchor constraintEqualToConstant:28],
-        [row.leadingAnchor constraintEqualToAnchor:blur.leadingAnchor constant:16],
-        [row.trailingAnchor constraintEqualToAnchor:blur.trailingAnchor constant:-16],
-        [row.centerYAnchor constraintEqualToAnchor:blur.centerYAnchor],
-    ]];
-    [container addSubview:blur];
-
-    [UIView animateWithDuration:0.3 animations:^{
-        blur.transform = CGAffineTransformMakeTranslation(0, 110);
-    } completion:^(__unused BOOL f) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.4 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            [UIView animateWithDuration:0.3 animations:^{
-                blur.alpha = 0;
-                blur.transform = CGAffineTransformMakeTranslation(0, 40);
-            } completion:^(__unused BOOL f2) { [blur removeFromSuperview]; }];
-        });
-    }];
-}
-@end
-
-@interface FBGFloatingWindow : UIWindow
-@property (nonatomic, strong) UIButton *ball;
-@property (nonatomic, strong) UIView *handle;
-@property (nonatomic, assign) BOOL docked;
-@property (nonatomic, strong) NSTimer *dockTimer;
-+ (instancetype)shared;
-- (void)attachWhenSceneReady;
-- (void)refreshState;
-@end
-
-@implementation FBGFloatingWindow
-
-+ (instancetype)shared {
-    static FBGFloatingWindow *one;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ one = [[self alloc] initWithFrame:UIScreen.mainScreen.bounds]; });
-    return one;
-}
-
-- (instancetype)initWithFrame:(CGRect)frame {
-    if ((self = [super initWithFrame:frame])) {
-        self.windowLevel = UIWindowLevelAlert + 1;
-        self.backgroundColor = [UIColor clearColor];
-        self.rootViewController = [UIViewController new];
-        self.rootViewController.view.backgroundColor = [UIColor clearColor];
-
-        _ball = [UIButton buttonWithType:UIButtonTypeCustom];
-        _ball.frame = CGRectMake(self.bounds.size.width - 70, 220, 52, 52);
-        _ball.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.95];
-        _ball.layer.cornerRadius = 26;
-        _ball.layer.masksToBounds = YES;
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self
-                                                                             action:@selector(onPan:)];
-        [_ball addGestureRecognizer:pan];
-        [_ball addTarget:self action:@selector(onTap) forControlEvents:UIControlEventTouchUpInside];
-        [self.rootViewController.view addSubview:_ball];
-        [self snap];
-
-        _handle = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 14, 46)];
-        _handle.backgroundColor = [UIColor colorWithWhite:0.2 alpha:0.7];
-        _handle.layer.cornerRadius = 6;
-        _handle.hidden = YES; _handle.alpha = 0;
-        UIPanGestureRecognizer *hpan = [[UIPanGestureRecognizer alloc] initWithTarget:self
-                                                                              action:@selector(onHandlePan:)];
-        UITapGestureRecognizer *htap = [[UITapGestureRecognizer alloc] initWithTarget:self
-                                                                               action:@selector(undock)];
-        [_handle addGestureRecognizer:hpan];
-        [_handle addGestureRecognizer:htap];
-        [self.rootViewController.view addSubview:_handle];
-
-        [self refreshState];
-    }
-    return self;
-}
-
-- (void)makeKeyWindow {
-    [super makeKeyWindow];
-    // 不抢目标 App 的 keyWindow
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *kw = nil;
-        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-            if (sc.activationState == UISceneActivationStateForegroundActive &&
-                [sc isKindOfClass:[UIWindowScene class]]) {
-                for (UIWindow *w in ((UIWindowScene *)sc).windows) {
-                    if (w.isKeyWindow) { kw = w; break; }
-                }
-            }
-        }
-        if (kw && kw != self) [kw makeKeyWindow];
-    });
-}
-
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if (!_ball.hidden) {
-        CGPoint p = [self convertPoint:point toView:_ball];
-        if ([_ball pointInside:p withEvent:event]) return [super hitTest:point withEvent:event];
-    }
-    if (!_handle.hidden) {
-        CGPoint p = [self convertPoint:point toView:_handle];
-        if ([_handle pointInside:p withEvent:event]) return [super hitTest:point withEvent:event];
-    }
-    return nil;
-}
-
-- (void)attachWhenSceneReady {
-    __block int tries = 0;
-    __weak typeof(self) weakSelf = self;
-    __block void (^attempt)(void);
-    attempt = ^{
-        typeof(self) me = weakSelf;
-        if (!me) return;
-        UIWindowScene *target = nil;
-        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-            if ([sc isKindOfClass:[UIWindowScene class]]) { target = (UIWindowScene *)sc; break; }
-        }
-        if (target) {
-            me.windowScene = target;
-            me.hidden = NO;
-            [me makeKeyAndVisible];
-            [me startDockClock];
-            [me refreshState];
-        } else if (++tries < 20) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), attempt);
-        }
-    };
-    dispatch_async(dispatch_get_main_queue(), attempt);
-}
-
-- (void)refreshState {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.hidden = !gShowBall;
-        if (!gShowBall) return;
-        BOOL on = !gLocalOff && gFUBGEnabled;
-        UIImage *icon = [UIImage systemImageNamed: on ? @"hourglass" : @"powersleep"];
-        [self.ball setImage:icon forState:UIControlStateNormal];
-        self.ball.tintColor = on ? [UIColor systemBlueColor] : [UIColor systemRedColor];
-    });
-}
-
-- (void)snap {
-    CGFloat w = self.bounds.size.width;
-    CGPoint c = _ball.center;
-    c.x = c.x < w / 2 ? 26 : w - 26;
-    c.y = MAX(26, MIN(self.bounds.size.height - 26, c.y));
-    [UIView animateWithDuration:0.25 animations:^{ _ball.center = c; }];
-}
-
-- (void)onPan:(UIPanGestureRecognizer *)g {
-    [self resetDockClock];
-    CGPoint tr = [g translationInView:self];
-    g.view.center = CGPointMake(g.view.center.x + tr.x, g.view.center.y + tr.y);
-    [g setTranslation:CGPointZero inView:self];
-    if (g.state == UIGestureRecognizerStateEnded) { [self snap]; [self startDockClock]; }
-}
-
-- (void)onHandlePan:(UIPanGestureRecognizer *)g {
-    if (g.state == UIGestureRecognizerStateBegan) { [self undock]; return; }
-    CGPoint tr = [g translationInView:self];
-    _ball.center = CGPointMake(_ball.center.x + tr.x, _ball.center.y + tr.y);
-    [g setTranslation:CGPointZero inView:self];
-    if (g.state == UIGestureRecognizerStateEnded) { [self snap]; [self startDockClock]; }
-}
-
-- (void)startDockClock {
-    [_dockTimer invalidate];
-    __weak typeof(self) weakSelf = self;
-    _dockTimer = [NSTimer scheduledTimerWithTimeInterval:5.0 repeats:NO block:^(__unused NSTimer *t) {
-        [weakSelf dock];
-    }];
-}
-- (void)resetDockClock {
-    if (_docked) return;
-    [_dockTimer invalidate];
-    [self startDockClock];
-}
-
-- (void)dock {
-    if (_docked) return;
-    _docked = YES;
-    BOOL left = _ball.center.x < self.bounds.size.width / 2;
-    _handle.frame = CGRectMake(left ? 0 : self.bounds.size.width - 14,
-                               _ball.frame.origin.y + 3, 14, 46);
-    [UIView animateWithDuration:0.25 animations:^{
-        _ball.alpha = 0;
-        _ball.transform = CGAffineTransformMakeScale(0.5, 0.5);
-    } completion:^(__unused BOOL f) {
-        _ball.hidden = YES;
-        _handle.hidden = NO;
-        [UIView animateWithDuration:0.2 animations:^{ _handle.alpha = 1; }];
-    }];
-}
-
-- (void)undock {
-    if (!_docked) return;
-    _docked = NO;
-    _ball.hidden = NO;
-    BOOL left = _handle.frame.origin.x < self.bounds.size.width / 2;
-    _ball.center = CGPointMake(left ? 26 + 7 : self.bounds.size.width - 26 - 7, _handle.center.y);
-    [UIView animateWithDuration:0.25 animations:^{
-        _handle.alpha = 0;
-        _ball.alpha = 1;
-        _ball.transform = CGAffineTransformIdentity;
-    } completion:^(__unused BOOL f) {
-        _handle.hidden = YES;
-        [self startDockClock];
-    }];
-}
-
-- (void)onTap {
-    [self resetDockClock];
-    BOOL newOff = !gLocalOff;
-    [[NSUserDefaults standardUserDefaults] setBool:newOff forKey:kFBGLocalOff];
-    gLocalOff = newOff;
-    _fbg_recalc();
-    notify_post([kNotifyName UTF8String]);
-
-    UIImpactFeedbackGenerator *fb = [[UIImpactFeedbackGenerator alloc]
-        initWithStyle:UIImpactFeedbackStyleMedium];
-    [fb impactOccurred];
-
-    [self refreshState];
-    [UIView animateWithDuration:0.1 animations:^{
-        _ball.transform = CGAffineTransformMakeScale(1.2, 1.2);
-    } completion:^(__unused BOOL f) {
-        [UIView animateWithDuration:0.1 animations:^{
-            _ball.transform = CGAffineTransformIdentity;
-        }];
-    }];
-
-    NSString *appName = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleName"] ?: @"App";
-    [FBGToastView showIn:self.rootViewController.view
-                   title:appName
-                subtitle:(newOff ? @"真后台 已暂停（本 App）" : @"真后台 已开启")
-                iconName:(newOff ? @"powersleep" : @"hourglass")];
-
-    if (newOff && gPhysBg) _fbg_stopAudio(YES);
-}
-
-@end
-
 #pragma mark - 生命周期 / Darwin
 
 static void _fbg_onEnterBackground(CFNotificationCenterRef c, void *o, CFStringRef n,
@@ -2317,9 +2079,8 @@ static void _fbg_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n,
                               const void *obj, CFDictionaryRef info) {
     (void)c; (void)o; (void)n; (void)obj; (void)info;
     _fbg_loadPref();
-    NSLog(@"[FUBG] prefs reloaded: active=%d scene=%d audio=%d ball=%d override=%d",
-          gActive, gUseScene, gUseAudio, gShowBall, gHasAppOverride);
-    // v1.8.10：悬浮球全局禁用，无需刷新
+    NSLog(@"[FUBG] prefs reloaded: active=%d scene=%d audio=%d override=%d",
+          gActive, gUseScene, gUseAudio, gHasAppOverride);
     if (!gUseAudio && gPhysBg) _fbg_stopAudio(NO);
     if (gUseAudio && gPhysBg && (!gPlayer || !gPlayer.isPlaying)) _fbg_startAudio();
 }
@@ -2331,9 +2092,8 @@ static void FUBGEntry(void) {
     @autoreleasepool {
     // v1.8.12：与动画侧同样全程 @try 包裹，保活引擎装不上也不能拖垮目标 App。
     @try {
-        // v1.8.10：全 App 通用保活（场景伪装+音频断言），悬浮球全局禁用。
-        // 悬浮球是常驻全屏透明 UIWindow（alert+1 层级），会拦截触摸/抢占状态栏。
-        // 场景伪装/音频断言只在后台活跃，不影响前台 UI。
+        // v2.1.0：全 App 通用保活（场景伪装 + 音频断言），两者都只在后台活跃，
+        // 不影响前台 UI、不拦截触摸。
         _fbg_loadPref();
 
         // hook 一次性安装，内部按全局开关决定行为
@@ -2372,12 +2132,11 @@ static void FUBGEntry(void) {
                                                               block:^(NSTimer *t){ _fbg_watchdogFire(t); }];
                 [[NSRunLoop mainRunLoop] addTimer:gWatchdog forMode:NSRunLoopCommonModes];
             }
-            // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
         });
 
-        NSLog(@"[FUBG] v1.8.18 (SIOriginal v1.8.18) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.1.7 (SIOriginal v2.1.7) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
-              gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
+              gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
     } @catch (NSException *e) {
         NSLog(@"[FUBG] keep-alive install failed (app unaffected): %@", e);
