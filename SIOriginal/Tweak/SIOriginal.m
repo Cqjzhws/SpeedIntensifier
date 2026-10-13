@@ -837,13 +837,15 @@ static void   (*o_UV_transFromNoAnim)(Class, SEL, UIView *, UIView *, double,
 static void   (*o_sv_setDecelRate)(id, SEL, CGFloat);
 static void   (*o_sv_setDelaysTouches)(id, SEL, BOOL);
 
-// ---- v2.1.8 极速模式新 hook ----
+// ---- v2.1.8 极速模式新 hook（暂时注释 IMP 声明） ----
+#if 0
 static void   (*o_AIstartAnim)(id, SEL);
 static void   (*o_AIstopAnim)(id, SEL);
 static void   (*o_SVHUDDismissDelay)(id, SEL, double);
 static void   (*o_MBHUDHide)(id, SEL, BOOL);
 static void   (*o_WKsetHidden)(id, SEL, BOOL);
 static double (*o_transitionDuration)(id, SEL, id);
+#endif
 
 #pragma mark - CAAnimation（核心：仅基类，子类自动继承）
 
