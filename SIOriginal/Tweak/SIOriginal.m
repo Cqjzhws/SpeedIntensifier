@@ -240,7 +240,7 @@ static double   gTransBoost = 3.0;      // 转场独立倍率 3×
 static BOOL     gInAppNotify = YES;     // 热重载顶部提示
 
 // v2.1.8：极速模式
-static BOOL     gInstantTransition = NO;
+static BOOL     gInstantTransition = YES;   // v2.1.8 full-speed default-on
 static BOOL     gHUDFast       = YES;
 static double   gHUDDelay      = 0.15;
 static BOOL     gWKFastShow    = YES;
@@ -420,6 +420,25 @@ static BOOL SIO_feelProtected(void) {
 }
 
 // 本进程是否命中 App 覆盖 / 是否被列表硬保护（供启动日志与配置排查）
+// v2.1.8: HUD / web instant-show guard list. IM and payment apps use the
+// spinner/overlay as a flow-state signal ("paying...", "sending...") and must
+// keep their loaders untouched.
+static BOOL SIO_hudProtected(void) {
+    static NSArray *hlist = nil;
+    static dispatch_once_t honce;
+    dispatch_once(&honce, ^{
+        hlist = @[
+            @"com.tencent.xin",              // WeChat
+            @"com.tencent.mqq",              // QQ
+            @"com.apple.mobilesms",          // Messages
+            @"com.tencent.wework",           // WeCom
+            @"com.eg.android.AlipayGphone",  // Alipay
+        ];
+    });
+    NSString *bid = SIO_bundleID();
+    return bid.length && [hlist containsObject:bid];
+}
+
 static BOOL gHasAppOverride   = NO;
 static BOOL gListHardGuarded  = NO;
 
@@ -478,7 +497,7 @@ static void SIO_reload(void) {
     gInAppNotify = d[@"InAppNotify"] ? [d[@"InAppNotify"] boolValue] : YES;
 
     // v2.1.8：极速模式
-    gInstantTransition = d[@"InstantTransition"] ? [d[@"InstantTransition"] boolValue] : NO;
+    gInstantTransition = d[@"InstantTransition"] ? [d[@"InstantTransition"] boolValue] : YES;
     gHUDFast           = d[@"HUDFast"]           ? [d[@"HUDFast"]           boolValue] : YES;
     double hd = d[@"HUDDelay"] ? [d[@"HUDDelay"] doubleValue] : 0.15;
     gHUDDelay          = (hd >= 0.02 && hd <= 1.0) ? hd : 0.15;
@@ -836,6 +855,13 @@ static void   (*o_UV_transFromNoAnim)(Class, SEL, UIView *, UIView *, double,
 // UIScrollView 手感 setter 强黏（App 后续改值也会被钳回）
 static void   (*o_sv_setDecelRate)(id, SEL, CGFloat);
 static void   (*o_sv_setDelaysTouches)(id, SEL, BOOL);
+
+// ---- v2.1.8 instant page/link open ----
+static void   (*o_AIstartAnim)(id, SEL);                                // UIActivityIndicatorView
+static void   (*o_AIstopAnim)(id, SEL);
+static void   (*o_WKsetHidden)(id, SEL, BOOL);                          // WKWebView setHidden:
+static void   (*o_SVHUDDelay)(id, SEL, NSTimeInterval, void (^)(void)); // +SVProgressHUD dismissWithDelay:completion:
+static void   (*o_MBHUDHide)(id, SEL, BOOL);                            // -MBProgressHUD hideAnimated:
 
 #pragma mark - CAAnimation（核心：仅基类，子类自动继承）
 
@@ -1321,6 +1347,66 @@ static void sio_cv_deselectItem(id self, SEL _cmd, NSIndexPath *ip, BOOL anim) {
     SIO_listWrap(^{ o_cv_deselectItem(self, _cmd, ip, anim); });
 }
 
+#pragma mark - v2.1.8 instant page/link open
+
+// UIActivityIndicatorView: defer startAnimating by HUDDelay. If stopAnimating
+// arrives within that window (the vast majority of short requests), the spinner
+// is cancelled before it ever appears - kills the "flash of loader" entirely.
+static const void *kSIOAIDelayMark = &kSIOAIDelayMark;
+
+static void sio_AIstartAnim(id self, SEL _cmd) {
+    SIO_REQUIRE_ORIG(o_AIstartAnim);
+    if (SIO_blocked() || !gHUDFast || SIO_hudProtected()) { o_AIstartAnim(self, _cmd); return; }
+    objc_setAssociatedObject(self, kSIOAIDelayMark, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak id wself = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gHUDDelay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        id s = wself;
+        if (!s || !objc_getAssociatedObject(s, kSIOAIDelayMark)) return;
+        objc_setAssociatedObject(s, kSIOAIDelayMark, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        o_AIstartAnim(s, _cmd);
+    });
+}
+
+static void sio_AIstopAnim(id self, SEL _cmd) {
+    SIO_REQUIRE_ORIG(o_AIstopAnim);
+    // Always cancel any pending deferred start, then stop immediately.
+    objc_setAssociatedObject(self, kSIOAIDelayMark, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    o_AIstopAnim(self, _cmd);
+}
+
+// WKWebView setHidden: while load progress >10%, refuse to hide. Stops apps from
+// covering a web view that is already rendering (the classic white-screen wait).
+// dylib does not link WebKit.framework, so read properties via objc_msgSend and
+// never reference any WK* type symbol directly.
+static void sio_WKsetHidden(id self, SEL _cmd, BOOL hidden) {
+    SIO_REQUIRE_ORIG(o_WKsetHidden);
+    if (hidden && !SIO_blocked() && gWKFastShow && !SIO_hudProtected()) {
+        BOOL loading = ((BOOL (*)(id, SEL))objc_msgSend)(self, @selector(isLoading));
+        if (loading) {
+            double progress = ((double (*)(id, SEL))objc_msgSend)(self, @selector(estimatedProgress));
+            if (progress > 0.1) return;   // keep visible; once loaded, normal hide works
+        }
+    }
+    o_WKsetHidden(self, _cmd, hidden);
+}
+
+// SVProgressHUD class method +dismissWithDelay:completion: force near-zero delay.
+static void sio_SVHUDDelay(id self, SEL _cmd, NSTimeInterval delay, void (^completion)(void)) {
+    SIO_REQUIRE_ORIG(o_SVHUDDelay);
+    if (SIO_blocked() || !gHUDFast || SIO_hudProtected()) {
+        o_SVHUDDelay(self, _cmd, delay, completion); return;
+    }
+    o_SVHUDDelay(self, _cmd, 0.001, completion);
+}
+
+// MBProgressHUD instance method -hideAnimated: drop the hide animation.
+static void sio_MBHUDHide(id self, SEL _cmd, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_MBHUDHide);
+    if (SIO_blocked() || !gHUDFast || SIO_hudProtected()) { o_MBHUDHide(self, _cmd, animated); return; }
+    o_MBHUDHide(self, _cmd, NO);
+}
+
 #pragma mark - 安装
 
 __attribute__((constructor))
@@ -1479,16 +1565,38 @@ static void SIOriginalInit(void) {
                             (IMP)sio_cv_deselectItem, (IMP *)&o_cv_deselectItem);
     }
 
+    // ---- v2.1.8 instant-open hooks (probe classes; skip silently if absent) ----
+    {
+        Class ai = objc_getClass("UIActivityIndicatorView");
+        if (ai) {
+            SIO_swizzleInstance(ai, @selector(startAnimating), (IMP)sio_AIstartAnim, (IMP *)&o_AIstartAnim);
+            SIO_swizzleInstance(ai, @selector(stopAnimating),  (IMP)sio_AIstopAnim,  (IMP *)&o_AIstopAnim);
+        }
+        Class wk = objc_getClass("WKWebView");
+        if (wk) {
+            SIO_swizzleInstance(wk, @selector(setHidden:), (IMP)sio_WKsetHidden, (IMP *)&o_WKsetHidden);
+        }
+        Class svh = objc_getClass("SVProgressHUD");
+        if (svh && class_getClassMethod(svh, @selector(dismissWithDelay:completion:))) {
+            SIO_swizzleClass(svh, @selector(dismissWithDelay:completion:), (IMP)sio_SVHUDDelay, (IMP *)&o_SVHUDDelay);
+        }
+        Class mbh = objc_getClass("MBProgressHUD");
+        if (mbh && class_getInstanceMethod(mbh, @selector(hideAnimated:))) {
+            SIO_swizzleInstance(mbh, @selector(hideAnimated:), (IMP)sio_MBHUDHide, (IMP *)&o_MBHUDHide);
+        }
+    }
+
     // iOS 16 优化增强：UIViewPropertyAnimator + UIScrollView + CALayer
     SIO_installiOS16Extras();
 
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.1.7 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d override=%d listGuard=%d)",
+    NSLog(@"[SIOriginal] v2.1.8 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
+          gInstantTransition, gHUDFast, gHUDDelay, gWKFastShow,
           gHasAppOverride, gListHardGuarded);
     if (SIO_fbgBuiltinExcluded()) {
         NSLog(@"[SIOriginal] %@ is a built-in keep-alive exclusion: audio-assertion/scene-fake engine stays OFF", gSelfBundle);
