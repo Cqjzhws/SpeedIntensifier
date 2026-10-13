@@ -162,12 +162,6 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"TransitionBoost"])  d[@"TransitionBoost"]  = @2.0;   // 转场再 ×2
     // v2.1.2：FastLongPress / LongPressDuration 已随长按 hook 一并移除
     if (!d[@"InAppNotify"])      d[@"InAppNotify"]      = @YES;
-    // v2.1.8：极速模式 5 键（与 dylib SIO_reload 严格一致）
-    if (!d[@"InstantTransition"]) d[@"InstantTransition"] = @NO;    // 默认关
-    if (!d[@"HUDFast"])           d[@"HUDFast"]           = @YES;    // 默认开
-    if (!d[@"HUDDelay"])          d[@"HUDDelay"]          = @0.15;   // 150ms 阈值
-    if (!d[@"WKFastShow"])        d[@"WKFastShow"]        = @YES;    // 默认开
-    if (!d[@"CustomTransFast"])   d[@"CustomTransFast"]   = @NO;    // 默认关
     if (!d[@"Blacklist"])  d[@"Blacklist"]  = @[ @"com.tencent.wework" ];
     if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
@@ -188,7 +182,6 @@ static NSArray *SIOConfigKeys(void) {
                   @"FastScroll", @"FastTap", @"LayerBoost",
                   @"FloorDuration", @"TransitionBoost",
                   @"InAppNotify",
-                  @"InstantTransition", @"HUDFast", @"HUDDelay", @"WKFastShow", @"CustomTransFast",
                   @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
                   @"AppOverrides" ];
     });
@@ -420,20 +413,17 @@ static UIView *SIORow(NSString *title, UIView *ctrl, UIColor *titleColor) {
 
 static UIView *SIOCard(NSArray<UIView *> *items, CGFloat spacing) {
     UIView *card = [[UIView alloc] init];
-    // v2.1.8：毛玻璃质感卡片背景，自动适配深色/浅色模式
-    if (@available(iOS 13, *)) {
-        card.backgroundColor = [UIColor tertiarySystemGroupedBackgroundColor];
-    } else {
-        card.backgroundColor = [UIColor colorWithWhite:1 alpha:0.92];
-    }
-    card.layer.cornerRadius = 20;
+    card.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    card.layer.cornerRadius = 18;
+    // v2.1.0：淡描边 + 柔和阴影，卡片在浅色/深色背景下都能立住轮廓。
+    // 这里不设 masksToBounds —— stack 有 16pt 内边距，子视图不会溢出圆角，
+    // 关掉裁剪才能让阴影显示出来。
     card.layer.borderWidth = 0.5;
-    card.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.25].CGColor;
-    // v2.1.8：更明显的阴影（双层：近处清晰 + 远处柔和光晕）
+    card.layer.borderColor = [UIColor separatorColor].CGColor;
     card.layer.shadowColor = [UIColor blackColor].CGColor;
-    card.layer.shadowOpacity = 0.08;
-    card.layer.shadowRadius = 16;
-    card.layer.shadowOffset = CGSizeMake(0, 4);
+    card.layer.shadowOpacity = 0.06;
+    card.layer.shadowRadius = 10;
+    card.layer.shadowOffset = CGSizeMake(0, 3);
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:items];
     st.axis = UILayoutConstraintAxisVertical;
     st.spacing = spacing;
@@ -461,15 +451,15 @@ static UIButton *SIOPill(NSString *title, UIColor *bg, UIColor *fg) {
     return b;
 }
 
-// v2.1.8：预设大按钮 —— 圆角更大 + 高度更高，触感更饱满
+// v2.1.0：预设大按钮 —— 图标在上、文字在下，比原来的小胶囊好按也好认
 static UIButton *SIOPresetButton(NSString *emoji, NSString *title, UIColor *tint) {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     b.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-    b.layer.cornerRadius = 16;
+    b.layer.cornerRadius = 14;
     b.layer.borderWidth = 1.5;
     b.layer.borderColor = tint.CGColor;
 
-    UILabel *e = SIOLabel(emoji, 24, tint);
+    UILabel *e = SIOLabel(emoji, 22, tint);
     e.textAlignment = NSTextAlignmentCenter;
     UILabel *t = SIOLabel(title, 13, [UIColor labelColor]);
     t.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
@@ -487,7 +477,7 @@ static UIButton *SIOPresetButton(NSString *emoji, NSString *title, UIColor *tint
         [st.leadingAnchor constraintEqualToAnchor:b.leadingAnchor constant:4],
         [st.trailingAnchor constraintEqualToAnchor:b.trailingAnchor constant:-4],
     ]];
-    [b.heightAnchor constraintEqualToConstant:72].active = YES;
+    [b.heightAnchor constraintEqualToConstant:66].active = YES;
     return b;
 }
 
@@ -509,32 +499,19 @@ static UILabel *SIOSectionTitle(NSString *t) {
 @implementation SIOGradientHeader
 - (instancetype)initWithFrame:(CGRect)frame {
     if ((self = [super initWithFrame:frame])) {
-        self.layer.cornerRadius = 24;
+        self.layer.cornerRadius = 22;
         self.layer.masksToBounds = YES;
         _grad = [CAGradientLayer layer];
-        // v2.1.8：深空蓝紫渐变（群青 → 品红 → 金橙），更有速度感
+        // v2.1.0：三档渐变（祖母绿 → 孔雀蓝 → 深夜蓝），比原来的两段更有层次
         _grad.colors = @[
-            (id)[UIColor colorWithRed:0.12 green:0.10 blue:0.42 alpha:1.0].CGColor,  // 深群青
-            (id)[UIColor colorWithRed:0.55 green:0.18 blue:0.55 alpha:1.0].CGColor,  // 品红紫
-            (id)[UIColor colorWithRed:0.92 green:0.42 blue:0.18 alpha:1.0].CGColor,  // 金橙
+            (id)[UIColor colorWithRed:0.06 green:0.62 blue:0.47 alpha:1.0].CGColor,
+            (id)[UIColor colorWithRed:0.05 green:0.36 blue:0.52 alpha:1.0].CGColor,
+            (id)[UIColor colorWithRed:0.03 green:0.09 blue:0.20 alpha:1.0].CGColor,
         ];
         _grad.locations = @[ @0.0, @0.55, @1.0 ];
         _grad.startPoint = CGPointMake(0, 0);
         _grad.endPoint = CGPointMake(1, 1);
         [self.layer insertSublayer:_grad atIndex:0];
-
-        // v2.1.8：顶部金属高光条，让头部更立体
-        UIView *shine = [[UIView alloc] init];
-        shine.translatesAutoresizingMaskIntoConstraints = NO;
-        shine.backgroundColor = [UIColor colorWithWhite:1 alpha:0.12];
-        shine.layer.cornerRadius = 1;
-        [self addSubview:shine];
-        [NSLayoutConstraint activateConstraints:@[
-            [shine.topAnchor constraintEqualToAnchor:self.topAnchor constant:10],
-            [shine.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:20],
-            [shine.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-20],
-            [shine.heightAnchor constraintEqualToConstant:1.2],
-        ]];
 
         // 右上角版本徽章
         UILabel *badge = SIOLabel(SIO_VERSION, 11, [UIColor whiteColor]);
@@ -649,9 +626,6 @@ static UILabel *SIOSectionTitle(NSString *t) {
 // 手感页
 @property (strong) UISwitch *swList, *swZoom, *swFastScroll, *swFastTap;
 @property (strong) UISwitch *swNotify;
-// v2.1.8：极速模式
-@property (strong) UISwitch *swInstTr, *swHUDFast, *swWKFast, *swCustTrans;
-@property (strong) UISegmentedControl *segHUDDelay;
 // 系统页
 @property (strong) UISwitch *swRM, *swCF, *swRT;
 @property (strong) UISegmentedControl *segDrag;
@@ -699,15 +673,6 @@ static UILabel *SIOSectionTitle(NSString *t) {
     self.swFastScroll.on = [c[@"FastScroll"] boolValue];
     self.swFastTap.on = [c[@"FastTap"] boolValue];
     self.swNotify.on = [c[@"InAppNotify"] boolValue];
-    // v2.1.8：极速模式
-    self.swInstTr.on     = [c[@"InstantTransition"] boolValue];
-    self.swHUDFast.on    = [c[@"HUDFast"]           boolValue];
-    self.swWKFast.on     = [c[@"WKFastShow"]        boolValue];
-    self.swCustTrans.on  = [c[@"CustomTransFast"]   boolValue];
-    double hd = [c[@"HUDDelay"] doubleValue];
-    NSArray *hdIdx = @[@0.05, @0.10, @0.15, @0.25, @0.50];
-    int hi = 2; for (int i = 0; i < hdIdx.count; i++) if (fabs(hd - [hdIdx[i] doubleValue]) < 0.01) hi = i;
-    self.segHUDDelay.selectedSegmentIndex = hi;
     self.blacklist.text = [c[@"Blacklist"] componentsJoinedByString:@"\n"];
 
     self.swRM.on = ReadAx(@"ReduceMotionEnabled");
@@ -850,13 +815,6 @@ static UILabel *SIOSectionTitle(NSString *t) {
     cfg[@"FloorDuration"] = @(FloorForIndex((int)self.segFloor.selectedSegmentIndex));
     cfg[@"TransitionBoost"] = @(TransForIndex((int)self.segTrans.selectedSegmentIndex));
     cfg[@"InAppNotify"] = @(self.swNotify.on);
-    // v2.1.8：极速模式
-    cfg[@"InstantTransition"] = @(self.swInstTr.on);
-    cfg[@"HUDFast"]           = @(self.swHUDFast.on);
-    cfg[@"WKFastShow"]        = @(self.swWKFast.on);
-    cfg[@"CustomTransFast"]   = @(self.swCustTrans.on);
-    double hd = (@[@0.05, @0.10, @0.15, @0.25, @0.50][(int)self.segHUDDelay.selectedSegmentIndex] ?: @0.15) doubleValue];
-    cfg[@"HUDDelay"] = @(hd);
     cfg[@"Blacklist"] = [self blacklistFromView];
 
     cfg[@"FUBGEnabled"] = @(self.swFUBG.on);
@@ -1052,11 +1010,6 @@ static UILabel *SIOSectionTitle(NSString *t) {
     if ([k isEqualToString:@"FastScroll"]) return self.swFastScroll;
     if ([k isEqualToString:@"FastTap"]) return self.swFastTap;
     if ([k isEqualToString:@"InAppNotify"]) return self.swNotify;
-    // v2.1.8：极速模式
-    if ([k isEqualToString:@"InstantTransition"]) return self.swInstTr;
-    if ([k isEqualToString:@"HUDFast"])           return self.swHUDFast;
-    if ([k isEqualToString:@"WKFastShow"])        return self.swWKFast;
-    if ([k isEqualToString:@"CustomTransFast"])   return self.swCustTrans;
     if ([k isEqualToString:@"FUBGEnabled"]) return self.swFUBG;
     if ([k isEqualToString:@"FUBGSceneFake"]) return self.swFUBGScene;
     if ([k isEqualToString:@"FUBGAudioKeep"]) return self.swFUBGAudio;
@@ -1373,28 +1326,6 @@ static UILabel *SIOSectionTitle(NSString *t) {
         "把这两项从关改开后，需要杀掉目标 App 重开才会生效；从开改关则热重载立即生效。",
         12, [UIColor secondaryLabelColor]);
     [self.stack addArrangedSubview:feelNote];
-
-    // ---- v2.1.8：极速模式 ----
-    self.swInstTr   = [[UISwitch alloc] init];
-    self.swHUDFast  = [[UISwitch alloc] init];
-    self.swWKFast   = [[UISwitch alloc] init];
-    self.swCustTrans = [[UISwitch alloc] init];
-    self.segHUDDelay = [[UISegmentedControl alloc] initWithItems:@[@"50ms", @"100ms", @"150ms", @"250ms", @"500ms"]];
-    self.segHUDDelay.selectedSegmentIndex = 2;
-
-    [self.stack addArrangedSubview:SIOSectionTitle(@"链接/页面打开 · 全速优化")];
-    [self.stack addArrangedSubview:SIOCard(@[
-        SIORowSub(@"转场瞬切", @"push/present/pop 一律 0.001s，快到看不见过渡", self.swInstTr),
-        SIORowSub(@"Loading HUD 消除", @"UIActivityIndicatorView 等刚要显示就被取消，目标 App 重开生效", self.swHUDFast),
-        SIORowSub(@"HUD 取消阈值", @"show 后多少 ms 内 stop 就取消（越小越激进）", self.segHUDDelay),
-        SIORowSub(@"WKWebView 极速显示", @"加载中拒绝隐藏 webView，网络返回立即渲染", self.swWKFast),
-        SIORowSub(@"自定义转场加速", @"加速 App 自定义的 UIViewControllerAnimatedTransitioning（默认关，风险高）", self.swCustTrans),
-    ], 14)];
-
-    UILabel *speedNote = SIOLabel(
-        @"保护名单：微信/QQ/企业微信/支付宝的 Loading HUD 永不消除——这些 App 的 HUD 是「支付中/发送中」的流程守卫。",
-        12, [UIColor systemOrangeColor]);
-    [self.stack addArrangedSubview:speedNote];
 
     UILabel *warn = SIOLabel(
         @"⚠️ 硬保护名单：顺丰同城骑士 com.sfic.knight、桌面进程 com.apple.springboard —— 列表加速恒为关闭，任何配置都打不开（SpringBoard 打开会黑屏/白苹果）。淘宝/京东等重列表 App 也建议保持关闭。",
