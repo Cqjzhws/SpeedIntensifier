@@ -1330,6 +1330,7 @@ static void sio_cv_deselectItem(id self, SEL _cmd, NSIndexPath *ip, BOOL anim) {
     SIO_listWrap(^{ o_cv_deselectItem(self, _cmd, ip, anim); });
 }
 
+#if 0  // v2.1.8 hook 函数体暂时注释，定位编译错误
 #pragma mark - v2.1.8 极速模式：HUD 消除 + WKWebView
 
 // ---- 黑名单：HUD hook 对流程守卫型 App 跳过 ----
@@ -1398,7 +1399,7 @@ static void sio_WKsetHidden(id self, SEL _cmd, BOOL hidden) {
         }
     }
     o_WKsetHidden(self, _cmd, hidden);
-}
+#endif  // 0  // v2.1.8 hook 函数体暂时注释
 
 #pragma mark - 安装
 
