@@ -1379,8 +1379,15 @@ static void sio_AIstopAnim(id self, SEL _cmd) {
 // covering a web view that is already rendering (the classic white-screen wait).
 // dylib does not link WebKit.framework, so read properties via objc_msgSend and
 // never reference any WK* type symbol directly.
+static Class sio_WKClass(void) {
+    static Class c; static dispatch_once_t tok;
+    dispatch_once(&tok, ^{ c = objc_getClass("WKWebView"); });
+    return c;
+}
 static void sio_WKsetHidden(id self, SEL _cmd, BOOL hidden) {
     SIO_REQUIRE_ORIG(o_WKsetHidden);
+    Class wkc = sio_WKClass();
+    if (!wkc || ![self isKindOfClass:wkc]) { o_WKsetHidden(self, _cmd, hidden); return; }
     if (hidden && !SIO_blocked() && gWKFastShow && !SIO_hudProtected()) {
         BOOL loading = ((BOOL (*)(id, SEL))objc_msgSend)(self, @selector(isLoading));
         if (loading) {
@@ -1574,7 +1581,23 @@ static void SIOriginalInit(void) {
         }
         Class wk = objc_getClass("WKWebView");
         if (wk) {
-            SIO_swizzleInstance(wk, @selector(setHidden:), (IMP)sio_WKsetHidden, (IMP *)&o_WKsetHidden);
+            // setHidden: is inherited from UIView. A plain method_setImplementation
+            // would rewrite the shared UIView IMP and hook EVERY view (then isLoading
+            // crashes non-web views). Copy the parent IMP onto WKWebView first, then
+            // override only that subclass copy.
+            SEL wkSel = @selector(setHidden:);
+            Method wkM = class_getInstanceMethod(wk, wkSel);
+            if (wkM) {
+                IMP parentImp = method_getImplementation(wkM);
+                if (class_addMethod(wk, wkSel, parentImp, method_getTypeEncoding(wkM))) {
+                    Method ownM = class_getInstanceMethod(wk, wkSel);
+                    o_WKsetHidden = (void (*)(id, SEL, BOOL))method_getImplementation(ownM);
+                    method_setImplementation(ownM, (IMP)sio_WKsetHidden);
+                } else {
+                    // WKWebView already provides its own setHidden: - direct swizzle is safe.
+                    SIO_swizzleInstance(wk, wkSel, (IMP)sio_WKsetHidden, (IMP *)&o_WKsetHidden);
+                }
+            }
         }
         Class svh = objc_getClass("SVProgressHUD");
         if (svh && class_getClassMethod(svh, @selector(dismissWithDelay:completion:))) {
