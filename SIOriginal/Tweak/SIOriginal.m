@@ -226,27 +226,25 @@
 // 本版回退，且不再作为缺省值；开关保留，用户可在配置 App 里手动打开自担风险。
 static BOOL     gEnabled   = YES;
 static int      gMode      = 0;      // 0=加速 1=慢放 2=瞬切
-static double   gSpeed     = 15.0;   // 加速倍率（时长 ÷ 倍率）—— 纯时长缩放，历史无闪退记录
-static double   gSlowFactor = 2.0;   // 慢放倍率（时长 × 因子）
+static double   gSpeed     = 40.0;   // 全速加速：40×
+static double   gSlowFactor = 2.0;   // 慢放倍率
 static BOOL     gSpring    = YES;    // CASpring 参数缩放
 static BOOL     gExtra     = YES;    // 导航/模态进阶转场
-static BOOL     gListAccel = YES;    // TV/CV 列表全家桶，v2.1.7 默认开（硬保护名单仍恒关）
-static BOOL     gZoomAccel = YES;    // UIScrollView 缩放动画，v2.1.7 默认开
-static BOOL     gFastScroll = YES;   // v2.1.7 默认开（hook 按需安装，见 SIO_installiOS16Extras）
-static BOOL     gFastTap = YES;      // v2.1.7 默认开
-static double   gLayerBoost = 3.0;   // 显式动画（CAAnimation/CALayer）额外倍率
-static double   gFloorDuration = 0.01;  // 动画时长安全下限，允许 0.005–0.1
-static double   gTransBoost = 2.0;      // 进阶转场独立额外倍率
-static BOOL     gInAppNotify = YES;     // 配置热重载时在目标 App 内弹顶部提示，默认开
+static BOOL     gListAccel = YES;    // TV/CV 列表全家桶
+static BOOL     gZoomAccel = YES;    // UIScrollView 缩放动画
+static BOOL     gFastScroll = YES;   // 滑行惯性加急
+static BOOL     gFastTap = YES;      // 点击零延迟
+static double   gLayerBoost = 5.0;   // 显式动画额外倍率（转圈/旋转单独加速 5×）
+static double   gFloorDuration = 0.005;  // 极限下限 5ms（全速档不撞 UIKit 最小阈值）
+static double   gTransBoost = 3.0;      // 转场独立倍率 3×
+static BOOL     gInAppNotify = YES;     // 热重载顶部提示
 
-// ---------- v2.1.0：热路径派生量（在 SIO_recalc 里一次性算好） ----------
-// 每次时长换算都要做「除法 + 下限范围判断」，而这是所有 hook 的最内层。
-// 改成 reload 时预计算倒数（乘法）与已校验过的下限，热路径省掉 1 次除法 + 1 次范围比较。
-static double   gInvSpeed    = 1.0 / 15.0;      // 加速模式：1 / gSpeed（gSpeed<=1 时置 1.0）
-static double   gInvLayer    = 1.0 / (15.0 * 3.0); // 显式动画路径叠乘：1 / gLayerBoost
-static double   gFloorCached = 0.01;            // 已通过合法性校验的下限
-static BOOL     gBlockedFast = NO;              // !gEnabled || gSelfBlacklisted（SIO_blocked 第一道）
-static BOOL     gIsWeChat  = NO;     // 微信缩放预览守卫用（L104）
+// ---------- 热路径派生量 ----------
+static double   gInvSpeed    = 1.0 / 40.0;
+static double   gInvLayer    = 1.0 / 5.0;
+static double   gFloorCached = 0.005;
+static BOOL     gBlockedFast = NO;
+static BOOL     gIsWeChat  = NO;
 // v1.8.12：黑名单在重载时一次性解析成本进程布尔值，热路径零分配（见 SIO_reload）
 static BOOL     gSelfBlacklisted = NO;
 static NSString *gSelfBundle = nil;
@@ -820,17 +818,16 @@ static void   (*o_sv_setDelaysTouches)(id, SEL, BOOL);
 static void sio_CAAnim_setDuration(id self, SEL _cmd, double d) {
     SIO_REQUIRE_ORIG(o_CAAnim_setDuration);
     if (SIO_blocked()) { o_CAAnim_setDuration(self, _cmd, d); return; }
-    // v2.1.7 fix：CAKeyframeAnimation（含高德 MAMapKeyFrameAnimation）按时序播放多帧，
-    // 压到 FloorDuration（0.01s）会丢帧导致地图黑屏。改为用更高下限 0.1s 加速，
-    // 既保持加速效果又保证每帧都有足够时间渲染。
+    // v2.1.7 fix + v2.1.8 opt：CAKeyframeAnimation 用 0.05s 下限加速。
+    // 比普通动画的 0.005s 慢（保证渲染），但比地图黑屏修复时的 0.1s 快一倍。
     if ([self isKindOfClass:[CAKeyframeAnimation class]]) {
         double target;
         switch (gMode) {
             case 1:  target = d * gSlowFactor; break;
-            case 2:  target = 0.1;             break;  // 瞬切对 keyframe 用 0.1s 保证渲染
-            default: target = (gSpeed > 1.0001) ? (d / gSpeed) : d;
+            case 2:  target = 0.08;            break;  // 瞬切：地图 80ms 闪一下也比 100ms 快
+            default: target = (gSpeed > 1.0001) ? (d * gInvSpeed) : d;
         }
-        if (target < 0.1) target = 0.1;     // keyframe 专用下限：0.1s 足够渲染
+        if (target < 0.05) target = 0.05;     // keyframe 下限 50ms
         o_CAAnim_setDuration(self, _cmd, target);
         SIO_markAnimScaled(self);
         return;
@@ -1710,13 +1707,13 @@ static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
                 SIO_markAnimScaled(anim);
                 double newDur;
                 if ([anim isKindOfClass:[CAKeyframeAnimation class]]) {
-                    // v2.1.7 fix：CAKeyframeAnimation 用 0.1s 下限加速（不丢帧）
+                    // v2.1.8 opt：CAKeyframeAnimation 用 0.05s 下限
                     switch (gMode) {
                         case 1:  newDur = origDur * gSlowFactor; break;
-                        case 2:  newDur = 0.1;                    break;
-                        default: newDur = (gSpeed > 1.0001) ? (origDur / gSpeed) : origDur;
+                        case 2:  newDur = 0.08;                   break;
+                        default: newDur = (gSpeed > 1.0001) ? (origDur * gInvSpeed) : origDur;
                     }
-                    if (newDur < 0.1) newDur = 0.1;
+                    if (newDur < 0.05) newDur = 0.05;
                 } else {
                     // v1.8.17：与 setDuration: 路径共用同一套换算（含 LayerBoost）
                     newDur = SIO_targetDurationLayer(origDur);
