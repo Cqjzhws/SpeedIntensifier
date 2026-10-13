@@ -162,6 +162,12 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"TransitionBoost"])  d[@"TransitionBoost"]  = @2.0;   // 转场再 ×2
     // v2.1.2：FastLongPress / LongPressDuration 已随长按 hook 一并移除
     if (!d[@"InAppNotify"])      d[@"InAppNotify"]      = @YES;
+    // v2.1.8：极速模式 5 键（与 dylib SIO_reload 严格一致）
+    if (!d[@"InstantTransition"]) d[@"InstantTransition"] = @NO;    // 默认关
+    if (!d[@"HUDFast"])           d[@"HUDFast"]           = @YES;    // 默认开
+    if (!d[@"HUDDelay"])          d[@"HUDDelay"]          = @0.15;   // 150ms 阈值
+    if (!d[@"WKFastShow"])        d[@"WKFastShow"]        = @YES;    // 默认开
+    if (!d[@"CustomTransFast"])   d[@"CustomTransFast"]   = @NO;    // 默认关
     if (!d[@"Blacklist"])  d[@"Blacklist"]  = @[ @"com.tencent.wework" ];
     if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
@@ -182,6 +188,7 @@ static NSArray *SIOConfigKeys(void) {
                   @"FastScroll", @"FastTap", @"LayerBoost",
                   @"FloorDuration", @"TransitionBoost",
                   @"InAppNotify",
+                  @"InstantTransition", @"HUDFast", @"HUDDelay", @"WKFastShow", @"CustomTransFast",
                   @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
                   @"AppOverrides" ];
     });
@@ -642,6 +649,9 @@ static UILabel *SIOSectionTitle(NSString *t) {
 // 手感页
 @property (strong) UISwitch *swList, *swZoom, *swFastScroll, *swFastTap;
 @property (strong) UISwitch *swNotify;
+// v2.1.8：极速模式
+@property (strong) UISwitch *swInstTr, *swHUDFast, *swWKFast, *swCustTrans;
+@property (strong) UISegmentedControl *segHUDDelay;
 // 系统页
 @property (strong) UISwitch *swRM, *swCF, *swRT;
 @property (strong) UISegmentedControl *segDrag;
@@ -689,6 +699,15 @@ static UILabel *SIOSectionTitle(NSString *t) {
     self.swFastScroll.on = [c[@"FastScroll"] boolValue];
     self.swFastTap.on = [c[@"FastTap"] boolValue];
     self.swNotify.on = [c[@"InAppNotify"] boolValue];
+    // v2.1.8：极速模式
+    self.swInstTr.on     = [c[@"InstantTransition"] boolValue];
+    self.swHUDFast.on    = [c[@"HUDFast"]           boolValue];
+    self.swWKFast.on     = [c[@"WKFastShow"]        boolValue];
+    self.swCustTrans.on  = [c[@"CustomTransFast"]   boolValue];
+    double hd = [c[@"HUDDelay"] doubleValue];
+    NSArray *hdIdx = @[@0.05, @0.10, @0.15, @0.25, @0.50];
+    int hi = 2; for (int i = 0; i < hdIdx.count; i++) if (fabs(hd - [hdIdx[i] doubleValue]) < 0.01) hi = i;
+    self.segHUDDelay.selectedSegmentIndex = hi;
     self.blacklist.text = [c[@"Blacklist"] componentsJoinedByString:@"\n"];
 
     self.swRM.on = ReadAx(@"ReduceMotionEnabled");
@@ -831,6 +850,13 @@ static UILabel *SIOSectionTitle(NSString *t) {
     cfg[@"FloorDuration"] = @(FloorForIndex((int)self.segFloor.selectedSegmentIndex));
     cfg[@"TransitionBoost"] = @(TransForIndex((int)self.segTrans.selectedSegmentIndex));
     cfg[@"InAppNotify"] = @(self.swNotify.on);
+    // v2.1.8：极速模式
+    cfg[@"InstantTransition"] = @(self.swInstTr.on);
+    cfg[@"HUDFast"]           = @(self.swHUDFast.on);
+    cfg[@"WKFastShow"]        = @(self.swWKFast.on);
+    cfg[@"CustomTransFast"]   = @(self.swCustTrans.on);
+    double hd = (@[@0.05, @0.10, @0.15, @0.25, @0.50][(int)self.segHUDDelay.selectedSegmentIndex] ?: @0.15) doubleValue];
+    cfg[@"HUDDelay"] = @(hd);
     cfg[@"Blacklist"] = [self blacklistFromView];
 
     cfg[@"FUBGEnabled"] = @(self.swFUBG.on);
@@ -1026,6 +1052,11 @@ static UILabel *SIOSectionTitle(NSString *t) {
     if ([k isEqualToString:@"FastScroll"]) return self.swFastScroll;
     if ([k isEqualToString:@"FastTap"]) return self.swFastTap;
     if ([k isEqualToString:@"InAppNotify"]) return self.swNotify;
+    // v2.1.8：极速模式
+    if ([k isEqualToString:@"InstantTransition"]) return self.swInstTr;
+    if ([k isEqualToString:@"HUDFast"])           return self.swHUDFast;
+    if ([k isEqualToString:@"WKFastShow"])        return self.swWKFast;
+    if ([k isEqualToString:@"CustomTransFast"])   return self.swCustTrans;
     if ([k isEqualToString:@"FUBGEnabled"]) return self.swFUBG;
     if ([k isEqualToString:@"FUBGSceneFake"]) return self.swFUBGScene;
     if ([k isEqualToString:@"FUBGAudioKeep"]) return self.swFUBGAudio;
@@ -1342,6 +1373,28 @@ static UILabel *SIOSectionTitle(NSString *t) {
         "把这两项从关改开后，需要杀掉目标 App 重开才会生效；从开改关则热重载立即生效。",
         12, [UIColor secondaryLabelColor]);
     [self.stack addArrangedSubview:feelNote];
+
+    // ---- v2.1.8：极速模式 ----
+    self.swInstTr   = [[UISwitch alloc] init];
+    self.swHUDFast  = [[UISwitch alloc] init];
+    self.swWKFast   = [[UISwitch alloc] init];
+    self.swCustTrans = [[UISwitch alloc] init];
+    self.segHUDDelay = [[UISegmentedControl alloc] initWithItems:@[@"50ms", @"100ms", @"150ms", @"250ms", @"500ms"]];
+    self.segHUDDelay.selectedSegmentIndex = 2;
+
+    [self.stack addArrangedSubview:SIOSectionTitle(@"链接/页面打开 · 全速优化")];
+    [self.stack addArrangedSubview:SIOCard(@[
+        SIORowSub(@"转场瞬切", @"push/present/pop 一律 0.001s，快到看不见过渡", self.swInstTr),
+        SIORowSub(@"Loading HUD 消除", @"UIActivityIndicatorView 等刚要显示就被取消，目标 App 重开生效", self.swHUDFast),
+        SIORowSub(@"HUD 取消阈值", @"show 后多少 ms 内 stop 就取消（越小越激进）", self.segHUDDelay),
+        SIORowSub(@"WKWebView 极速显示", @"加载中拒绝隐藏 webView，网络返回立即渲染", self.swWKFast),
+        SIORowSub(@"自定义转场加速", @"加速 App 自定义的 UIViewControllerAnimatedTransitioning（默认关，风险高）", self.swCustTrans),
+    ], 14)];
+
+    UILabel *speedNote = SIOLabel(
+        @"保护名单：微信/QQ/企业微信/支付宝的 Loading HUD 永不消除——这些 App 的 HUD 是「支付中/发送中」的流程守卫。",
+        12, [UIColor systemOrangeColor]);
+    [self.stack addArrangedSubview:speedNote];
 
     UILabel *warn = SIOLabel(
         @"⚠️ 硬保护名单：顺丰同城骑士 com.sfic.knight、桌面进程 com.apple.springboard —— 列表加速恒为关闭，任何配置都打不开（SpringBoard 打开会黑屏/白苹果）。淘宝/京东等重列表 App 也建议保持关闭。",
