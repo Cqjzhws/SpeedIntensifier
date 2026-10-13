@@ -1561,9 +1561,8 @@ static void SIOriginalInit(void) {
     // iOS 16 优化增强：UIViewPropertyAnimator + UIScrollView + CALayer
     SIO_installiOS16Extras();
 
-    // ---- v2.1.8：极速模式 hook 安装 ----
-
-    // UIActivityIndicatorView startAnimating/stopAnimating（系统类，无条件安装，runtime-gated 内部判断开关）
+    // ---- v2.1.8：极速模式 hook 安装（暂时注释等定位编译错误） ----
+#if 0
     Class ai = objc_getClass("UIActivityIndicatorView");
     if (ai && gHUDFast && !SIO_hudProtected()) {
         SIO_swizzleInstance(ai, @selector(startAnimating),
@@ -1571,22 +1570,17 @@ static void SIOriginalInit(void) {
         SIO_swizzleInstance(ai, @selector(stopAnimating),
                             (IMP)sio_AIstopAnim, (IMP *)&o_AIstopAnim);
     }
-
-    // WKWebView setHidden:（系统类，无条件安装，runtime-gated 内部判断开关）
     Class wk = objc_getClass("WKWebView");
     if (wk) {
         SIO_swizzleInstance(wk, @selector(setHidden:),
                             (IMP)sio_WKsetHidden, (IMP *)&o_WKsetHidden);
     }
-
-    // SVProgressHUD dismissWithDelay:（第三方类，objc_getClass 探测存在性）
     if (gHUDFast && !SIO_hudProtected()) {
         Class svhud = objc_getClass("SVProgressHUD");
         if (svhud) {
             Method m = class_getInstanceMethod(svhud, @selector(dismissWithDelay:));
             if (m) SIO_swizzleInstance(svhud, @selector(dismissWithDelay:),
                                        (IMP)sio_SVHUDDismissDelay, (IMP *)&o_SVHUDDismissDelay);
-            // 也 hook 类方法（SVProgressHUD 是单例，两种方法都有）
             SIO_swizzleClass(svhud, @selector(dismissWithDelay:),
                              (IMP)sio_SVHUDDismissDelay, (IMP *)&o_SVHUDDismissDelay);
         }
@@ -1596,6 +1590,7 @@ static void SIOriginalInit(void) {
                                 (IMP)sio_MBHUDHide, (IMP *)&o_MBHUDHide);
         }
     }
+#endif
 
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
