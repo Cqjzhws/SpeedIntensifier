@@ -396,6 +396,24 @@ static BOOL SIO_fbgBuiltinExcluded(void) {
     return bid.length && [list containsObject:bid];
 }
 
+// v2.1.7 fix：FastTap 保护名单。这些 App 依赖 UIScrollView 的 delaysContentTouches=YES
+// 来正确识别长按手势（如微信聊天长按弹复制菜单）。FastTap 把它强制设为 NO 会导致
+// 长按手势无法触发，因此对这些 App 跳过 FastTap。
+static BOOL SIO_fastTapProtected(void) {
+    static NSArray *list = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        list = @[
+            @"com.tencent.xin",       // 微信：聊天长按复制依赖 delaysContentTouches
+            @"com.tencent.mqq",       // QQ：长按消息复制
+            @"com.apple.mobilesms",   // 信息：长按复制
+            @"com.tencent.wework",    // 企业微信：长按复制
+        ];
+    });
+    NSString *bid = SIO_bundleID();
+    return bid.length && [list containsObject:bid];
+}
+
 // 本进程是否命中 App 覆盖 / 是否被列表硬保护（供启动日志与配置排查）
 static BOOL gHasAppOverride   = NO;
 static BOOL gListHardGuarded  = NO;
@@ -802,6 +820,12 @@ static void   (*o_sv_setDelaysTouches)(id, SEL, BOOL);
 static void sio_CAAnim_setDuration(id self, SEL _cmd, double d) {
     SIO_REQUIRE_ORIG(o_CAAnim_setDuration);
     if (SIO_blocked()) { o_CAAnim_setDuration(self, _cmd, d); return; }
+    // v2.1.7 fix：CAKeyframeAnimation（含高德 MAMapKeyFrameAnimation）按时序播放多帧，
+    // 压缩时长会丢帧导致地图黑屏/路径动画断裂，原样透传。
+    if ([self isKindOfClass:[CAKeyframeAnimation class]]) {
+        o_CAAnim_setDuration(self, _cmd, d);
+        return;
+    }
     // v1.8.15：显式设时长视为新意图，按传入值缩放并重新打标
     //（不因已有标记而跳过，否则「add 之后再改时长」会被错误忽略）
     // v1.8.17：走 LayerBoost 版本（显式动画可单独加倍率）
@@ -1638,7 +1662,9 @@ static void sio_SV_didMoveToWindow(id self, SEL _cmd) {
         if (gFastScroll && sv.decelerationRate != UIScrollViewDecelerationRateFast) {
             sv.decelerationRate = UIScrollViewDecelerationRateFast;
         }
-        if (gFastTap && sv.delaysContentTouches) {
+        // v2.1.7 fix：FastTap 把 delaysContentTouches 设为 NO 会破坏微信等 App 的
+        // 长按手势识别（长按不弹出复制菜单）。对依赖长按的 App 跳过 FastTap。
+        if (gFastTap && !SIO_fastTapProtected() && sv.delaysContentTouches) {
             sv.delaysContentTouches = NO;
         }
     } @catch (__unused NSException *e) {}
@@ -1655,7 +1681,9 @@ static void sio_SV_setDecelRate(id self, SEL _cmd, CGFloat rate) {
 
 static void sio_SV_setDelaysTouches(id self, SEL _cmd, BOOL b) {
     SIO_REQUIRE_ORIG(o_sv_setDelaysTouches);
-    if (!SIO_blocked() && gFastTap) b = NO;
+    // v2.1.7 fix：对依赖长按手势的 App（如微信）不强制 delaysContentTouches=NO，
+    // 否则长按复制菜单无法弹出。
+    if (!SIO_blocked() && gFastTap && !SIO_fastTapProtected()) b = NO;
     o_sv_setDelaysTouches(self, _cmd, b);
 }
 
@@ -1669,17 +1697,21 @@ static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
     // sio_CAAnim_setDuration 处理（带标记），这里必须跳过，否则同一个值被缩两次。
     if (!SIO_blocked() && anim && o_CAAnim_setDuration &&
         [anim isKindOfClass:[CAAnimation class]] && !SIO_animScaled(anim)) {
-        @try {
-            double origDur = ((CAAnimation *)anim).duration;
-            if (origDur > 0) {
-                SIO_markAnimScaled(anim);
-                // v1.8.17：与 setDuration: 路径共用同一套换算（含 LayerBoost）
-                double newDur = SIO_targetDurationLayer(origDur);
-                if (newDur != origDur) {
-                    o_CAAnim_setDuration(anim, @selector(setDuration:), newDur);
+        // v2.1.7 fix：CAKeyframeAnimation（地图相机动画等）按时序播放多帧，
+        // 压缩时长会丢帧导致地图黑屏，跳过。
+        if (![anim isKindOfClass:[CAKeyframeAnimation class]]) {
+            @try {
+                double origDur = ((CAAnimation *)anim).duration;
+                if (origDur > 0) {
+                    SIO_markAnimScaled(anim);
+                    // v1.8.17：与 setDuration: 路径共用同一套换算（含 LayerBoost）
+                    double newDur = SIO_targetDurationLayer(origDur);
+                    if (newDur != origDur) {
+                        o_CAAnim_setDuration(anim, @selector(setDuration:), newDur);
+                    }
                 }
-            }
-        } @catch (__unused NSException *e) {}
+            } @catch (__unused NSException *e) {}
+        }
     }
     o_layer_addAnim(self, _cmd, anim, key);
 }
