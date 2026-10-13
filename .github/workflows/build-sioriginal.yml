@@ -58,6 +58,8 @@ jobs:
           cp SIOriginal/App/Info.plist "$APP/Info.plist"
           cp SIOriginal/App/AppIcon.png "$APP/AppIcon.png"
           for f in SIOriginal/App/Icon-*.png; do cp "$f" "$APP/$(basename $f)"; done
+          # v2.1.5：首页主人头像（App 内 imageWithContentsOfFile 加载）
+          cp SIOriginal/App/Owner.jpg "$APP/Owner.jpg"
           codesign --force --sign - --entitlements SIOriginal/entitlements.plist "$APP"
 
           mkdir -p build/Payload
