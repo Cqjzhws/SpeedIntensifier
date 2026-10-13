@@ -1385,13 +1385,16 @@ static void sio_MBHUDHide(id self, SEL _cmd, BOOL animated) {
 }
 
 // ---- WKWebView setHidden: ----
+// 注意：dylib 没链接 WebKit framework，用 performSelector 调属性避免编译错误
 static void sio_WKsetHidden(id self, SEL _cmd, BOOL hidden) {
     SIO_REQUIRE_ORIG(o_WKsetHidden);
     if (SIO_blocked() || !gWKFastShow) { o_WKsetHidden(self, _cmd, hidden); return; }
     if (hidden) {
-        WKWebView *wv = (WKWebView *)self;
-        if (wv.isLoading && wv.estimatedProgress > 0.1) {
-            return;  // 正在加载，拒绝隐藏——让 webView 保持可见
+        // 用 performSelector 读 isLoading 和 estimatedProgress
+        BOOL isLoading = ((BOOL(*)(id, SEL))objc_msgSend)(self, @selector(isLoading));
+        double progress = ((double(*)(id, SEL))objc_msgSend)(self, @selector(estimatedProgress));
+        if (isLoading && progress > 0.1) {
+            return;  // 正在加载，拒绝隐藏
         }
     }
     o_WKsetHidden(self, _cmd, hidden);
