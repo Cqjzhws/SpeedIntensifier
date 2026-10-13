@@ -239,6 +239,13 @@ static double   gFloorDuration = 0.005;  // 极限下限 5ms（全速档不撞 U
 static double   gTransBoost = 3.0;      // 转场独立倍率 3×
 static BOOL     gInAppNotify = YES;     // 热重载顶部提示
 
+// v2.1.8：极速模式 —— 链接/页面打开速度全速优化
+static BOOL     gInstantTransition = NO;   // 转场瞬切 0.001s（默认关，风险最低的一行代码）
+static BOOL     gHUDFast       = YES;      // HUD 消除（默认开，收益最大）
+static double   gHUDDelay      = 0.15;     // HUD show 取消阈值（秒）
+static BOOL     gWKFastShow    = YES;      // WKWebView 加载中强制可见（默认开）
+static BOOL     gCustomTransFast = NO;     // 自定义转场加速（默认关，风险高）
+
 // ---------- 热路径派生量 ----------
 static double   gInvSpeed    = 1.0 / 40.0;
 static double   gInvLayer    = 1.0 / 5.0;
@@ -470,6 +477,14 @@ static void SIO_reload(void) {
     // v2.0.0：热重载顶部提示，缺键默认开（纯展示、不拦截触摸）
     gInAppNotify = d[@"InAppNotify"] ? [d[@"InAppNotify"] boolValue] : YES;
 
+    // v2.1.8：极速模式（缺省值按「用户收益最大化 + 安全兜底」策略）
+    gInstantTransition = d[@"InstantTransition"] ? [d[@"InstantTransition"] boolValue] : NO;
+    gHUDFast           = d[@"HUDFast"]           ? [d[@"HUDFast"]           boolValue] : YES;
+    double hd = d[@"HUDDelay"] ? [d[@"HUDDelay"] doubleValue] : 0.15;
+    gHUDDelay          = (hd >= 0.02 && hd <= 1.0) ? hd : 0.15;
+    gWKFastShow        = d[@"WKFastShow"]        ? [d[@"WKFastShow"]        boolValue] : YES;
+    gCustomTransFast   = d[@"CustomTransFast"]   ? [d[@"CustomTransFast"]   boolValue] : NO;
+
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     gSelfBlacklisted = NO;
     id bl = d[@"Blacklist"];
@@ -530,6 +545,15 @@ static void SIO_reload(void) {
             double tb2 = [ovr[@"TransitionBoost"] doubleValue];
             if (tb2 >= 1.0 && tb2 <= 3.0) gTransBoost = tb2;
         }
+        // v2.1.8：极速模式 5 键覆盖
+        if (ovr[@"InstantTransition"]) gInstantTransition = [ovr[@"InstantTransition"] boolValue];
+        if (ovr[@"HUDFast"])           gHUDFast           = [ovr[@"HUDFast"]           boolValue];
+        if (ovr[@"HUDDelay"]) {
+            double hd2 = [ovr[@"HUDDelay"] doubleValue];
+            if (hd2 >= 0.02 && hd2 <= 1.0) gHUDDelay = hd2;
+        }
+        if (ovr[@"WKFastShow"])        gWKFastShow        = [ovr[@"WKFastShow"]        boolValue];
+        if (ovr[@"CustomTransFast"])   gCustomTransFast   = [ovr[@"CustomTransFast"]   boolValue];
     }
 
     // ---- v1.8.14：列表 hook 硬保护，必须放在所有覆盖之后，优先级最高 ----
@@ -813,6 +837,14 @@ static void   (*o_UV_transFromNoAnim)(Class, SEL, UIView *, UIView *, double,
 static void   (*o_sv_setDecelRate)(id, SEL, CGFloat);
 static void   (*o_sv_setDelaysTouches)(id, SEL, BOOL);
 
+// ---- v2.1.8 极速模式新 hook ----
+static void   (*o_AIstartAnim)(id, SEL);
+static void   (*o_AIstopAnim)(id, SEL);
+static void   (*o_SVHUDDismissDelay)(id, SEL, double);
+static void   (*o_MBHUDHide)(id, SEL, BOOL);
+static void   (*o_WKsetHidden)(id, SEL, BOOL);
+static double (*o_transitionDuration)(id, SEL, id);
+
 #pragma mark - CAAnimation（核心：仅基类，子类自动继承）
 
 static void sio_CAAnim_setDuration(id self, SEL _cmd, double d) {
@@ -1023,7 +1055,9 @@ static void sio_CASpring_damp(id self, SEL _cmd, double v) {
 //   瞬切    → 0.01s（直达）
 // v2.0.0：在全局模式换算之后，再叠加转场独立倍率 TransitionBoost（仅加速/瞬切，
 // 慢放不叠加），同样受 FloorDuration 下限保护。
+// v2.1.8：InstantTransition 优先级最高（热路径每次判断，runtime-gated）
 static inline double SIO_transitionDuration(void) {
+    if (gEnabled && gInstantTransition) return 0.001;
     double d = SIO_targetDuration(0.35);
     if (gEnabled && gMode != 1 && gTransBoost > 1.0001 && d > 0.0) {
         d = d / gTransBoost;
@@ -1296,6 +1330,73 @@ static void sio_cv_deselectItem(id self, SEL _cmd, NSIndexPath *ip, BOOL anim) {
     SIO_listWrap(^{ o_cv_deselectItem(self, _cmd, ip, anim); });
 }
 
+#pragma mark - v2.1.8 极速模式：HUD 消除 + WKWebView
+
+// ---- 黑名单：HUD hook 对流程守卫型 App 跳过 ----
+static BOOL SIO_hudProtected(void) {
+    static NSArray *list = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ list = @[
+        @"com.tencent.xin",
+        @"com.tencent.mqq",
+        @"com.tencent.wework",
+        @"com.apple.mobilesms",
+        @"com.alipay.iphoneclient",
+    ]; });
+    NSString *bid = gSelfBundle ?: @"";
+    return bid.length && [list containsObject:bid];
+}
+
+// ---- UIActivityIndicatorView startAnimating/stopAnimating ----
+static const void *kSIOAIDelayMark = &kSIOAIDelayMark;
+
+static void sio_AIstartAnim(id self, SEL _cmd) {
+    SIO_REQUIRE_ORIG(o_AIstartAnim);
+    if (SIO_blocked() || !gHUDFast || SIO_hudProtected()) { o_AIstartAnim(self, _cmd); return; }
+    objc_setAssociatedObject(self, kSIOAIDelayMark, (__bridge id)kCFBooleanTrue, OBJC_ASSOCIATION_ASSIGN);
+    __weak id wself = self;
+    NSTimeInterval delay = gHUDDelay;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!objc_getAssociatedObject(wself, kSIOAIDelayMark)) return;
+        o_AIstartAnim(wself, _cmd);
+    });
+}
+
+static void sio_AIstopAnim(id self, SEL _cmd) {
+    SIO_REQUIRE_ORIG(o_AIstopAnim);
+    if (SIO_blocked() || !gHUDFast || SIO_hudProtected()) { o_AIstopAnim(self, _cmd); return; }
+    objc_setAssociatedObject(self, kSIOAIDelayMark, nil, OBJC_ASSOCIATION_ASSIGN);
+    o_AIstopAnim(self, _cmd);
+}
+
+// ---- SVProgressHUD dismissWithDelay: ----
+static void sio_SVHUDDismissDelay(id self, SEL _cmd, double delay) {
+    SIO_REQUIRE_ORIG(o_SVHUDDismissDelay);
+    if (SIO_blocked() || !gHUDFast || SIO_hudProtected()) { o_SVHUDDismissDelay(self, _cmd, delay); return; }
+    o_SVHUDDismissDelay(self, _cmd, 0.0);  // 强制立即 dismiss
+}
+
+// ---- MBProgressHUD hide: ----
+static void sio_MBHUDHide(id self, SEL _cmd, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_MBHUDHide);
+    if (SIO_blocked() || !gHUDFast || SIO_hudProtected()) { o_MBHUDHide(self, _cmd, animated); return; }
+    o_MBHUDHide(self, _cmd, NO);  // 无动画立即消失
+}
+
+// ---- WKWebView setHidden: ----
+static void sio_WKsetHidden(id self, SEL _cmd, BOOL hidden) {
+    SIO_REQUIRE_ORIG(o_WKsetHidden);
+    if (SIO_blocked() || !gWKFastShow) { o_WKsetHidden(self, _cmd, hidden); return; }
+    if (hidden) {
+        WKWebView *wv = (WKWebView *)self;
+        if (wv.isLoading && wv.estimatedProgress > 0.1) {
+            return;  // 正在加载，拒绝隐藏——让 webView 保持可见
+        }
+    }
+    o_WKsetHidden(self, _cmd, hidden);
+}
+
 #pragma mark - 安装
 
 __attribute__((constructor))
@@ -1457,13 +1558,50 @@ static void SIOriginalInit(void) {
     // iOS 16 优化增强：UIViewPropertyAnimator + UIScrollView + CALayer
     SIO_installiOS16Extras();
 
+    // ---- v2.1.8：极速模式 hook 安装 ----
+
+    // UIActivityIndicatorView startAnimating/stopAnimating（系统类，无条件安装，runtime-gated 内部判断开关）
+    Class ai = objc_getClass("UIActivityIndicatorView");
+    if (ai && gHUDFast && !SIO_hudProtected()) {
+        SIO_swizzleInstance(ai, @selector(startAnimating),
+                            (IMP)sio_AIstartAnim, (IMP *)&o_AIstartAnim);
+        SIO_swizzleInstance(ai, @selector(stopAnimating),
+                            (IMP)sio_AIstopAnim, (IMP *)&o_AIstopAnim);
+    }
+
+    // WKWebView setHidden:（系统类，无条件安装，runtime-gated 内部判断开关）
+    Class wk = objc_getClass("WKWebView");
+    if (wk) {
+        SIO_swizzleInstance(wk, @selector(setHidden:),
+                            (IMP)sio_WKsetHidden, (IMP *)&o_WKsetHidden);
+    }
+
+    // SVProgressHUD dismissWithDelay:（第三方类，objc_getClass 探测存在性）
+    if (gHUDFast && !SIO_hudProtected()) {
+        Class svhud = objc_getClass("SVProgressHUD");
+        if (svhud) {
+            Method m = class_getInstanceMethod(svhud, @selector(dismissWithDelay:));
+            if (m) SIO_swizzleInstance(svhud, @selector(dismissWithDelay:),
+                                       (IMP)sio_SVHUDDismissDelay, (IMP *)&o_SVHUDDismissDelay);
+            // 也 hook 类方法（SVProgressHUD 是单例，两种方法都有）
+            SIO_swizzleClass(svhud, @selector(dismissWithDelay:),
+                             (IMP)sio_SVHUDDismissDelay, (IMP *)&o_SVHUDDismissDelay);
+        }
+        Class mbhud = objc_getClass("MBProgressHUD");
+        if (mbhud) {
+            SIO_swizzleInstance(mbhud, @selector(hide:),
+                                (IMP)sio_MBHUDHide, (IMP *)&o_MBHUDHide);
+        }
+    }
+
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
-    // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.1.7 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d override=%d listGuard=%d)",
+    // v2.1.8：追加极速模式 5 个新开关（instantTransition/HUD/wkFast/customTrans/hudDelay）
+    NSLog(@"[SIOriginal] v2.1.8 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instTr=%d hud=%d(%.2fs) wkFast=%d custTrans=%d hudProt=%d override=%d listGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
+          gInstantTransition, gHUDFast, gHUDDelay, gWKFastShow, gCustomTransFast, SIO_hudProtected(),
           gHasAppOverride, gListHardGuarded);
     if (SIO_fbgBuiltinExcluded()) {
         NSLog(@"[SIOriginal] %@ is a built-in keep-alive exclusion: audio-assertion/scene-fake engine stays OFF", gSelfBundle);
