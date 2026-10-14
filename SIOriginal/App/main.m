@@ -1656,6 +1656,113 @@ static UILabel *SIOSectionTitle(NSString *t) {
 
 #pragma mark - App Delegate
 
+#pragma mark - ===== SIO_SHOT_BUILD: simulator auto-screenshot harness =====
+#ifdef SIO_SHOT_BUILD
+@interface SIOShotHarness : NSObject
++ (void)runWithTab:(UITabBarController *)tab;
+@end
+@implementation SIOShotHarness
+
++ (void)savePNG:(UIImage *)img name:(NSString *)name dir:(NSString *)dir {
+    if (!img) { NSLog(@"[SIOSHOT] nil image %@", name); return; }
+    NSData *d = UIImagePNGRepresentation(img);
+    NSString *p = [dir stringByAppendingPathComponent:name];
+    [d writeToFile:p atomically:YES];
+    NSLog(@"[SIOSHOT] %@ %lux%lu %lubytes", name,
+          (unsigned long)CGImageGetWidth(img.CGImage),
+          (unsigned long)CGImageGetHeight(img.CGImage), (unsigned long)d.length);
+}
+
++ (void)showcaseOn:(UIView *)v {
+    for (UIView *sub in v.subviews) {
+        if ([sub isKindOfClass:[UISwitch class]]) {
+            UISwitch *sw = (id)sub;
+            [sw setOn:YES animated:NO];
+            [sw sendActionsForControlEvents:UIControlEventValueChanged];
+        } else if ([sub isKindOfClass:[UISlider class]]) {
+            UISlider *sl = (id)sub;
+            [sl setValue:40.0f animated:NO];
+            [sl sendActionsForControlEvents:UIControlEventValueChanged];
+        }
+        [self showcaseOn:sub];
+    }
+}
+
++ (void)waitForFile:(NSString *)path then:(void (^)(void))block {
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) { block(); return; }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(200 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{ [self waitForFile:path then:block]; });
+}
+
++ (void)runWithTab:(UITabBarController *)tab {
+    NSString *dir = NSProcessInfo.processInfo.environment[@"SIO_SHOT_DIR"];
+    if (!dir.length) dir = @"/tmp/sio_shots";
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    for (NSString *g in @[@"READY0",@"READY1",@"READY2",@"READY3",@"GO0",@"GO1",@"GO2",@"GO3",@"DONE"]) {
+        [[NSFileManager defaultManager] removeItemAtPath:[dir stringByAppendingPathComponent:g] error:nil];
+    }
+    NSArray *names = @[@"01_engine", @"02_feel", @"03_system", @"04_advanced"];
+    // Showcase state on the first three tabs (switches on, speed x40).
+    // Advanced keeps its clean empty override form.
+    for (NSUInteger i = 0; i < 3; i++) {
+        UINavigationController *n = (id)tab.viewControllers[i];
+        [self showcaseOn:n.topViewController.view];
+        if ([n.topViewController respondsToSelector:@selector(refreshHeader)]) {
+            [n.topViewController performSelector:@selector(refreshHeader)];
+        }
+    }
+    __block NSInteger idx = 0;
+    __weak UITabBarController *wt = tab;
+    __block void (^step)(void) = ^void(void) {
+        UITabBarController *t = wt;
+        if (!t || idx >= (NSInteger)names.count) {
+            [@"DONE" writeToFile:[dir stringByAppendingPathComponent:@"DONE"]
+                      atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            NSLog(@"[SIOSHOT] DONE");
+            return;
+        }
+        t.selectedIndex = idx;
+        NSString *name = names[idx];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(900 * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+            // In-app full-page long capture (viewport-independent).
+            UIViewController *vc = ((UINavigationController *)t.selectedViewController).topViewController;
+            UIScrollView *scroll = nil;
+            for (UIView *v in vc.view.subviews) {
+                if ([v isKindOfClass:[UIScrollView class]]) { scroll = (id)v; break; }
+            }
+            if (scroll) {
+                [scroll layoutIfNeeded];
+                CGSize cs = scroll.contentSize;
+                if (cs.width > 1 && cs.height > 1) {
+                    CGRect saved = scroll.frame;
+                    scroll.frame = CGRectMake(0, 0, cs.width, cs.height);
+                    [scroll setNeedsLayout]; [scroll layoutIfNeeded];
+                    UIGraphicsImageRenderer *rf =
+                        [[UIGraphicsImageRenderer alloc] initWithBounds:CGRectMake(0, 0, cs.width, cs.height)];
+                    UIImage *full = [rf imageWithActions:^(UIGraphicsImageRendererContext *c) {
+                        [scroll drawViewHierarchyInRect:CGRectMake(0, 0, cs.width, cs.height)
+                                       afterScreenUpdates:YES];
+                    }];
+                    [self savePNG:full name:[name stringByAppendingString:@"_full.png"] dir:dir];
+                    scroll.frame = saved;
+                    [scroll setNeedsLayout]; [scroll layoutIfNeeded];
+                }
+            }
+            // Tell CI the tab is on screen; CI takes the device screenshot (with status bar).
+            [@"R" writeToFile:[dir stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"READY%ld", (long)idx]]
+                    atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [self waitForFile:[dir stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"GO%ld", (long)idx]] then:^{ idx += 1; step(); }];
+        });
+    };
+    step();
+}
+@end
+#endif
+
 @interface SIOAppDelegate : UIResponder <UIApplicationDelegate>
 @property (strong, nonatomic) UIWindow *window;
 @property (strong, nonatomic) SIOModel *model;
@@ -1731,6 +1838,11 @@ static UILabel *SIOSectionTitle(NSString *t) {
             [tab presentViewController:a animated:YES completion:nil];
         });
     }
+#ifdef SIO_SHOT_BUILD
+    if ([NSProcessInfo.processInfo.environment[@"SIO_SHOT"] isEqualToString:@"1"]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [SIOShotHarness runWithTab:tab]; });
+    }
+#endif
     return YES;
 }
 @end
