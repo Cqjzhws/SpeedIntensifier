@@ -405,6 +405,12 @@ static BOOL SIO_fbgBuiltinExcluded(void) {
 // （delaysContentTouches、decelerationRate）来正确识别长按/选择等手势。
 // 整个手感模块（FastScroll + FastTap + setter 强黏）对这些 App 全部跳过。
 static BOOL SIO_feelProtected(void) {
+    // v2.1.8 fix: SF intracity rider (com.sfic.knight) order hall needs full native
+    // scroll inertia. FastScroll locks decelerationRate to 0.99 (fast), which cut
+    // each swipe to one or two order cells ("one cell at a time" feel). Skip the
+    // whole feel module for this app; ListAccel is already hard-guarded here, so
+    // only the animation speedup stays active.
+    if ([SIO_bundleID() isEqualToString:@"com.sfic.knight"]) return YES;
     static NSArray *list = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
