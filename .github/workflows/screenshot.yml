@@ -1,0 +1,78 @@
+name: Screenshot Pages
+
+on:
+  workflow_dispatch:
+
+jobs:
+  shots:
+    name: Build simulator app and capture every tab
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Build simulator app (SIO_SHOT_BUILD)
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
+          APP=build/SIOriginal.app
+          rm -rf build && mkdir -p "$APP"
+          clang -arch arm64 -x objective-c -DSIO_SHOT_BUILD -O1 \
+            -isysroot "$SDK" -mios-simulator-version-min=14.0 -fobjc-arc \
+            -framework Foundation -framework UIKit -framework QuartzCore -framework CoreGraphics \
+            SIOriginal/App/main.m -o "$APP/SIOriginal"
+          cp SIOriginal/App/Info.plist "$APP/"
+          cp SIOriginal/App/AppIcon.png "$APP/" 2>/dev/null || true
+          for f in SIOriginal/App/Icon-*.png; do [ -f "$f" ] && cp "$f" "$APP/"; done
+          cp SIOriginal/App/Owner.jpg "$APP/"
+          codesign --force --sign - "$APP"
+          echo "simulator app built"
+
+      - name: Boot simulator
+        run: |
+          set -e
+          UDID=$(xcrun simctl create sioshot "iPhone 15")
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl status_bar "$UDID" override --time "9:41" || true
+          xcrun simctl ui "$UDID" appearance light || true
+
+      - name: Install, launch and capture
+        run: |
+          set -e
+          mkdir -p /tmp/sio_shots && rm -f /tmp/sio_shots/*
+          xcrun simctl install "$UDID" build/SIOriginal.app
+          SIMCTL_CHILD_SIO_SHOT=1 SIMCTL_CHILD_SIO_SHOT_DIR=/tmp/sio_shots \
+            xcrun simctl launch "$UDID" com.local.sioriginal
+          names=(01_engine 02_feel 03_system 04_advanced)
+          for i in 0 1 2 3; do
+            for k in $(seq 1 60); do
+              [ -f "/tmp/sio_shots/READY$i" ] && break
+              sleep 1
+            done
+            test -f "/tmp/sio_shots/READY$i" || { echo "tab $i never became ready"; ls -la /tmp/sio_shots; exit 1; }
+            sleep 1
+            xcrun simctl io "$UDID" screenshot "/tmp/sio_shots/${names[$i]}_screen.png"
+            touch "/tmp/sio_shots/GO$i"
+          done
+          for k in $(seq 1 30); do [ -f /tmp/sio_shots/DONE ] && break; sleep 1; done
+          test -f /tmp/sio_shots/DONE
+          rm -f /tmp/sio_shots/READY* /tmp/sio_shots/GO* /tmp/sio_shots/DONE
+          ls -la /tmp/sio_shots
+
+      - name: Shutdown simulator
+        if: always()
+        run: |
+          xcrun simctl shutdown "$UDID" 2>/dev/null || true
+          xcrun simctl delete "$UDID" 2>/dev/null || true
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: sio-screenshots
+          path: /tmp/sio_shots/
+          if-no-files-found: error
+          retention-days: 30
