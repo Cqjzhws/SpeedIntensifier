@@ -29,7 +29,7 @@ extern int reboot(int);
 static NSString * const PrefPath  = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
 static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.1.7";
+static NSString * const SIO_VERSION = @"v2.1.9";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 static NSArray *HardGuardBundles(void) {
@@ -162,6 +162,10 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"TransitionBoost"])  d[@"TransitionBoost"]  = @2.0;   // 转场再 ×2
     // v2.1.2：FastLongPress / LongPressDuration 已随长按 hook 一并移除
     if (!d[@"InAppNotify"])      d[@"InAppNotify"]      = @YES;
+    // v2.1.9：瞬时打开三件套 —— 与 dylib 侧默认值保持一致（缺键 = 开）
+    if (!d[@"InstantTransition"]) d[@"InstantTransition"] = @YES;
+    if (!d[@"HUDFast"])           d[@"HUDFast"]           = @YES;
+    if (!d[@"WKFastShow"])        d[@"WKFastShow"]        = @YES;
     if (!d[@"Blacklist"])  d[@"Blacklist"]  = @[ @"com.tencent.wework" ];
     if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
@@ -182,6 +186,8 @@ static NSArray *SIOConfigKeys(void) {
                   @"FastScroll", @"FastTap", @"LayerBoost",
                   @"FloorDuration", @"TransitionBoost",
                   @"InAppNotify",
+                  // v2.1.9：瞬时打开三件套（新键登记白名单才能被写入 plist）
+                  @"InstantTransition", @"HUDFast", @"WKFastShow",
                   @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
                   @"AppOverrides" ];
     });
@@ -529,7 +535,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
         UILabel *st2 = SIOLabel(@"等待读取…", 13, [UIColor whiteColor]);
         st2.tag = 99;
         st2.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
-        // v2.1.7：状态行允许两行 —— 一行塞不下全部状态，之前直接顶到头像底下被遮挡
+        // v2.1.9：状态行允许两行 —— 一行塞不下全部状态，之前直接顶到头像底下被遮挡
         st2.numberOfLines = 2;
 
         for (UIView *v in @[ badge, t, s, st2 ]) {
@@ -551,8 +557,8 @@ static UILabel *SIOSectionTitle(NSString *t) {
             [t.trailingAnchor constraintLessThanOrEqualToAnchor:badge.leadingAnchor constant:-8],
         ]];
 
-        // v2.1.7：右上角主人头像（打包资源 Owner.jpg；缺资源时自动隐藏，不影响构建）
-        // v2.1.7 修复启动崩溃：头像约束引用了 badge，而原代码在 badge 入层级之前就激活，
+        // v2.1.9：右上角主人头像（打包资源 Owner.jpg；缺资源时自动隐藏，不影响构建）
+        // v2.1.9 修复启动崩溃：头像约束引用了 badge，而原代码在 badge 入层级之前就激活，
         // 触发 NSLayoutConstraintIsPotentiallyDanglyInContainer → SIGABRT（启动 37ms 即崩）。
         // 现在统一挪到所有子视图 addSubview 与主约束激活之后。
         UIImage *ownerImg = [UIImage imageWithContentsOfFile:
@@ -584,7 +590,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
                 [cap.centerXAnchor constraintEqualToAnchor:av.centerXAnchor],
                 [cap.widthAnchor constraintEqualToConstant:70],
 
-                // v2.1.7：文字区让出右侧头像列 —— 标题/状态/副标题都不得越过头像左缘，
+                // v2.1.9：文字区让出右侧头像列 —— 标题/状态/副标题都不得越过头像左缘，
                 // 修复状态行钻到头像底下被遮挡的问题
                 [t.trailingAnchor constraintLessThanOrEqualToAnchor:av.leadingAnchor constant:-10],
                 [st2.trailingAnchor constraintLessThanOrEqualToAnchor:av.leadingAnchor constant:-10],
@@ -626,6 +632,8 @@ static UILabel *SIOSectionTitle(NSString *t) {
 // 手感页
 @property (strong) UISwitch *swList, *swZoom, *swFastScroll, *swFastTap;
 @property (strong) UISwitch *swNotify;
+// v2.1.9：瞬时打开三件套（dylib 侧三个键缺键即默认开，这里给它们补上可视化开关）
+@property (strong) UISwitch *swInstant, *swHUDFast, *swWKFast;
 // 系统页
 @property (strong) UISwitch *swRM, *swCF, *swRT;
 @property (strong) UISegmentedControl *segDrag;
@@ -673,6 +681,10 @@ static UILabel *SIOSectionTitle(NSString *t) {
     self.swFastScroll.on = [c[@"FastScroll"] boolValue];
     self.swFastTap.on = [c[@"FastTap"] boolValue];
     self.swNotify.on = [c[@"InAppNotify"] boolValue];
+    // v2.1.9：缺键视为开（与 dylib 侧默认一致，避免出现「UI 显示关、实际在跑」）
+    self.swInstant.on = c[@"InstantTransition"] ? [c[@"InstantTransition"] boolValue] : YES;
+    self.swHUDFast.on = c[@"HUDFast"] ? [c[@"HUDFast"] boolValue] : YES;
+    self.swWKFast.on  = c[@"WKFastShow"]  ? [c[@"WKFastShow"]  boolValue] : YES;
     self.blacklist.text = [c[@"Blacklist"] componentsJoinedByString:@"\n"];
 
     self.swRM.on = ReadAx(@"ReduceMotionEnabled");
@@ -721,7 +733,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
 }
 
 - (void)refreshOverrides {
-    // v2.1.7：支持多 ID —— 控件回显按第一个 ID；提示文案说明批量行为
+    // v2.1.9：支持多 ID —— 控件回显按第一个 ID；提示文案说明批量行为
     NSArray *ids = [self ovBundleIDs];
     NSString *bid = ids.firstObject ?: @"com.sfic.knight";
     id allRaw = [NSDictionary dictionaryWithContentsOfFile:PrefPath][@"AppOverrides"];
@@ -760,7 +772,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
         self.ovGuard.text = [NSString stringWithFormat:@"%@ 暂无专属配置；打开开关并保存即可创建。", bid];
         self.ovGuard.textColor = [UIColor secondaryLabelColor];
     }
-    // v2.1.7：多 ID 时追加批量提示
+    // v2.1.9：多 ID 时追加批量提示
     if (ids.count > 1) {
         NSMutableString *multi = [NSMutableString string];
         [multi appendFormat:@"📦 本次将对 %lu 个 Bundle ID 生效：", (unsigned long)ids.count];
@@ -782,7 +794,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     return bl;
 }
 
-// v2.1.7：专属覆盖输入框支持一次填多个 Bundle ID（逗号 / 空格 / 换行分隔），去重去空。
+// v2.1.9：专属覆盖输入框支持一次填多个 Bundle ID（逗号 / 空格 / 换行分隔），去重去空。
 - (NSArray<NSString *> *)ovBundleIDs {
     NSMutableSet *seen = [NSMutableSet set];
     NSMutableArray *ids = [NSMutableArray array];
@@ -815,6 +827,10 @@ static UILabel *SIOSectionTitle(NSString *t) {
     cfg[@"FloorDuration"] = @(FloorForIndex((int)self.segFloor.selectedSegmentIndex));
     cfg[@"TransitionBoost"] = @(TransForIndex((int)self.segTrans.selectedSegmentIndex));
     cfg[@"InAppNotify"] = @(self.swNotify.on);
+    // v2.1.9：瞬时打开三件套写盘 —— 不写的话这三个键缺失，dylib 依旧默认全开，关不掉
+    cfg[@"InstantTransition"] = @(self.swInstant.on);
+    cfg[@"HUDFast"] = @(self.swHUDFast.on);
+    cfg[@"WKFastShow"] = @(self.swWKFast.on);
     cfg[@"Blacklist"] = [self blacklistFromView];
 
     cfg[@"FUBGEnabled"] = @(self.swFUBG.on);
@@ -822,7 +838,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     cfg[@"FUBGAudioKeep"] = @(self.swFUBGAudio.on);
 
     // App 专属覆盖（保留其它 bundle 的既有条目）
-    // v2.1.7：支持一次填多个 Bundle ID（逗号/空格/换行分隔），保存时批量应用
+    // v2.1.9：支持一次填多个 Bundle ID（逗号/空格/换行分隔），保存时批量应用
     NSArray *ovIDs = [self ovBundleIDs];
     id ovAllRaw = [NSDictionary dictionaryWithContentsOfFile:PrefPath][@"AppOverrides"];
     NSMutableDictionary *ovOut = [ovAllRaw isKindOfClass:[NSDictionary class]]
@@ -854,7 +870,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     WriteAx(@"ReduceMotionEnabled", self.swRM.on);
     WriteAx(@"PreferCrossFadeTransitions", self.swCF.on);
     WriteAx(@"ReduceTransparencyEnabled", self.swRT.on);
-    // v2.1.7：总开关是最高优先级 —— 关闭时把 UIAnimationDragCoefficient 一并清掉。
+    // v2.1.9：总开关是最高优先级 —— 关闭时把 UIAnimationDragCoefficient 一并清掉。
     // 这是 iOS 原生读取的键，不经过 dylib：不清的话「启用动画引擎」关了，
     // UIKit 照样按 ×5/×10/×20 加速，总开关会被误认为假开关。
     WriteUIKitDrag(self.swEnabled.on
@@ -873,7 +889,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
                    FloorForIndex((int)self.segFloor.selectedSegmentIndex) < 0.009
                      ? [NSString stringWithFormat:@"%.3fs", FloorForIndex((int)self.segFloor.selectedSegmentIndex)]
                      : [NSString stringWithFormat:@"%.2fs", FloorForIndex((int)self.segFloor.selectedSegmentIndex)]];
-    // v2.1.7：去掉「长按%@」—— 长按加速已随 v2.1.2 移除，且这里少传一个参数，
+    // v2.1.9：去掉「长按%@」—— 长按加速已随 v2.1.2 移除，且这里少传一个参数，
     // 会把寄存器里的垃圾（NSString 类对象）当成参数打出来，自检里出现「长按 NSString」。
     return [NSString stringWithFormat:@"%@ · %@ · 显式×%.0f · 转场×%.1f · 弹簧%@ · 滑行%@ · 点按%@",
             self.swEnabled.on ? @"已启用" : @"已暂停", detail,
@@ -903,6 +919,10 @@ static UILabel *SIOSectionTitle(NSString *t) {
     self.segSlow.selectedSegmentIndex = 0;
     self.slSpeed.value = 15.0f;
     self.swNotify.on = YES;
+    // v2.1.9：预设沿用瞬时打开三件套的默认（开）
+    self.swInstant.on = YES;
+    self.swHUDFast.on = YES;
+    self.swWKFast.on = YES;
 
     switch (i) {
         case 0: // 极速：倍率再往上顶，显式/转场倍率拉到最大（纯时长缩放，安全）
@@ -964,6 +984,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     // 布尔键
     NSArray *boolKeys = @[ @"Enabled", @"Spring", @"Extra", @"ListAccel", @"ZoomAccel",
                            @"FastScroll", @"FastTap", @"InAppNotify",
+                           @"InstantTransition", @"HUDFast", @"WKFastShow",
                            @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep" ];
     for (NSString *k in boolKeys) {
         if (d[k]) {
@@ -1010,6 +1031,9 @@ static UILabel *SIOSectionTitle(NSString *t) {
     if ([k isEqualToString:@"FastScroll"]) return self.swFastScroll;
     if ([k isEqualToString:@"FastTap"]) return self.swFastTap;
     if ([k isEqualToString:@"InAppNotify"]) return self.swNotify;
+    if ([k isEqualToString:@"InstantTransition"]) return self.swInstant;
+    if ([k isEqualToString:@"HUDFast"]) return self.swHUDFast;
+    if ([k isEqualToString:@"WKFastShow"]) return self.swWKFast;
     if ([k isEqualToString:@"FUBGEnabled"]) return self.swFUBG;
     if ([k isEqualToString:@"FUBGSceneFake"]) return self.swFUBGScene;
     if ([k isEqualToString:@"FUBGAudioKeep"]) return self.swFUBGAudio;
@@ -1256,13 +1280,13 @@ static UILabel *SIOSectionTitle(NSString *t) {
 - (void)changed {
     [self.model refreshDynamicLabels];
     [self refreshHeader];
-    // v2.1.7：总开关等改动实时广播，系统页的拖拽系数提示同步刷新
+    // v2.1.9：总开关等改动实时广播，系统页的拖拽系数提示同步刷新
     [[NSNotificationCenter defaultCenter] postNotificationName:kAppliedNote object:nil];
 }
 - (void)uiApplied { [self.model refreshDynamicLabels]; [self refreshHeader]; }
 
 - (void)preset:(UIButton *)b {
-    // v2.1.7：预设按钮的文字画在内部 stack 里，titleForState: 恒为 nil，
+    // v2.1.9：预设按钮的文字画在内部 stack 里，titleForState: 恒为 nil，
     // 弹窗标题会变成「套用预设 （null）？」—— 改按 tag 取名字。
     NSString *name = (@[ @"极速", @"标准", @"保守", @"瞬切" ])[b.tag];
     if (!name) name = @"预设";
@@ -1312,6 +1336,23 @@ static UILabel *SIOSectionTitle(NSString *t) {
     [self.stack addArrangedSubview:SIOCard(@[
         SIORowSub(@"缩放动画加速", @"图片预览缩放事务加速，异常就关", m.swZoom),
     ], 14)];
+
+    // v2.1.9：瞬时打开三件套 —— 这三个键原先在 App 里没有入口，dylib 缺键即默认开，
+    // 等于一直生效且无法关闭。现在补上开关，出兼容性问题时可以逐项关掉排查。
+    m.swInstant = [[UISwitch alloc] init];
+    m.swHUDFast = [[UISwitch alloc] init];
+    m.swWKFast = [[UISwitch alloc] init];
+    [self.stack addArrangedSubview:SIOSectionTitle(@"瞬时打开 · 默认全开")];
+    [self.stack addArrangedSubview:SIOCard(@[
+        SIORowSub(@"瞬时打开页面", @"把导航/模态转场直接压到 1ms，点链接秒开新页（绕过转场倍率与时长下限）", m.swInstant),
+        SIORowSub(@"加载圈 / HUD 加速", @"转圈延后 0.15s 才显形，SVProgressHUD/MBProgressHUD 立即消失", m.swHUDFast),
+        SIORowSub(@"网页提前显形", @"WKWebView 加载进度过 10% 后拒绝再被隐藏，网页更早露出来", m.swWKFast),
+    ], 14)];
+    UILabel *instantNote = SIOLabel(
+        @"注：IM 与支付类 App 在 dylib 内置保护名单内，这三项对它们自动不生效。"
+        "若某个 App 出现打开白屏、内容没渲染完就切走，优先关掉「瞬时打开页面」和「网页提前显形」。",
+        12, [UIColor secondaryLabelColor]);
+    [self.stack addArrangedSubview:instantNote];
 
     // 列表加速（高危组）
     m.swList = [[UISwitch alloc] init];
@@ -1392,7 +1433,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     double c = DragCoeffForIndex(idx);
     if (!m.swEnabled.on) {
         m.lblDrag.textColor = [UIColor secondaryLabelColor];
-        m.lblDrag.text = @"总开关当前关闭：保存后此项会被清成原生值（v2.1.7 起），先开总开关再选档位。";
+        m.lblDrag.text = @"总开关当前关闭：保存后此项会被清成原生值（v2.1.9 起），先开总开关再选档位。";
         return;
     }
     if (idx == 4) {
@@ -1415,7 +1456,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
 
 @interface SIOAdvancedVC : SIOPageVC <UITextFieldDelegate>
 @property (strong) UITextView *reportView;
-@property (strong) UIButton  *checkPill;   // v2.1.7：保留引用以便点击后改标题给反馈
+@property (strong) UIButton  *checkPill;   // v2.1.9：保留引用以便点击后改标题给反馈
 @end
 @implementation SIOAdvancedVC
 
@@ -1424,7 +1465,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     self.title = @"高级";
 
     // ---- App 专属覆盖 ----
-    // v2.1.7：输入框支持多个 Bundle ID（逗号/空格/换行分隔），保存时批量生效
+    // v2.1.9：输入框支持多个 Bundle ID（逗号/空格/换行分隔），保存时批量生效
     [self.stack addArrangedSubview:SIOSectionTitle(@"App 专属覆盖（可一次填多个 Bundle ID）")];
     m.ovBundle = [[UITextField alloc] init];
     m.ovBundle.placeholder = @"com.sfic.knight（多个用逗号/空格分隔）";
@@ -1492,7 +1533,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     [self.stack addArrangedSubview:ioRow];
 
     // ---- 自检 ----
-    // v2.1.7：按钮点击加可感知反馈（标题变化 + 震动 + 报告加时间戳），
+    // v2.1.9：按钮点击加可感知反馈（标题变化 + 震动 + 报告加时间戳），
     // 修复「看起来点了没反应」的问题；报告区禁止文本选中，避免长按手势抢触摸。
     [self.stack addArrangedSubview:SIOSectionTitle(@"注入 / 环境自检")];
     self.checkPill = SIOPill(@"🔍 重新检测", [UIColor systemTealColor], [UIColor whiteColor]);
@@ -1603,7 +1644,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
 }
 
 - (void)doCheck {
-    // v2.1.7：点击反馈 —— 震动 + 按钮标题短暂变化 + 报告含检测时间，肉眼可见「真的重新检测了」
+    // v2.1.9：点击反馈 —— 震动 + 按钮标题短暂变化 + 报告含检测时间，肉眼可见「真的重新检测了」
     self.reportView.text = [self.model checkReport];
     [self.reportView setContentOffset:CGPointZero animated:NO];
     if (self.checkPill) {
