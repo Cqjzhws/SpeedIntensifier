@@ -321,6 +321,10 @@ static BOOL     gIsWeChat  = NO;
 // v1.8.12：黑名单在重载时一次性解析成本进程布尔值，热路径零分配（见 SIO_reload）
 static BOOL     gSelfBlacklisted = NO;
 static NSString *gSelfBundle = nil;
+// v2.1.11：gPhysBg 原定义在保活段，但热重载日志（动画段）要打印它做排障用。
+// 这里把定义前移，保活段保留注释说明它如何被维护。
+static BOOL gPhysBg = NO;   // 物理上是否处于后台（由真实生命周期通知维护）
+
 // v2.1.11：保护名单命中结果同样缓存为进程布尔。
 // SIO_hudProtected() / SIO_feelProtected() 每次调用都要 dispatch_once → 取 bundleID →
 // 数组线性遍历 + 逐项 isEqualToString:，而它们挂在 7 个高频 hook 上
@@ -2158,7 +2162,7 @@ static NSArray *gExclude   = nil;
 static BOOL    gActive    = NO;   // 本 App 最终是否参与保活（总开关 ∧ 排除名单）
 static BOOL    gUseScene  = NO;   // 本 App 是否启用场景伪装
 static BOOL    gUseAudio  = NO;   // 本 App 是否启用音频断言
-static BOOL    gPhysBg    = NO;   // 物理上是否处于后台（由真实生命周期通知维护）
+// gPhysBg 的定义已前移到文件前段（热重载日志要打印它）；注释见那里。
 static BOOL    gHasAudioMode = NO;
 
 static AVAudioPlayer *gPlayer = nil;
@@ -2469,6 +2473,8 @@ static void _fbg_stopAudio(BOOL releaseSession) {
 static void _fbg_watchdogStop(void) {
     if (gWatchdog) { [gWatchdog invalidate]; gWatchdog = nil; }
 }
+
+static void _fbg_watchdogFire(NSTimer *t);   // 前向声明：下面 Start 的 block 里要引用
 
 static void _fbg_watchdogStart(void) {
     if (gWatchdog || !gUseAudio || !gPhysBg) return;
