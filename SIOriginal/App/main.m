@@ -29,7 +29,7 @@ extern int reboot(int);
 static NSString * const PrefPath  = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
 static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.1.9";
+static NSString * const SIO_VERSION = @"v2.1.10";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 static NSArray *HardGuardBundles(void) {
@@ -643,6 +643,10 @@ static UILabel *SIOSectionTitle(NSString *t) {
 @property (strong) UITextField *ovBundle;
 @property (strong) UISwitch *ovOn, *ovSpring, *ovExtra, *ovList, *ovZoom;
 @property (strong) UISwitch *ovFastScroll, *ovFastTap;
+// v2.1.10：专属覆盖补上「瞬时打开三件套」。dylib 574~581 行是读这三个键的，
+// 但 v2.1.9 的 save() 构造覆盖字典时漏了它们，导致开了专属覆盖的 App
+// 无法单独关掉瞬时打开（想用它排查白屏就没招）。
+@property (strong) UISwitch *ovInstant, *ovHUDFast, *ovWKFast;
 @property (strong) UISlider *ovSpeed;
 @property (strong) UILabel *ovSpeedLabel, *ovGuard;
 @property (strong) UISegmentedControl *ovMode, *ovLayer, *ovFloor, *ovTrans;
@@ -757,6 +761,10 @@ static UILabel *SIOSectionTitle(NSString *t) {
     self.ovLayer.selectedSegmentIndex = LayerIndexForBoost(mine[@"LayerBoost"] ? [mine[@"LayerBoost"] doubleValue] : 1.0);
     self.ovFloor.selectedSegmentIndex = FloorIndexFor(mine[@"FloorDuration"] ? [mine[@"FloorDuration"] doubleValue] : 0.01);
     self.ovTrans.selectedSegmentIndex = TransIndexFor(mine[@"TransitionBoost"] ? [mine[@"TransitionBoost"] doubleValue] : 1.0);
+    // v2.1.10：瞬时打开三件套回显（缺键与 dylib 默认一致 = 开）
+    self.ovInstant.on = mine[@"InstantTransition"] ? [mine[@"InstantTransition"] boolValue] : YES;
+    self.ovHUDFast.on = mine[@"HUDFast"]           ? [mine[@"HUDFast"]           boolValue] : YES;
+    self.ovWKFast.on  = mine[@"WKFastShow"]        ? [mine[@"WKFastShow"]        boolValue] : YES;
 
     BOOL guarded = [HardGuardBundles() containsObject:bid];
     self.ovList.enabled = !guarded;
@@ -859,6 +867,10 @@ static UILabel *SIOSectionTitle(NSString *t) {
                 @"LayerBoost": @(LayerBoostForIndex((int)self.ovLayer.selectedSegmentIndex)),
                 @"FloorDuration":   @(FloorForIndex((int)self.ovFloor.selectedSegmentIndex)),
                 @"TransitionBoost": @(TransForIndex((int)self.ovTrans.selectedSegmentIndex)),
+                // v2.1.10：瞬时打开三件套写入专属覆盖（dylib 会读，v2.1.9 漏了）
+                @"InstantTransition": @(self.ovInstant.on),
+                @"HUDFast":           @(self.ovHUDFast.on),
+                @"WKFastShow":        @(self.ovWKFast.on),
             };
         } else {
             [ovOut removeObjectForKey:ovBid];
@@ -1016,6 +1028,30 @@ static UILabel *SIOSectionTitle(NSString *t) {
     }
     if ([d[@"UIAnimationDragCoefficient"] isKindOfClass:[NSNumber class]])
         self.segDrag.selectedSegmentIndex = DragIndexForCoeff([d[@"UIAnimationDragCoefficient"] doubleValue]);
+
+    // v2.1.10：导出配置里含 AppOverrides，导入却整块丢弃 —— 导出/导入不对称。
+    // 覆盖项在 UI 上没有一一对应的控件可逐个回显，所以直接合并写回 plist，
+    // 再把第一个 bundle 填进输入框让 refreshOverrides 回显出来。
+    if ([d[@"AppOverrides"] isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *cfg = ReadConfig();
+        NSMutableDictionary *ov = [cfg[@"AppOverrides"] isKindOfClass:[NSDictionary class]]
+                                ? [cfg[@"AppOverrides"] mutableCopy] : [NSMutableDictionary dictionary];
+        NSDictionary *inc = d[@"AppOverrides"];
+        NSUInteger n = 0;
+        for (id bid in inc) {
+            if (![bid isKindOfClass:[NSString class]]) continue;
+            id v = inc[bid];
+            if (![v isKindOfClass:[NSDictionary class]]) continue;
+            ov[(NSString *)bid] = v; n++;
+        }
+        if (n) {
+            cfg[@"AppOverrides"] = ov;
+            WriteConfig(cfg);
+            NSString *first = [ov.allKeys sortedArrayUsingSelector:@selector(compare:)].firstObject;
+            if (first) self.ovBundle.text = first;
+            [self refreshOverrides];
+        }
+    }
 
     [self refreshDynamicLabels];
     [[NSNotificationCenter defaultCenter] postNotificationName:kAppliedNote object:nil];
@@ -1433,7 +1469,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     double c = DragCoeffForIndex(idx);
     if (!m.swEnabled.on) {
         m.lblDrag.textColor = [UIColor secondaryLabelColor];
-        m.lblDrag.text = @"总开关当前关闭：保存后此项会被清成原生值（v2.1.9 起），先开总开关再选档位。";
+        m.lblDrag.text = @"总开关当前关闭：保存后此项会被清成原生值（v2.1.10 起），先开总开关再选档位。";
         return;
     }
     if (idx == 4) {
@@ -1500,6 +1536,10 @@ static UILabel *SIOSectionTitle(NSString *t) {
     m.ovZoom = [[UISwitch alloc] init];
     m.ovFastScroll = [[UISwitch alloc] init];
     m.ovFastTap = [[UISwitch alloc] init];
+    // v2.1.10：专属覆盖版「瞬时打开三件套」（与手感页同名，但只作用于这里填的 Bundle ID）
+    m.ovInstant = [[UISwitch alloc] init];
+    m.ovHUDFast = [[UISwitch alloc] init];
+    m.ovWKFast  = [[UISwitch alloc] init];
     m.ovGuard = SIOLabel(@"", 12, [UIColor secondaryLabelColor]);
 
     [self.stack addArrangedSubview:SIOCard(@[
@@ -1516,6 +1556,12 @@ static UILabel *SIOSectionTitle(NSString *t) {
         SIORow(@"缩放动画加速", m.ovZoom, nil),
         SIORow(@"滑行惯性加急", m.ovFastScroll, nil),
         SIORow(@"点击零延迟", m.ovFastTap, nil),
+        // v2.1.10：瞬时打开三件套的专属覆盖版。某个 App 白屏/转场抽搐时，
+        // 在这里单独关掉它的「瞬时打开页面」，不用动全局。
+        SIOLabel(@"瞬时打开（专属）", 15, [UIColor labelColor]),
+        SIORow(@"瞬时打开页面", m.ovInstant, nil),
+        SIORow(@"加载圈 / HUD 加速", m.ovHUDFast, nil),
+        SIORow(@"网页提前显形", m.ovWKFast, nil),
         m.ovGuard,
     ], 10)];
 
