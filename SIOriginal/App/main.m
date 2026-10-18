@@ -2149,10 +2149,16 @@ static BOOL gUIDirty = NO;
     NSString *scope = ids.count > 1
         ? [NSString stringWithFormat:@"%lu 个 Bundle ID（%@ 等）", (unsigned long)ids.count, bid]
         : bid;
-    BOOL anyGuarded = NO;
-    for (NSString *i in ids) if ([HardGuardBundles() containsObject:i]) { anyGuarded = YES; break; }
-    if (anyGuarded) {
-        m.ovGuard.text = [NSString stringWithFormat:@"⚠️ 含硬保护名单内的 Bundle ID：名单内 App 列表加速恒关。", bid];
+    // v2.1.20 修复（clang -Wformat-extra-args 实锤）：原来格式串里**没有 %@**，
+    // 却把 bid 当参数传了进来 —— 提示永远是「含硬保护名单内的 Bundle ID：…」，
+    // 不说是哪一个。这正是项目里记过的「格式串参数对不上」同一类问题
+    // （v2.1.9 自检里出现过「长按 NSString」）。现在按实际命中的 ID 逐个列出。
+    NSMutableArray *guardedIDs = [NSMutableArray array];
+    for (NSString *i in ids) if ([HardGuardBundles() containsObject:i]) [guardedIDs addObject:i];
+    if (guardedIDs.count) {
+        m.ovGuard.text = [NSString stringWithFormat:
+            @"⚠️ 硬保护名单命中：%@ —— 名单内 App 的「列表加速」恒关（dylib 启动日志 listGuard=1），其它加速项正常。",
+            [guardedIDs componentsJoinedByString:@"、"]];
         m.ovGuard.textColor = [UIColor systemOrangeColor];
     } else if (m.ovOn.on) {
         m.ovGuard.text = [NSString stringWithFormat:@"保存后将为 %@ 创建专属配置。", scope];
