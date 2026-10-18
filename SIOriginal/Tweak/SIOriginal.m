@@ -1,4 +1,4 @@
-// SIOriginal — 原版重制                                        v2.1.12
+// SIOriginal — 原版重制                                        v2.1.13
 //
 // ============================ v2.1.10 全量审计修复 ============================
 // 逐行审计 dylib（2407 行）+ 配置 App（1797 行）后修掉的四类问题：
@@ -53,6 +53,35 @@
 // [注释] ListAccel/ZoomAccel 缺键默认与注释矛盾（注释写 NO、代码是 YES）、
 //        出厂默认注释与代码矛盾（声称默认开会闪退，真凶实为 LPG hook 且已移除）。
 //        两处均为注释失真、代码正确，只改注释消除误导，不动行为。
+// =========================================================================
+//
+// ======================= v2.1.12 外部审查（第二份）补漏 =======================
+// 对照《v2.1.11 审查与功能加强报告》逐条回源码复核，实施 7 项修复 + 2 项增强：
+// [N-1] FUBG 侧缺出厂复位：_fbg_loadPref 的 `if (!d)` 只清部分全局 → 新增
+//       _fbg_resetDefaults()，与动画侧 SIO_resetDefaults() 对称。
+// [N-2] 列表硬保护名单在配置 App 侧有一份镜像（HardGuardBundles），两侧必须同步，
+//       已加交叉指向注释，改一侧时必然看到另一侧。
+// [N-3] WK 延迟隐藏入口去重：pending 期间重复 setHidden:YES 会插入第二笔延迟任务。
+// [N-4] _fbg_willPresent 未命中时吞掉 completionHandler → 补 else 分支回调。
+// [N-5] 慢放模式下 HUDDelay 不放大是有意决策，补注释（非 bug）。
+// [F-D] 新增 -[UIViewPropertyAnimator startAnimationAfterDelay:] hook。
+//       报告主张它必须共用 gInPAInit 重入锁；经复核该锁防的是 duration 双重缩放，
+//       而此处改的是 delay（另一个量），共用反而会漏掉合法调用 —— 保留判空式
+//       fail-safe，不共用锁，并在代码内写明分歧理由。
+// [F-A] 运行时 hook 命中统计（22 槽 _Atomic 计数器 + SIO_HIT 宏，70 处注入）。
+//       报告原设计是「dylib 写 plist → 配置 App 读」；该方案不可行：dylib 跑在目标
+//       App 进程内，受其沙盒限制，写不了 root 拥有的 /var/Managed Preferences/mobile/。
+//       改为「配置 App 发 Darwin 通知 → dylib 在目标 App 内弹 6s 浮层」。
+// =========================================================================
+//
+// ============================ v2.1.13 统计可读性 ============================
+// [v2.1.13-1] 命中统计浮层加**状态行**（SIO_statsStatusLine）。
+//   起因：用户在顺丰同城骑士上请求统计，看到一片 0，第一反应是「没注入/没生效」，
+//   实际是三道闸门按设计把它拦住了。纯数字无法自证。现在浮层顶部固定显示
+//   bundle id + 闸门状态（总开关关闭 / 整体黑名单命中 / 列表⛔硬保护 /
+//   手感⛔跳过 / HUD⛔跳过 / 全部生效），0 命中也能一眼判断是被拦还是真没覆盖。
+// [v2.1.13-2] 0 命中文案由「动画走了未覆盖的路径」改为「本 App 所有 hook 路径均被跳过」，
+//   前者在闸门拦截场景下是误导。
 // =========================================================================
 //
 // ============================ v2.1.7 真·闪退修复 ============================
@@ -804,6 +833,10 @@ static NSString *SIO_statsLogLine(void) {
     return s;
 }
 
+// v2.1.13：单文件编译，下方 SIO_statsStatusLine() 在 SIO_statsPanelText() 之后定义
+// → 这里必须先前向声明，否则 clang 报「implicit declaration」。
+static NSString *SIO_statsStatusLine(void);
+
 // 浮层版：只列非零项（22 项全列在手机上读不完），按命中数降序，最多 8 行。
 // 全为 0 时给一句明确的诊断提示 —— 这正是 F-A 想暴露的「走了未覆盖路径」信号。
 static NSString *SIO_statsPanelText(void) {
@@ -814,14 +847,18 @@ static NSString *SIO_statsPanelText(void) {
         total += v;
         if (v) [rows addObject:@[ @(v), [NSString stringWithUTF8String:kSIOHitNames[i]] ]];
     }
+    // v2.1.13：状态行必须在最上面。过去只给数字，用户在被保护的 App 上看到一片 0
+    // 会误判成「没生效」，实际是三道闸门把它拦住了（顺丰骑士就是这种情况）。
     if (!rows.count) {
-        return @"SIOriginal 命中统计\n本次运行 0 命中 —— 该 App 的动画走了未覆盖的路径";
+        return [NSString stringWithFormat:
+            @"SIOriginal 命中统计\n%@\n0 命中 —— 本 App 所有 hook 路径均被跳过",
+            SIO_statsStatusLine()];
     }
     [rows sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
         return [b[0] compare:a[0]];
     }];
     NSMutableString *s = [NSMutableString stringWithFormat:
-        @"SIOriginal 命中统计（共 %u 次）", total];
+        @"SIOriginal 命中统计（共 %u 次）\n%@", total, SIO_statsStatusLine()];
     NSUInteger n = MIN(rows.count, (NSUInteger)8);
     for (NSUInteger i = 0; i < n; i++) {
         [s appendFormat:@"\n%@  %@", rows[i][1], rows[i][0]];
@@ -927,6 +964,24 @@ static void SIO_dismissStats(void) {
         w.hidden = YES;
         if (sioStatsWindow == w) sioStatsWindow = nil;
     }];
+}
+
+// v2.1.13：顶部状态行。解决「报告全是 0 / 数字很小，不知道是被保护拦了还是没注入」。
+// 原来只显示命中数，用户在顺丰骑士上看到一片 0（实测确实如此：只有 CAAnim/LayerAdd
+// 走 SIO_targetDurationLayer，其余全被保护名单挡掉），第一反应是「没生效」。
+// 现在把三道闸门的状态直接写在最上面，一眼可判。
+static NSString *SIO_statsStatusLine(void) {
+    NSString *bid = SIO_bundleID() ?: @"?";
+    if (!gEnabled)
+        return [NSString stringWithFormat:@"%@  ⛔ 总开关关闭", bid];
+    if (gSelfBlacklisted)
+        return [NSString stringWithFormat:@"%@  ⛔ 整体黑名单命中", bid];
+    NSMutableString *s = [NSMutableString stringWithString:bid];
+    if (gListHardGuarded) [s appendString:@" · 列表⛔硬保护"];
+    if (gSelfFeelProtected) [s appendString:@" · 手感⛔跳过"];
+    if (gSelfHudProtected) [s appendString:@" · HUD⛔跳过"];
+    if ([s isEqualToString:bid]) [s appendString:@" · 全部生效"];
+    return s;
 }
 
 static void SIO_showStats(void) {
@@ -2110,7 +2165,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.1.12 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
+    NSLog(@"[SIOriginal] v2.1.13 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -2976,7 +3031,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.1.12 (SIOriginal v2.1.12) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.1.13 (SIOriginal v2.1.13) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
