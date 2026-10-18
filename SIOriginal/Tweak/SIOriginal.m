@@ -1,4 +1,19 @@
-// SIOriginal — 原版重制                                        v2.1.16
+// SIOriginal — 原版重制                                        v2.1.18
+//
+// ============================ v2.1.18 审查修复（两轮合并） ============================
+// 本轮 = v2.1.17 修复 + 外部审查报告核实后采纳项，全部基于 v2.1.16 原始源码重做：
+// [dylib] Enabled 缺键守卫（假开关）/ Notify 桶按保活闸门 gUseScene 判定 /
+//   黑名单两侧统一精确匹配 + 显式 * 通配（原动画侧仅精确、保活侧仅前缀，语义分叉，审查 P0-1）/
+//   出厂默认保持原状全速档 40×/5×/0.005/3×（审查 P0-2 用户拍板：不统一到标准档，
+//   维持 v2.1.16 出厂全速行为）/
+//   HUD 保护名单支付宝条目改 iOS 包名（原为安卓包名，iOS 永不命中=死保护）/
+//   AI 延迟启动确认无需闸门重检（spinner 已被请求无法撤回，原补丁为冗余分支已删，审查 P1-3）/
+//   白噪 base64 解码一次缓存（审查 P1-6）/ 瞬切滚动改下限时长事务，不再
+//   DisableActions+animated:NO（保留动画语义，审查 P0-3）。
+// [App] Blacklist 类型守卫（崩溃）/ RB_AUTOBOOT 取真值（硬重启不再退化为注销）/
+//   迁移写失败不再标记完成 / 导入 AppOverrides 单次写盘（P1-8）/ posix_spawn 失败留痕（P1-9）/
+//   硬保护与手感默认等过时文案订正 / 删除陈旧副本 Main.m（P1-12）。
+// =========================================================================
 //
 // ============================ v2.1.10 全量审计修复 ============================
 // 逐行审计 dylib（2407 行）+ 配置 App（1797 行）后修掉的四类问题：
@@ -363,7 +378,7 @@
 // 旧的因果说明会误导维护者把当前正确的默认值当成 bug 去「修回 NO」，故改写。
 static BOOL     gEnabled   = YES;
 static int      gMode      = 0;      // 0=加速 1=慢放 2=瞬切
-static double   gSpeed     = 40.0;   // 全速加速：40×
+static double   gSpeed     = 40.0;   // 全速加速：40×（v2.1.18 用户拍板保持原状，不统一标准档）
 static double   gSlowFactor = 2.0;   // 慢放倍率
 static BOOL     gSpring    = YES;    // CASpring 参数缩放
 static BOOL     gExtra     = YES;    // 导航/模态进阶转场
@@ -660,7 +675,7 @@ static BOOL SIO_hudProtected(void) {
             @"com.tencent.mqq",              // QQ
             @"com.apple.mobilesms",          // Messages
             @"com.tencent.wework",           // WeCom
-            @"com.eg.android.AlipayGphone",  // Alipay
+            @"com.alipay.iphoneclient",      // Alipay iOS — v2.1.18 修复：原条目 com.eg.android.AlipayGphone 是安卓包名，iOS 永不命中（死保护）
         ];
     });
     NSString *bid = SIO_bundleID();
@@ -689,7 +704,7 @@ static void SIO_recalc(void) {
 static void SIO_resetDefaults(void) {
     gEnabled      = YES;
     gMode         = 0;
-    gSpeed        = 40.0;
+    gSpeed        = 40.0;     // 出厂全速档（v2.1.18 用户拍板保持原状，与 reload/App UI 的 15 分叉保留）
     gSlowFactor   = 2.0;
     gSpring       = YES;
     gExtra        = YES;
@@ -722,7 +737,10 @@ static void SIO_reload(void) {
         SIO_recalc();
         return;
     }
-    gEnabled = [d[@"Enabled"] boolValue];
+    // v2.1.18 真 bug 修复：原来裸 boolValue 无缺键守卫 —— 键缺失 ⇒ nil ⇒ NO ⇒ 引擎
+    // 静默关闭，而配置 App 缺省显示「已启用」（ReadConfig Enabled 默认 YES），
+    // 正是本项目最忌的假开关。现与 Spring/Extra/ListAccel 等同款写法对齐：缺键默认开。
+    gEnabled = d[@"Enabled"] ? [d[@"Enabled"] boolValue] : YES;
     int mode = [d[@"Mode"] intValue];
     gMode = (mode >= 0 && mode <= 2) ? mode : 0;
     double sp = [d[@"Speed"] doubleValue];
@@ -781,7 +799,16 @@ static void SIO_reload(void) {
             if (![it isKindOfClass:[NSString class]]) continue;
             NSString *s = [(NSString *)it stringByTrimmingCharactersInSet:
                            [NSCharacterSet whitespaceCharacterSet]];
-            if (s.length && [bid isEqualToString:s]) { gSelfBlacklisted = YES; break; }
+            if (!s.length) continue;
+            // v2.1.18（审查 P0-1）：与保活侧 _fbg_isExcluded 统一语义 —— 默认精确匹配；
+            // 条目结尾显式写 * 才按前缀匹配（如 com.tencent.* 排除整个家族）。
+            // 原版此处仅精确匹配、保活侧仅前缀匹配，同一份黑名单两侧分叉。
+            if ([s hasSuffix:@"*"]) {
+                if (s.length > 1 && [bid hasPrefix:[s substringToIndex:s.length - 1]])
+                    { gSelfBlacklisted = YES; break; }
+            } else if ([bid isEqualToString:s]) {
+                gSelfBlacklisted = YES; break;
+            }
         }
     }
 
@@ -888,7 +915,19 @@ static NSString *SIO_statsStatusLine(void);
 // 却一个都没应用，看着像「生效很多」实为 0。v2.1.16 把每个桶拆成「调用 / 生效」两个数，
 // 并把整桶被拦掉的标 ⛔已跳过，不再误导。闸门状态在一次热重载内恒定，故按当前状态推算
 // 「是否整桶被拦」是确定性的，无需改动 70 处 hook（零编译风险）。
+// v2.1.18：Notify 桶归属保活子系统，需要读 gUseScene。单文件编译，gUseScene 定义在
+// 下方 FUBG 段，这里先做暂定声明（C 允许暂定定义与后文带初始化的定义合并，无冲突）。
+static BOOL gUseScene;
+
 static BOOL SIO_bucketSkipped(int slot) {
+    // v2.1.18 真 bug 修复：Notify 由 _fbg_willPresent 计数，其闸门是保活侧 gUseScene
+    //（∧gPhysBg），与动画总开关 gEnabled 无关。原来 !gEnabled 一律返回 YES，总开关
+    // 关闭时面板把横幅伪装误标「⛔Notify 调用N/生效0」，实际后台伪装正常生效。
+    // 黑名单精确命中的 App 保活侧同样命中排除（v2.1.18 起两侧都是精确匹配），仍算跳过。
+    if (slot == SIO_HIT_NOTIFY) {
+        if (gSelfBlacklisted) return YES;
+        return !gUseScene;
+    }
     // 总开关关 / 全局黑名单：所有动画/列表/手感/HUD 全部跳过
     if (!gEnabled || gSelfBlacklisted) return YES;
     switch (slot) {
@@ -1965,6 +2004,9 @@ static void sio_AIstartAnim(id self, SEL _cmd) {
                    dispatch_get_main_queue(), ^{
         id s = wself;
         if (!s || !objc_getAssociatedObject(s, kSIOAIDelayMark)) return;
+        // v2.1.18（审查 P1-3）：延迟窗口内闸门可能翻转（关 HUDFast / 进黑名单）。
+        // 但 spinner 是 App 已请求过的启动、无法撤回，照常补原生 startAnimating 才是对的；
+        // 故此处不重检闸门（重检后仍只能做同一件事，无意义）。
         objc_setAssociatedObject(s, kSIOAIDelayMark, nil, OBJC_ASSOCIATION_ASSIGN);
         o_AIstartAnim(s, _cmd);
     });
@@ -2288,7 +2330,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.1.16 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
+    NSLog(@"[SIOriginal] v2.1.18 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -2407,8 +2449,10 @@ static void sio_PA_startAfterDelay(id self, SEL _cmd, NSTimeInterval delay) {
 //     侧滑退出全部失灵，卡在预览页回不到微信；
 //   · 加速模式用外层 CATransaction 覆盖时长，同样可能打乱缩放事务内部时序。
 // 因此只要该 scrollView 正处于缩放活动期（缩放动画中/回弹中/当前仍放大），
-// 两个 hook 一律原样透传，不做任何时长/动画改写。普通滚动（非动画、未放大）
+// 两个 hook 一律原样旁路，不做任何时长/动画改写。普通滚动（非动画、未放大）
 // 不受影响，滚动加速照常生效。
+// v2.1.18（审查 P0-3）：普通滚动的瞬切分支也已改为「下限时长事务」，不再改
+// animated + DisableActions；本缩放旁路保护照旧保留，属双保险。
 static BOOL SIO_svZoomEngaged(UIScrollView *sv) {
     if (![sv isKindOfClass:[UIScrollView class]]) return NO;
     @try {
@@ -2428,10 +2472,14 @@ static void sio_SV_setContentOffset(id self, SEL _cmd, CGPoint p, BOOL animated)
         o_sv_setContentOffset(self, _cmd, p, animated); return;
     }
     if (gEnabled && gMode == 2) {
+        // v2.1.18（审查 P0-3）：原来瞬切用 DisableActions + animated:NO —— 取消 UIKit
+        // 滚动动画事务。缩放场景（v1.8.3/v1.8.4 取证）已证明该手法会破坏动画完成回调的
+        // 状态配对；普通滚动（自动滚顶/下拉刷新回弹/消息定位）同理，只是尚无卡死实证。
+        // 改为「下限时长事务」：视觉近瞬（默认 10ms），动画正常完成、状态机正常收尾。
         [CATransaction begin];
         @try {
-            [CATransaction setValue:(id)kCFBooleanTrue forKey:kCATransactionDisableActions];
-            o_sv_setContentOffset(self, _cmd, p, NO);
+            SIO_setTransactionDuration(SIO_floor());
+            o_sv_setContentOffset(self, _cmd, p, YES);
         } @finally { [CATransaction commit]; }
         return;
     }
@@ -2449,10 +2497,11 @@ static void sio_SV_scrollRect(id self, SEL _cmd, CGRect r, BOOL animated) {
         o_sv_scrollRect(self, _cmd, r, animated); return;
     }
     if (gEnabled && gMode == 2) {
+        // v2.1.18（审查 P0-3）：同 setContentOffset —— 下限时长事务替代 DisableActions+NO
         [CATransaction begin];
         @try {
-            [CATransaction setValue:(id)kCFBooleanTrue forKey:kCATransactionDisableActions];
-            o_sv_scrollRect(self, _cmd, r, NO);
+            SIO_setTransactionDuration(SIO_floor());
+            o_sv_scrollRect(self, _cmd, r, YES);
         } @finally { [CATransaction commit]; }
         return;
     }
@@ -2700,7 +2749,15 @@ static BOOL _fbg_isExcluded(void) {
     if (SIO_fbgBuiltinExcluded()) return YES;
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     for (NSString *b in gExclude) {
-        if ([b isKindOfClass:[NSString class]] && b.length && [bid hasPrefix:b]) return YES;
+        if (![b isKindOfClass:[NSString class]] || !b.length) continue;
+        // v2.1.18（审查 P0-1）：与动画侧（isEqualToString 精确）统一语义 ——
+        // 默认精确匹配；条目结尾显式写 * 才按前缀匹配（如 com.tencent.* 排除整个家族）。
+        // 原来所有条目一律 hasPrefix：同一份黑名单两个子系统行为分叉，家族排除是隐式行为。
+        if ([b hasSuffix:@"*"]) {
+            if (b.length > 1 && [bid hasPrefix:[b substringToIndex:b.length - 1]]) return YES;
+        } else if ([bid isEqualToString:b]) {
+            return YES;
+        }
     }
     return NO;
 }
@@ -2952,10 +3009,21 @@ static BOOL _fbg_activateSession(void) {
     return YES;
 }
 
+// v2.1.18（审查 P1-6）：白噪是编译期常量，原来每次重建 player（看门狗/中断恢复）
+// 都全量解码一次 base64（47KB）；改为解码一次缓存复用。
+static NSData *_fbg_noiseData(void) {
+    static NSData *d; static dispatch_once_t t;
+    dispatch_once(&t, ^{
+        d = [[NSData alloc] initWithBase64EncodedString:kFBGNoiseB64
+                                               options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    });
+    return d;
+}
+
 static void _fbg_buildAndPlay(void) {
     @try {
-        NSData *data = [[NSData alloc] initWithBase64EncodedString:kFBGNoiseB64
-                                                          options:NSDataBase64DecodingIgnoreUnknownCharacters];
+        NSData *data = _fbg_noiseData();
+        if (!data.length) return;
         AVAudioPlayer *p = [[AVAudioPlayer alloc] initWithData:data error:nil];
         if (!p) return;
         p.numberOfLoops = -1;
@@ -3154,7 +3222,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.1.16 (SIOriginal v2.1.16) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.1.18 (SIOriginal v2.1.18) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
