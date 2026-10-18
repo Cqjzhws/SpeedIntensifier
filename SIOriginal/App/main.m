@@ -32,7 +32,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.1.15";
+static NSString * const SIO_VERSION = @"v2.1.16";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -1718,8 +1718,12 @@ static UILabel *SIOSectionTitle(NSString *t) {
          "然后切回目标 App —— 统计浮层会在它回到前台时弹出并显示 6 秒。\n"
          "（v2.1.15 起支持常驻后台的 App：顺丰骑士这类收请求时还在后台，浮层会挂起，"
          "等你切回去才弹；以前会被「非前台不弹」直接挡掉。）\n"
-         "看什么：哪一项数字大，就说明这个 App 的动画主要走那条路"
-         "（比如 ListTV 大就调列表相关、LayerAdd 大就调显式动画倍率 LayerBoost）。\n"
+         "看什么：每一项都拆成「调用 / 生效」两个数 —— 调用=hook 被走过多少次，"
+         "生效=其中真正没被闸门拦掉、确实被加速了多少次。\n"
+         "被手感/HUD/列表/总开关保护的桶，调用数可能很大但生效恒为 0，"
+         "面板会给它标 ⛔已跳过（例如微信手感 9167 全被拦 = 生效 0，不是「手感在使劲」）。\n"
+         "哪一项「生效」数大，说明这个 App 的动画主要走那条路并被成功加速"
+         "（比如 LayerAdd 生效大就调显式动画倍率 LayerBoost）。\n"
          "浮层第一行是状态行，会写明该 App 命中了哪道闸门"
          "（总开关关闭 / 黑名单 / 列表⛔硬保护 / 手感⛔跳过 / HUD⛔跳过 / 全部生效）；"
          "数字很小或全 0 先看这一行 —— 多半是被保护名单按设计拦住了，不是没注入。\n"
