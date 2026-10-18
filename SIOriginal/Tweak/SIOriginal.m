@@ -1,4 +1,4 @@
-// SIOriginal — 原版重制                                        v2.1.10
+// SIOriginal — 原版重制                                        v2.1.11
 //
 // ============================ v2.1.10 全量审计修复 ============================
 // 逐行审计 dylib（2407 行）+ 配置 App（1797 行）后修掉的四类问题：
@@ -20,6 +20,39 @@
 //   两个 reload 均已改为主线程串行执行。
 // [微优化] sio_AIstartAnim 每次调用分配 @YES → 复用 kCFBooleanTrue + ASSIGN，零分配。
 // [一致性] 文件头 / 启动日志 / FUBG 日志三处版本号统一为 v2.1.10。
+// =========================================================================
+//
+// ============================ v2.1.11 外部审查补漏 ============================
+// 本轮以一份外部《v2.1.9 代码审查报告》为对照，逐条回源码复核后修掉我上一轮漏掉的问题
+// （均为报告确凿、我逐行复核成立者）：
+//
+// [P0-3] 配置缺失不复位：SIO_reload 的 `if (!d)` 分支只清 3 个变量，其余 15 个全局
+//   沿用上次的值且无日志 → 「删掉 plist 想恢复默认」完全无效。新增 SIO_resetDefaults()。
+// [P1-1] WKWebView setHidden: 命中时 `return` 把隐藏请求**永久丢弃**，无补执行机制。
+//   大量 App 只设一次 hidden 就依赖该状态，命中后 webView 永久可见，只能杀进程。
+//   改为「延迟执行」：加载完成或 2s 超时后一定补上，期间 App 再显示则自动作废。
+// [P1-2] 8 个 UIView 块动画 hook + 2 个老式 API hook 用 `SIO_setUIViewAnim(NO)` 无条件
+//   清零而非恢复（SIO_setTransactionDuration 里作者自己写的是保存/恢复）。嵌套块动画时
+//   外层会失去重入保护。10 处统一改为保存/恢复。
+// [P1-4] gOrigWillPresent 是全局单例：App 先后设两个不同类的 delegate 时后者覆盖前者，
+//   此后前者收到通知会被转发到**后者的原实现**（self 类型不匹配）。改为按类存储
+//   （NSMapTable<Class, IMP>），并改用 class_addMethod 避免改到父类实现。
+// [F-1]  SIO_targetDelay 每次做 1.0/gSpeed，未复用已缓存的 gInvSpeed；
+//        SIO_transitionDuration 的 d/gTransBoost 同样。新增 gInvTrans，两处改乘法。
+// [F-2]  SIO_hudProtected() / SIO_feelProtected() 未缓存：每次都走数组线性遍历 +
+//        字符串比较，却挂在 7 个高频 hook 上。改为进程布尔 gSelfHudProtected /
+//        gSelfFeelProtected，与 gSelfBlacklisted 同一套做法。
+// [F-3]  保活看门狗常驻 NSRunLoopCommonModes 且从不 invalidate：滚动时每 1.5s 唤醒
+//        主线程、前台也空转、关掉音频保活后仍空转。改为进入后台才装、回前台/关开关即卸，
+//        周期 1.5s → 3.0s。
+// [F-4]  _fbg_appState 热路径每次 dladdr 后 stringWithUTF8String: 分配 NSString +
+//        两次 containsString:。applicationState 极高频，改在 C 字符串上 strstr，零分配。
+// [F-C]  热重载不再只打 toast：补一行完整运行时状态日志（含 hudGuard / feelGuard /
+//        listHardGuarded / blacklisted / override / physBg），让「改了配置没生效」可自查。
+// [P2-1] gCustomTransFast 全文 3 处赋值 0 处消费、App 侧无入口 —— 双重死配置，删除。
+// [注释] ListAccel/ZoomAccel 缺键默认与注释矛盾（注释写 NO、代码是 YES）、
+//        出厂默认注释与代码矛盾（声称默认开会闪退，真凶实为 LPG hook 且已移除）。
+//        两处均为注释失真、代码正确，只改注释消除误导，不动行为。
 // =========================================================================
 //
 // ============================ v2.1.7 真·闪退修复 ============================
@@ -229,6 +262,9 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+// v2.1.11：strstr 用于 _fbg_appState 热路径上的 C 字符串判定（零分配），显式引入。
+#include <string.h>
+#include <dlfcn.h>
 #import <AVFoundation/AVFoundation.h>
 #import <UserNotifications/UserNotifications.h>
 #import <objc/runtime.h>
@@ -243,10 +279,12 @@
 #define kNotifyName  @"com.local.sioriginal.settingschanged"
 
 // ---------- 配置 ----------
-// v2.1.1：【重要】出厂默认回归 v1.8.18 的「已验证稳定」组合。
-// 仓库提交历史明确记录：v2.0.5 把 FastTap/FastScroll 默认开启 → 「全部 APP 闪退」，
-// v2.0.6 回退默认关闭后消失。v2.1.0 误把这三项重新默认打开，导致同样闪退。
-// 本版回退，且不再作为缺省值；开关保留，用户可在配置 App 里手动打开自担风险。
+// v2.1.11 注释订正（行为不变，只改注释）：
+// 这段注释原文声称「FastTap/FastScroll 默认开启会导致全部 App 闪退，故回退为关」，
+// 与紧邻其下的实际代码（全为 YES）直接矛盾。真实情况是：那三次「闪退」的真凶
+// 是 sio_LPG_init 这个无条件安装的坏 hook（见文件头「v2.1.7 真·闪退修复」的完整
+// 取证），与默认值无关；该 hook 已在 v2.1.7 整体移除，因此 v2.1.7 起默认值恢复全开。
+// 旧的因果说明会误导维护者把当前正确的默认值当成 bug 去「修回 NO」，故改写。
 static BOOL     gEnabled   = YES;
 static int      gMode      = 0;      // 0=加速 1=慢放 2=瞬切
 static double   gSpeed     = 40.0;   // 全速加速：40×
@@ -267,17 +305,29 @@ static BOOL     gInstantTransition = YES;   // v2.1.8 full-speed default-on
 static BOOL     gHUDFast       = YES;
 static double   gHUDDelay      = 0.15;
 static BOOL     gWKFastShow    = YES;
-static BOOL     gCustomTransFast = NO;
+// v2.1.11：gCustomTransFast 已删除。它是个**双重死配置** —— 全文 3 处赋值、0 处消费，
+// 且 App 侧不在 SIOConfigKeys 白名单、不在 save()、也没有任何 UI 控件能写它。
+// 按本项目 v2.1.0 定下的判定标准（「dylib 读了却没有任何消费方 = 假开关」）直接移除。
 
 // ---------- 热路径派生量 ----------
 static double   gInvSpeed    = 1.0 / 40.0;
 static double   gInvLayer    = 1.0 / 5.0;
+// v2.1.11：转场倍率倒数。SIO_transitionDuration 里原本每次做 `d / gTransBoost`，
+// 与 gInvSpeed / gInvLayer 同一套「除法→乘法」范式，只是当年漏了这一处。
+static double   gInvTrans    = 1.0 / 3.0;
 static double   gFloorCached = 0.005;
 static BOOL     gBlockedFast = NO;
 static BOOL     gIsWeChat  = NO;
 // v1.8.12：黑名单在重载时一次性解析成本进程布尔值，热路径零分配（见 SIO_reload）
 static BOOL     gSelfBlacklisted = NO;
 static NSString *gSelfBundle = nil;
+// v2.1.11：保护名单命中结果同样缓存为进程布尔。
+// SIO_hudProtected() / SIO_feelProtected() 每次调用都要 dispatch_once → 取 bundleID →
+// 数组线性遍历 + 逐项 isEqualToString:，而它们挂在 7 个高频 hook 上
+// （startAnimating、WKWebView setHidden:、SV/MB HUD、ScrollView 三个 setter）。
+// bundle id 进程内恒定不变，与 gSelfBlacklisted 完全同级，故只算一次。
+static BOOL     gSelfHudProtected  = NO;
+static BOOL     gSelfFeelProtected = NO;
 
 static pthread_key_t gInUIViewAnimKey;
 static pthread_key_t gInPAInitKey;   // v1.8.12：UIViewPropertyAnimator 初始化重入保护
@@ -478,14 +528,45 @@ static void SIO_recalc(void) {
     gFloorCached = (gFloorDuration >= 0.005 && gFloorDuration <= 0.1) ? gFloorDuration : 0.01;
     gInvSpeed    = (gSpeed > 1.0001) ? (1.0 / gSpeed) : 1.0;
     gInvLayer    = (gLayerBoost > 1.0001) ? (1.0 / gLayerBoost) : 1.0;
+    gInvTrans    = (gTransBoost > 1.0001) ? (1.0 / gTransBoost) : 1.0;
     gBlockedFast = (!gEnabled || gSelfBlacklisted);
+}
+
+// v2.1.11：配置缺失/损坏时的统一复位表。
+// 原来 `if (!d)` 分支只重置 3 个变量，其余 15 个全局量全部沿用上一次的值，
+// 且没有任何日志。后果是「删掉 plist 想恢复默认」这个最常用的排障手段完全无效 ——
+// dylib 会顽固保持旧配置直到目标 App 重启。现在缺文件即回到出厂默认值，
+// 并打一条日志让「配置读不到」这件事变得可见。
+static void SIO_resetDefaults(void) {
+    gEnabled      = YES;
+    gMode         = 0;
+    gSpeed        = 40.0;
+    gSlowFactor   = 2.0;
+    gSpring       = YES;
+    gExtra        = YES;
+    gListAccel    = YES;      // v2.1.7 起全开，与静态初值一致（见下方注释说明）
+    gZoomAccel    = YES;
+    gFastScroll   = YES;
+    gFastTap      = YES;
+    gLayerBoost    = 5.0;
+    gFloorDuration = 0.005;
+    gTransBoost    = 3.0;
+    gInAppNotify   = YES;
+    gInstantTransition = YES;
+    gHUDFast       = YES;
+    gHUDDelay      = 0.15;
+    gWKFastShow    = YES;
+    gSelfBlacklisted = NO;
+    gHasAppOverride  = NO;
 }
 
 static void SIO_reload(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
     if (!d) {
-        gSelfBlacklisted = NO;
-        gHasAppOverride  = NO;
+        // v2.1.11：完整复位 + 留痕。原来这里只清 3 个变量，等于「删配置不生效」。
+        SIO_resetDefaults();
+        NSLog(@"[SIOriginal] prefs file missing/unreadable at %@ — reset to factory defaults",
+              kPrefPath);
         // 配置缺失也要执行硬保护，保证"没有配置文件"时顺丰同城同样安全
         gListHardGuarded = SIO_listHardBlocked();
         if (gListHardGuarded) gListAccel = NO;
@@ -501,11 +582,14 @@ static void SIO_reload(void) {
     gSlowFactor = (sf > 1.0 && sf <= 10.0) ? sf : 2.0;
     gSpring = d[@"Spring"] ? [d[@"Spring"] boolValue] : YES;
     gExtra  = d[@"Extra"]  ? [d[@"Extra"] boolValue]  : YES;
-    // v1.8.12：缺键默认 NO（原来 `: YES`）。配置 plist 一旦缺 ListAccel（旧版本写入的、
-    // 手工编辑过的、被其他工具覆盖过的），原来会静默打开 24 个列表 hook，
-    // 在重列表 App 上直接破坏列表状态机——危险功能必须 fail-safe。
+    // v2.1.11 注释订正（行为不变，只改注释）：
+    // 这两行紧邻的注释曾长期写着「缺键默认 NO」，但代码一直是 `: YES`。
+    // 这不是笔误 —— v2.1.7 明确改回全开，只是注释没跟着改，于是注释变成了
+    // 一份**虚假的安全承诺**：读代码的人以为有 fail-safe，实际没有。
+    // 真实兜底是另外两道：SIO_listHardBlocked()（顺丰骑士 / SpringBoard 硬保护，
+    // 全局开关与 App 覆盖都绕不过）和 SIO_svZoomEngaged() /
+    // SIO_wechatZoomPreviewActive() 两道运行时安全网。是否全开由 v2.1.7 决策决定。
     gListAccel = d[@"ListAccel"] ? [d[@"ListAccel"] boolValue] : YES;
-    // v1.8.15：缩放动画加速，缺键默认 NO（同一族在微信上出过「预览页卡死」，必须显式开）
     gZoomAccel = d[@"ZoomAccel"] ? [d[@"ZoomAccel"] boolValue] : YES;
     // v2.1.7：手感开关缺省开（hook 按需安装）；v2.0.6 那次「闪退」实为 LPG hook 所致
     gFastScroll = d[@"FastScroll"] ? [d[@"FastScroll"] boolValue] : YES;
@@ -531,7 +615,6 @@ static void SIO_reload(void) {
     double hd = d[@"HUDDelay"] ? [d[@"HUDDelay"] doubleValue] : 0.15;
     gHUDDelay          = (hd >= 0.02 && hd <= 1.0) ? hd : 0.15;
     gWKFastShow        = d[@"WKFastShow"]        ? [d[@"WKFastShow"]        boolValue] : YES;
-    gCustomTransFast   = d[@"CustomTransFast"]   ? [d[@"CustomTransFast"]   boolValue] : NO;
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     gSelfBlacklisted = NO;
@@ -601,7 +684,6 @@ static void SIO_reload(void) {
             if (hd2 >= 0.02 && hd2 <= 1.0) gHUDDelay = hd2;
         }
         if (ovr[@"WKFastShow"])        gWKFastShow        = [ovr[@"WKFastShow"]        boolValue];
-        if (ovr[@"CustomTransFast"])   gCustomTransFast   = [ovr[@"CustomTransFast"]   boolValue];
     }
 
     // ---- v1.8.14：列表 hook 硬保护，必须放在所有覆盖之后，优先级最高 ----
@@ -720,6 +802,15 @@ static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             SIO_reload();
+            // v2.1.11：热重载也打印一行完整状态。原来启动日志只在 constructor 打一次，
+            // 用户最常见的报障是「我改了配置但没生效」，而当时无法区分是
+            // 没写进 plist / dylib 没收到通知 / 收到了但命中保护名单。现在三种情况可分辨。
+            NSLog(@"[SIOriginal] reload in %@: enabled=%d mode=%d speed=%.1f "
+                  @"hudProtected=%d feelProtected=%d listHardGuarded=%d "
+                  @"blacklisted=%d override=%d physBg=%d",
+                  SIO_bundleID(), gEnabled, gMode, gSpeed,
+                  gSelfHudProtected, gSelfFeelProtected, gListHardGuarded,
+                  gSelfBlacklisted, gHasAppOverride, gPhysBg);
             // v2.0.0：热重载成功后在目标 App 内给出短暂、不拦截触摸的生效提示
             SIO_showToast();
         } @catch (__unused NSException *e) {}
@@ -945,7 +1036,9 @@ static inline double SIO_targetDelay(double delay) {
     switch (gMode) {
         case 1:  f = gSlowFactor;                               break;  // 慢放：延迟同倍放大
         case 2:  f = 0.0;                                       break;  // 瞬切：延迟归零
-        default: f = (gSpeed <= 1.0001) ? 1.0 : 1.0 / gSpeed;    break;  // 加速：延迟同倍缩短
+        // v2.1.11：改用 SIO_recalc 里已缓存的 gInvSpeed（语义等价：gSpeed<=1.0001 时
+        // gInvSpeed 已被置 1.0）。SIO_targetDuration 早就这么做了，这里当年漏改。
+        default: f = gInvSpeed;                                  break;  // 加速：延迟同倍缩短
     }
     return delay * f;
 }
@@ -953,55 +1046,61 @@ static inline double SIO_targetDelay(double delay) {
 static void sio_UV_anim_d(Class self, SEL _cmd, double d, void (^a)(void)) {
     SIO_REQUIRE_ORIG(o_UV_anim_d);
     if (SIO_blocked()) { o_UV_anim_d(self, _cmd, d, a); return; }
+    BOOL wasAnim = SIO_inUIViewAnim();
     SIO_setUIViewAnim(YES);
     o_UV_anim_d(self, _cmd, SIO_targetDuration(d), a);
-    SIO_setUIViewAnim(NO);
+    SIO_setUIViewAnim(wasAnim);   // v2.1.11：恢复而非清零，嵌套块动画时外层不丢重入保护
 }
 
 static void sio_UV_anim_dc(Class self, SEL _cmd, double d, void (^a)(void), void (^c)(BOOL)) {
     SIO_REQUIRE_ORIG(o_UV_anim_dc);
     if (SIO_blocked()) { o_UV_anim_dc(self, _cmd, d, a, c); return; }
+    BOOL wasAnim = SIO_inUIViewAnim();
     SIO_setUIViewAnim(YES);
     o_UV_anim_dc(self, _cmd, SIO_targetDuration(d), a, c);
-    SIO_setUIViewAnim(NO);
+    SIO_setUIViewAnim(wasAnim);   // v2.1.11：恢复而非清零，嵌套块动画时外层不丢重入保护
 }
 
 static void sio_UV_anim_ddoc(Class self, SEL _cmd, double d, double delay, UIViewAnimationOptions o,
                              void (^a)(void), void (^c)(BOOL)) {
     SIO_REQUIRE_ORIG(o_UV_anim_ddoc);
     if (SIO_blocked()) { o_UV_anim_ddoc(self, _cmd, d, delay, o, a, c); return; }
+    BOOL wasAnim = SIO_inUIViewAnim();
     SIO_setUIViewAnim(YES);
     o_UV_anim_ddoc(self, _cmd, SIO_targetDuration(d), SIO_targetDelay(delay), o, a, c);
-    SIO_setUIViewAnim(NO);
+    SIO_setUIViewAnim(wasAnim);   // v2.1.11：恢复而非清零，嵌套块动画时外层不丢重入保护
 }
 
 static void sio_UV_anim_spring(Class self, SEL _cmd, double d, double damp, double vel,
                                UIViewAnimationOptions o, void (^a)(void), void (^c)(BOOL)) {
     SIO_REQUIRE_ORIG(o_UV_anim_spring);
     if (SIO_blocked()) { o_UV_anim_spring(self, _cmd, d, damp, vel, o, a, c); return; }
+    BOOL wasAnim = SIO_inUIViewAnim();
     SIO_setUIViewAnim(YES);
     double m = SIO_springScale();
     o_UV_anim_spring(self, _cmd, SIO_targetDuration(d),
                      1.0 - (1.0 - damp) / m, vel * m, o, a, c);
-    SIO_setUIViewAnim(NO);
+    SIO_setUIViewAnim(wasAnim);   // v2.1.11：恢复而非清零，嵌套块动画时外层不丢重入保护
 }
 
 static void sio_UV_trans(Class self, SEL _cmd, UIView *v, double d, UIViewAnimationOptions o,
                          void (^a)(void), void (^c)(BOOL)) {
     SIO_REQUIRE_ORIG(o_UV_trans);
     if (SIO_blocked()) { o_UV_trans(self, _cmd, v, d, o, a, c); return; }
+    BOOL wasAnim = SIO_inUIViewAnim();
     SIO_setUIViewAnim(YES);
     o_UV_trans(self, _cmd, v, SIO_targetDuration(d), o, a, c);
-    SIO_setUIViewAnim(NO);
+    SIO_setUIViewAnim(wasAnim);   // v2.1.11：恢复而非清零，嵌套块动画时外层不丢重入保护
 }
 
 static void sio_UV_transFrom(Class self, SEL _cmd, UIView *a1, UIView *a2, double d,
                              UIViewAnimationOptions o, void (^an)(void), void (^c)(BOOL)) {
     SIO_REQUIRE_ORIG(o_UV_transFrom);
     if (SIO_blocked()) { o_UV_transFrom(self, _cmd, a1, a2, d, o, an, c); return; }
+    BOOL wasAnim = SIO_inUIViewAnim();
     SIO_setUIViewAnim(YES);
     o_UV_transFrom(self, _cmd, a1, a2, SIO_targetDuration(d), o, an, c);
-    SIO_setUIViewAnim(NO);
+    SIO_setUIViewAnim(wasAnim);   // v2.1.11：恢复而非清零，嵌套块动画时外层不丢重入保护
 }
 
 // v2.0.0 新增：无 animations 段的转场便捷变体
@@ -1011,9 +1110,10 @@ static void sio_UV_transFromNoAnim(Class self, SEL _cmd, UIView *a1, UIView *a2,
                                    UIViewAnimationOptions o, void (^c)(BOOL)) {
     SIO_REQUIRE_ORIG(o_UV_transFromNoAnim);
     if (SIO_blocked()) { o_UV_transFromNoAnim(self, _cmd, a1, a2, d, o, c); return; }
+    BOOL wasAnim = SIO_inUIViewAnim();
     SIO_setUIViewAnim(YES);
     o_UV_transFromNoAnim(self, _cmd, a1, a2, SIO_targetDuration(d), o, c);
-    SIO_setUIViewAnim(NO);
+    SIO_setUIViewAnim(wasAnim);   // v2.1.11：恢复而非清零，嵌套块动画时外层不丢重入保护
 }
 
 // ---- v1.8.12 新增：关键帧动画 ----
@@ -1025,9 +1125,10 @@ static void sio_UV_anim_keyframes(Class self, SEL _cmd, double d, double delay, 
                                   void (^a)(void), void (^c)(BOOL)) {
     SIO_REQUIRE_ORIG(o_UV_anim_keyframes);
     if (SIO_blocked()) { o_UV_anim_keyframes(self, _cmd, d, delay, o, a, c); return; }
+    BOOL wasAnim = SIO_inUIViewAnim();
     SIO_setUIViewAnim(YES);
     o_UV_anim_keyframes(self, _cmd, SIO_targetDuration(d), SIO_targetDelay(delay), o, a, c);
-    SIO_setUIViewAnim(NO);
+    SIO_setUIViewAnim(wasAnim);   // v2.1.11：恢复而非清零，嵌套块动画时外层不丢重入保护
 }
 
 // ---- v1.8.12 新增：系统动画（删除/插入/重排等系统内建动画） ----
@@ -1061,9 +1162,10 @@ static void sio_UV_setAnimDuration(Class self, SEL _cmd, double d) {
     if (SIO_blocked() || SIO_inUIViewAnim()) { o_UV_setAnimDuration(self, _cmd, d); return; }
     // 置起标记后再调原 IMP：若 UIKit 把老式 API 落到 CATransaction.setAnimationDuration:
     // （或回调本方法自身），那一层会被自己的 hook 跳过，保证只缩放一次。
+    BOOL wasAnim = SIO_inUIViewAnim();
     SIO_setUIViewAnim(YES);
     o_UV_setAnimDuration(self, _cmd, SIO_targetDuration(d));
-    SIO_setUIViewAnim(NO);
+    SIO_setUIViewAnim(wasAnim);   // v2.1.11：恢复而非清零，嵌套块动画时外层不丢重入保护
 }
 
 static void sio_UV_setAnimDelay(Class self, SEL _cmd, double d) {
@@ -1071,9 +1173,10 @@ static void sio_UV_setAnimDelay(Class self, SEL _cmd, double d) {
     if (SIO_blocked() || SIO_inUIViewAnim()) { o_UV_setAnimDelay(self, _cmd, d); return; }
     // 延迟与块动画 animateWithDuration:delay: 保持同一套换算：
     // 加速 → d/speed，慢放 → d×slowFactor，瞬切 → 0
+    BOOL wasAnim = SIO_inUIViewAnim();
     SIO_setUIViewAnim(YES);
     o_UV_setAnimDelay(self, _cmd, SIO_targetDelay(d));
-    SIO_setUIViewAnim(NO);
+    SIO_setUIViewAnim(wasAnim);   // v2.1.11：恢复而非清零，嵌套块动画时外层不丢重入保护
 }
 
 #pragma mark - CASpring（原版灵魂功能：参数缩放保持物理一致性）
@@ -1116,7 +1219,7 @@ static inline double SIO_transitionDuration(void) {
     if (gEnabled && gMode != 1 && gInstantTransition) return 0.001;
     double d = SIO_targetDuration(0.35);
     if (gEnabled && gMode != 1 && gTransBoost > 1.0001 && d > 0.0) {
-        d = d / gTransBoost;
+        d = d * gInvTrans;   // v2.1.11：除法→乘法，与 gInvSpeed / gInvLayer 同一套
         double fl = SIO_floor();
         if (d < fl) d = fl;
     }
@@ -1395,7 +1498,7 @@ static const void *kSIOAIDelayMark = &kSIOAIDelayMark;
 
 static void sio_AIstartAnim(id self, SEL _cmd) {
     SIO_REQUIRE_ORIG(o_AIstartAnim);
-    if (SIO_blocked() || !gHUDFast || SIO_hudProtected()) { o_AIstartAnim(self, _cmd); return; }
+    if (SIO_blocked() || !gHUDFast || gSelfHudProtected) { o_AIstartAnim(self, _cmd); return; }
     // v2.1.10 微优化：原来每次 startAnimating 都新建一个 @YES（NSNumber 分配）。
     // 这里改复用不朽常量 kCFBooleanTrue + ASSIGN 策略，与 SIO_markAnimScaled 同一套做法：
     // 常量永不释放，ASSIGN 不会悬垂，热路径（下拉刷新/列表加载）零分配。
@@ -1427,15 +1530,60 @@ static Class sio_WKClass(void) {
     dispatch_once(&tok, ^{ c = objc_getClass("WKWebView"); });
     return c;
 }
+// v2.1.11 真隐患修复：原来命中条件是 `return` —— 直接把 App 的 `webView.hidden = YES`
+// **永久丢弃**，且没有任何补执行机制。注释假设「加载完成后 App 会再调一次隐藏」，
+// 但现实中大量 App 只在某个状态切换点设一次 hidden，之后依赖这个状态不再重设。
+// 这类 App 命中后 webView 会永久可见盖住原生内容（或反过来原生内容永不显示），
+// 用户只能杀进程 —— 与本项目最忌惮的「丢弃一次状态设置、破坏状态配对」同一性质
+// （参考微信预览「工具栏永远停在隐藏态，只能杀微信」的取证记录）。
+//
+// 改成「延迟执行」：不拒绝这次隐藏，只把它推后。加载结束或总超时（2s）后一定补上
+// o_WKsetHidden(YES)，保证每一次隐藏请求最终都会执行。若期间 App 又调用了
+// setHidden:NO（重新显示），pending 标记被清，延后的隐藏自动作废。
+static const void *kSIOWKHidePending = &kSIOWKHidePending;
+
+static void sio_WKdeferHide(id wv, int attempt) {
+    objc_setAssociatedObject(wv, kSIOWKHidePending,
+                             (__bridge id)kCFBooleanTrue, OBJC_ASSOCIATION_ASSIGN);
+    __weak id wself = wv;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        id s = wself;
+        if (!s || !o_WKsetHidden) return;
+        // App 期间又把它显示回来了 → 这次延后的隐藏作废，不再补执行
+        if (!objc_getAssociatedObject(s, kSIOWKHidePending)) return;
+        BOOL loading = NO;
+        @try {
+            loading = ((BOOL (*)(id, SEL))objc_msgSend)(s, @selector(isLoading));
+        } @catch (__unused NSException *e) {}
+        // 最多等 2s（8 × 0.25s），超时无条件补执行 —— 绝不永久吞掉一次隐藏
+        if (loading && attempt < 7) { sio_WKdeferHide(s, attempt + 1); return; }
+        objc_setAssociatedObject(s, kSIOWKHidePending, nil, OBJC_ASSOCIATION_ASSIGN);
+        o_WKsetHidden(s, @selector(setHidden:), YES);
+    });
+}
+
 static void sio_WKsetHidden(id self, SEL _cmd, BOOL hidden) {
     SIO_REQUIRE_ORIG(o_WKsetHidden);
     Class wkc = sio_WKClass();
     if (!wkc || ![self isKindOfClass:wkc]) { o_WKsetHidden(self, _cmd, hidden); return; }
-    if (hidden && !SIO_blocked() && gWKFastShow && !SIO_hudProtected()) {
-        BOOL loading = ((BOOL (*)(id, SEL))objc_msgSend)(self, @selector(isLoading));
+    if (!hidden) {
+        // 显示请求：作废任何待补的隐藏（状态以 App 的最新意图为准）
+        objc_setAssociatedObject(self, kSIOWKHidePending, nil, OBJC_ASSOCIATION_ASSIGN);
+        o_WKsetHidden(self, _cmd, hidden);
+        return;
+    }
+    if (!SIO_blocked() && gWKFastShow && !gSelfHudProtected) {
+        BOOL loading = NO;
+        @try {
+            loading = ((BOOL (*)(id, SEL))objc_msgSend)(self, @selector(isLoading));
+        } @catch (__unused NSException *e) {}
         if (loading) {
-            double progress = ((double (*)(id, SEL))objc_msgSend)(self, @selector(estimatedProgress));
-            if (progress > 0.1) return;   // keep visible; once loaded, normal hide works
+            double progress = 0.0;
+            @try {
+                progress = ((double (*)(id, SEL))objc_msgSend)(self, @selector(estimatedProgress));
+            } @catch (__unused NSException *e) {}
+            if (progress > 0.1) { sio_WKdeferHide(self, 0); return; }   // 只延后，不丢弃
         }
     }
     o_WKsetHidden(self, _cmd, hidden);
@@ -1444,7 +1592,7 @@ static void sio_WKsetHidden(id self, SEL _cmd, BOOL hidden) {
 // SVProgressHUD class method +dismissWithDelay:completion: force near-zero delay.
 static void sio_SVHUDDelay(id self, SEL _cmd, NSTimeInterval delay, void (^completion)(void)) {
     SIO_REQUIRE_ORIG(o_SVHUDDelay);
-    if (SIO_blocked() || !gHUDFast || SIO_hudProtected()) {
+    if (SIO_blocked() || !gHUDFast || gSelfHudProtected) {
         o_SVHUDDelay(self, _cmd, delay, completion); return;
     }
     o_SVHUDDelay(self, _cmd, 0.001, completion);
@@ -1453,7 +1601,7 @@ static void sio_SVHUDDelay(id self, SEL _cmd, NSTimeInterval delay, void (^compl
 // MBProgressHUD instance method -hideAnimated: drop the hide animation.
 static void sio_MBHUDHide(id self, SEL _cmd, BOOL animated) {
     SIO_REQUIRE_ORIG(o_MBHUDHide);
-    if (SIO_blocked() || !gHUDFast || SIO_hudProtected()) { o_MBHUDHide(self, _cmd, animated); return; }
+    if (SIO_blocked() || !gHUDFast || gSelfHudProtected) { o_MBHUDHide(self, _cmd, animated); return; }
     o_MBHUDHide(self, _cmd, NO);
 }
 
@@ -1467,6 +1615,10 @@ static void SIOriginalInit(void) {
     pthread_key_create(&gInPAInitKey, NULL);
     gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     gIsWeChat = [gSelfBundle isEqualToString:@"com.tencent.xin"];
+    // v2.1.11：保护名单命中结果在此一次性算完，之后 7 个高频 hook 只读布尔。
+    // bundle id 进程内不变，热重载也无需重算。
+    gSelfHudProtected  = SIO_hudProtected();
+    gSelfFeelProtected = SIO_feelProtected();
     SIO_reload();
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
@@ -1658,12 +1810,12 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.1.10 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d)",
+    NSLog(@"[SIOriginal] v2.1.11 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
           gInstantTransition, gHUDFast, gHUDDelay, gWKFastShow,
-          gHasAppOverride, gListHardGuarded);
+          gHasAppOverride, gListHardGuarded, gSelfHudProtected, gSelfFeelProtected);
     if (SIO_fbgBuiltinExcluded()) {
         NSLog(@"[SIOriginal] %@ is a built-in keep-alive exclusion: audio-assertion/scene-fake engine stays OFF", gSelfBundle);
     }
@@ -1863,7 +2015,7 @@ static void sio_SV_didMoveToWindow(id self, SEL _cmd) {
     if (!gFastScroll && !gFastTap) return;
     if (SIO_blocked()) return;
     // v2.1.7 fix：对依赖长按/原生手势的 App（微信等）整个手感模块跳过。
-    if (SIO_feelProtected()) return;
+    if (gSelfFeelProtected) return;
     @try {
         UIScrollView *sv = (UIScrollView *)self;
         if (gFastScroll && sv.decelerationRate != UIScrollViewDecelerationRateFast) {
@@ -1880,13 +2032,13 @@ static void sio_SV_didMoveToWindow(id self, SEL _cmd) {
 // 改回去，旧版就"时灵时不灵"。setter 层钳回，开关真正全程生效。
 static void sio_SV_setDecelRate(id self, SEL _cmd, CGFloat rate) {
     SIO_REQUIRE_ORIG(o_sv_setDecelRate);
-    if (!SIO_blocked() && gFastScroll && !SIO_feelProtected()) rate = UIScrollViewDecelerationRateFast;
+    if (!SIO_blocked() && gFastScroll && !gSelfFeelProtected) rate = UIScrollViewDecelerationRateFast;
     o_sv_setDecelRate(self, _cmd, rate);
 }
 
 static void sio_SV_setDelaysTouches(id self, SEL _cmd, BOOL b) {
     SIO_REQUIRE_ORIG(o_sv_setDelaysTouches);
-    if (!SIO_blocked() && gFastTap && !SIO_feelProtected()) b = NO;
+    if (!SIO_blocked() && gFastTap && !gSelfFeelProtected) b = NO;
     o_sv_setDelaysTouches(self, _cmd, b);
 }
 
@@ -2126,9 +2278,12 @@ static UIApplicationState _fbg_appState(id self, SEL _cmd) {
         void *ret = __builtin_extract_return_addr(__builtin_return_address(0));
         Dl_info info;
         if (dladdr(ret, &info) && info.dli_fname) {
-            NSString *image = [NSString stringWithUTF8String:info.dli_fname] ?: @"";
-            if ([image containsString:@"UserNotifications"] ||
-                [image containsString:@"PushKit"]) {
+            // v2.1.11：原来每次都 stringWithUTF8String: 分配一个 NSString
+            // 再做两次 containsString: 子串搜索。applicationState 是极高频属性
+            // （网络请求/埋点/图片加载/生命周期判断都会读它），后台伪装期间每次
+            // 读取都要堆分配 + 两次子串搜索。直接在 C 字符串上判断，零分配。
+            if (strstr(info.dli_fname, "UserNotifications") ||
+                strstr(info.dli_fname, "PushKit")) {
                 return UIApplicationStateBackground;
             }
         }
@@ -2138,8 +2293,33 @@ static UIApplicationState _fbg_appState(id self, SEL _cmd) {
 }
 
 // ---- 通知横幅伪装 ----
-static void (*gOrigWillPresent)(id, SEL, UNUserNotificationCenter *, UNNotification *,
-                                void (^)(UNNotificationPresentationOptions));
+// v2.1.11：orig 指针原来是**全局单例** gOrigWillPresent。
+// 若 App 先后设置两个不同类的 delegate，第二个会把第一个记录的 IMP 覆盖掉，
+// 此后第一个 delegate 收到通知时会被转发到**第二个类的原实现**，self 却是第一个类的
+// 实例 —— 参数类型不匹配，轻则行为错乱重则崩溃。现在改为按类存储。
+typedef void (*SIO_WillPresentIMP)(id, SEL, UNUserNotificationCenter *, UNNotification *,
+                                   void (^)(UNNotificationPresentationOptions));
+
+static NSMapTable *gOrigWillPresentMap = nil;   // Class -> NSValue(IMP)
+
+static void SIO_setOrigWillPresent(Class c, IMP imp) {
+    if (!c || !imp) return;
+    if (!gOrigWillPresentMap)
+        gOrigWillPresentMap = [NSMapTable mapTableWithKeyOptions:NSMapTableStrongMemory
+                                                   valueOptions:NSMapTableStrongMemory];
+    [gOrigWillPresentMap setObject:[NSValue valueWithPointer:(void *)imp] forKey:(id)c];
+}
+
+// 沿 superclass 链向上找：B 继承 A 且未重写该方法时，我们 hook 的是 A 的实现，
+// 而 self 是 B 的实例，[self class] 取不到 A 存的 orig，必须向上回溯。
+static SIO_WillPresentIMP SIO_origWillPresentFor(Class c) {
+    if (!gOrigWillPresentMap) return NULL;
+    for (Class k = c; k; k = class_getSuperclass(k)) {
+        NSValue *v = [gOrigWillPresentMap objectForKey:(id)k];
+        if (v) return (SIO_WillPresentIMP)[v pointerValue];
+    }
+    return NULL;
+}
 
 static void _fbg_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center,
                              UNNotification *note,
@@ -2148,9 +2328,10 @@ static void _fbg_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center
         handler(UNNotificationPresentationOptionBanner |
                 UNNotificationPresentationOptionSound |
                 UNNotificationPresentationOptionBadge);
-    } else if (gOrigWillPresent) {
-        gOrigWillPresent(self, _cmd, center, note, handler);
+        return;
     }
+    SIO_WillPresentIMP orig = SIO_origWillPresentFor([self class]);
+    if (orig) orig(self, _cmd, center, note, handler);
 }
 
 static void (*gOrigUNSetDelegate)(id, SEL, id);
@@ -2164,8 +2345,14 @@ static void _fbg_unSetDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDel
         if (m) {
             IMP cur = method_getImplementation(m);
             if (cur != (IMP)_fbg_willPresent) {
-                gOrigWillPresent = (void *)cur;
-                method_setImplementation(m, (IMP)_fbg_willPresent);
+                // v2.1.11：class_getInstanceMethod 可能返回**父类**的 Method。
+                // 直接用 method_setImplementation 会改到父类实现，影响面超出预期。
+                // 先尝试 class_addMethod：成功 = 本类无实现（新增子类覆写，orig 即父类 IMP）；
+                // 失败 = 本类已有实现，正常替换。两种情况 orig 都记为 cur。
+                if (!class_addMethod(dc, sel, (IMP)_fbg_willPresent, method_getTypeEncoding(m))) {
+                    method_setImplementation(m, (IMP)_fbg_willPresent);
+                }
+                SIO_setOrigWillPresent(dc, cur);
             }
         }
     }
@@ -2271,6 +2458,24 @@ static void _fbg_stopAudio(BOOL releaseSession) {
     } @catch (__unused NSException *e) {}
 }
 
+// v2.1.11：看门狗改为**按需装卸**。原来在 constructor 里无条件安装，三个问题叠加：
+//   1. 挂在 NSRunLoopCommonModes（含 UITrackingRunLoopMode）→ 用户滚动列表时
+//      主线程每 1.5s 被唤醒一次，回调里第一行就 return，纯属空转，影响流畅度与耗电；
+//   2. 前台也常驻 —— 整个前台使用期间都在跑；
+//   3. 从不 invalidate —— 用户在配置 App 关掉「音频保活」后定时器依旧空转到进程退出。
+// 现在只在真正进入后台时安装（后台无滚动，NSDefaultRunLoopMode 足够），
+// 回前台即卸载；prefs 里关掉音频保活时同样卸载。周期 1.5s → 3.0s
+// （自愈场景本身有 0.3s 的中断恢复通道，不需要这么密的轮询）。
+static void _fbg_watchdogStop(void) {
+    if (gWatchdog) { [gWatchdog invalidate]; gWatchdog = nil; }
+}
+
+static void _fbg_watchdogStart(void) {
+    if (gWatchdog || !gUseAudio || !gPhysBg) return;
+    gWatchdog = [NSTimer scheduledTimerWithTimeInterval:3.0 repeats:YES
+                                                  block:^(NSTimer *t){ _fbg_watchdogFire(t); }];
+}
+
 // 自愈轮询：仅在停摆时重建，兼顾可靠与耗电
 static void _fbg_watchdogFire(__unused NSTimer *t) {
     if (!gUseAudio || !gPhysBg) return;
@@ -2315,10 +2520,12 @@ static void _fbg_onInterruption(NSNotification *note) {
 static void _fbg_onEnterBackground(NSNotification *note) {
     gPhysBg = YES;
     _fbg_startAudio();
+    _fbg_watchdogStart();   // v2.1.11：只在真后台时装看门狗，前台不再空转
 }
 
 static void _fbg_onEnterForeground(NSNotification *note) {
     gPhysBg = NO;
+    _fbg_watchdogStop();    // v2.1.11：回前台立即卸载
     // 回前台只暂停播放、保留会话（mix 模式下不与 App 音频冲突）
     if (gPlayer.isPlaying) [gPlayer pause];
     if (gTask != 0) {
@@ -2335,10 +2542,10 @@ static void _fbg_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n,
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             _fbg_loadPref();
-            NSLog(@"[FUBG] prefs reloaded: active=%d scene=%d audio=%d override=%d",
-                  gActive, gUseScene, gUseAudio, gHasAppOverride);
-            if (!gUseAudio && gPhysBg) _fbg_stopAudio(NO);
-            if (gUseAudio && gPhysBg && (!gPlayer || !gPlayer.isPlaying)) _fbg_startAudio();
+            NSLog(@"[FUBG] prefs reloaded: active=%d scene=%d audio=%d override=%d physBg=%d",
+                  gActive, gUseScene, gUseAudio, gHasAppOverride, gPhysBg);
+            if (!gUseAudio && gPhysBg) { _fbg_stopAudio(NO); _fbg_watchdogStop(); }
+            if (gUseAudio && gPhysBg && (!gPlayer || !gPlayer.isPlaying)) { _fbg_startAudio(); _fbg_watchdogStart(); }
         } @catch (__unused NSException *e) {}
     });
 }
@@ -2399,15 +2606,9 @@ static void FUBGEntry(void) {
         if (obInt)   [_fbg_obs addObject:obInt];
         if (obRoute) [_fbg_obs addObject:obRoute];
 
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (gUseAudio) {
-                gWatchdog = [NSTimer scheduledTimerWithTimeInterval:1.5 repeats:YES
-                                                              block:^(NSTimer *t){ _fbg_watchdogFire(t); }];
-                [[NSRunLoop mainRunLoop] addTimer:gWatchdog forMode:NSRunLoopCommonModes];
-            }
-        });
+        // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.1.10 (SIOriginal v2.1.10) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.1.11 (SIOriginal v2.1.11) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
