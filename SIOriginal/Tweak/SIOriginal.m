@@ -1,4 +1,4 @@
-// SIOriginal — 原版重制                                        v2.1.13
+// SIOriginal — 原版重制                                        v2.1.14
 //
 // ============================ v2.1.10 全量审计修复 ============================
 // 逐行审计 dylib（2407 行）+ 配置 App（1797 行）后修掉的四类问题：
@@ -82,6 +82,19 @@
 //   手感⛔跳过 / HUD⛔跳过 / 全部生效），0 命中也能一眼判断是被拦还是真没覆盖。
 // [v2.1.13-2] 0 命中文案由「动画走了未覆盖的路径」改为「本 App 所有 hook 路径均被跳过」，
 //   前者在闸门拦截场景下是误导。
+// =========================================================================
+//
+// ===================== v2.1.14 解除顺丰同城骑士硬保护 =====================
+// 用户选择「两道全解」：移除 com.sfic.knight 的全部硬保护（风险自担）。
+// [V-1] SIO_listHardBlocked() 名单移除 com.sfic.knight → ListAccel 不再恒关。
+// [V-2] SIO_feelProtected() 移除 `if (bid == com.sfic.knight) return YES;` 硬编码
+//       → 整手感模块（FastScroll/FastTap/setter 强黏）对此 App 正常生效。
+// [契约] App 侧 HardGuardBundles() 同步移除 com.sfic.knight（见 N-2 双向契约，
+//   否则专属覆盖页会显示「列表加速：开」而实际被硬关 = 假开关）。
+// [风险] 两处原始注释保留作记录：v1.8.14 记录「24 个 TV/CV hook 可能破坏列表状态机→
+//       卡死/崩溃」；v2.1.8 记录 FastScroll 把 decelRate 锁 0.99 导致订单列表飞太快难抢单。
+//       若骑士出现异常，把两行加回即可恢复，无需改别处。
+// [V-3] 命中统计浮层下移状态栏之下（之前窗口从 y=0 起，卡片压住时间/信号）。
 // =========================================================================
 //
 // ============================ v2.1.7 真·闪退修复 ============================
@@ -176,14 +189,17 @@
 // 全部沿用已验证的 CATransaction/时长改写机制，不触碰 TV/CV 列表状态机。
 // =========================================================================
 //
-// ============================ v1.8.14 顺丰同城骑士防护 ============================
+// ============================ v1.8.14 顺丰同城骑士防护（v2.1.14 已取消） ============================
+// ⚠ v2.1.14：应要求解除 com.sfic.knight 的全部硬保护（SIO_listHardBlocked 名单 +
+// SIO_feelProtected 硬编码两处均已移除）。下方历史说明保留作风险记录，当前不生效。
+//
 // 场景：TrollStore + TrollFools 把本 dylib 注入顺丰同城骑士 (com.sfic.knight)。
-// 该 App 是本项目实测确认的「列表 hook 冲突」App：24 个 TV/CV 变更类 hook 会破坏
+// 该 APP 是本项目实测确认的「列表 hook 冲突」App：24 个 TV/CV 变更类 hook 会破坏
 // 它的列表状态机 → 卡死 / 崩溃（v1.8.11 之前靠 bundle id 硬编码排除，v1.8.11 改成
 // 纯开关控制后，只剩"用户记得关"这一层，而配置是全局的 —— 为别的 App 打开列表
 // 加速会连带把顺丰同城也打开）。
 //
-// 本轮做两件事：
+// 当初做两件事：
 //  1. [防护] 列表 hook 硬保护名单 SIO_listHardBlocked()：名单内 App 的 ListAccel
 //     恒为 NO，优先级高于全局开关与 App 覆盖，任何配置都打不开。
 //     —— 安全项必须 fail-safe，不接受"忘了关"。
@@ -555,7 +571,9 @@ static BOOL SIO_listHardBlocked(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         blocked = @[
-            @"com.sfic.knight",        // 顺丰同城骑士（实测确认：列表 hook 导致卡死）
+            // v2.1.14：按用户要求移除 com.sfic.knight。原注释记录的「24 个 TV/CV hook 可能
+            // 破坏其列表状态机 → 卡死/崩溃」风险现由用户自行承担（列表加速默认开）。
+            // 若骑士出现列表异常，把这一行加回即可恢复硬保护，无需改别处。
             @"com.apple.springboard",  // v1.8.16：桌面进程，内部大量 TV/CV，一旦打开就是黑屏/白苹果
         ];
     });
@@ -581,12 +599,13 @@ static BOOL SIO_fbgBuiltinExcluded(void) {
 // （delaysContentTouches、decelerationRate）来正确识别长按/选择等手势。
 // 整个手感模块（FastScroll + FastTap + setter 强黏）对这些 App 全部跳过。
 static BOOL SIO_feelProtected(void) {
-    // v2.1.8 fix: SF intracity rider (com.sfic.knight) order hall needs full native
-    // scroll inertia. FastScroll locks decelerationRate to 0.99 (fast), which cut
-    // each swipe to one or two order cells ("one cell at a time" feel). Skip the
-    // whole feel module for this app; ListAccel is already hard-guarded here, so
-    // only the animation speedup stays active.
-    if ([SIO_bundleID() isEqualToString:@"com.sfic.knight"]) return YES;
+    // v2.1.14：移除 com.sfic.knight 的硬编码跳过（原 v2.1.8 逻辑，见下方历史注释）。
+    // 该 App 的手感模块现已按全局开关/专属覆盖正常生效；若抢单体验变差，把上面那行加回即可。
+    // ---- v2.1.8 历史注释（保留作风险记录，不再生效）----
+    // SF intracity rider (com.sfic.knight) order hall needs full native scroll inertia.
+    // FastScroll locks decelerationRate to 0.99 (fast), which cut each swipe to one or
+    // two order cells ("one cell at a time" feel). Skip the whole feel module for this
+    // app; ListAccel is already hard-guarded here, so only the animation speedup stays active.
     static NSArray *list = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -996,6 +1015,13 @@ static void SIO_showStats(void) {
             CGRect sb = UIScreen.mainScreen.bounds;
             CGFloat cardW = sb.size.width - 24;
 
+            // v2.1.14：浮层整体下移到状态栏之下，避免盖住时间/信号（之前窗口从 y=0 起，
+            // 卡片压在状态栏上）。拿不到状态栏高度就回退到 20pt 安全余量。
+            CGFloat topInset = 20;
+            if ([app respondsToSelector:@selector(statusBarFrame)])
+                topInset = app.statusBarFrame.size.height;
+            if (topInset < 20) topInset = 20;
+
             UIFont *font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightRegular];
             CGRect box = [text boundingRectWithSize:CGSizeMake(cardW - 28, CGFLOAT_MAX)
                                             options:NSStringDrawingUsesLineFragmentOrigin
@@ -1003,7 +1029,7 @@ static void SIO_showStats(void) {
                                             context:nil];
             CGFloat cardH = MIN(MAX(box.size.height + 24, 64), sb.size.height - 120);
 
-            UIWindow *w = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, sb.size.width,
+            UIWindow *w = [[UIWindow alloc] initWithFrame:CGRectMake(0, topInset, sb.size.width,
                                                                      cardH + 20)];
             if ([w respondsToSelector:@selector(setWindowScene:)]) {
                 for (UIScene *sc in app.connectedScenes) {
@@ -2165,7 +2191,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.1.13 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
+    NSLog(@"[SIOriginal] v2.1.14 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -3031,7 +3057,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.1.13 (SIOriginal v2.1.13) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.1.14 (SIOriginal v2.1.14) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
