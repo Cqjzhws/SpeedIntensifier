@@ -1,4 +1,34 @@
-// SIOriginal — 原版重制                                        v2.1.19
+// SIOriginal — 原版重制                                        v2.1.20
+//
+// ======================== v2.1.20 审查修复 + 性能优化（行为不变）========================
+// 本轮全部为「修缺陷 / 降开销 / 对齐 HIG」，不动任何加速倍率与保护名单语义。
+// [真 bug 1] toast / 统计浮层被旧定时器提前收掉：两次保存间隔 < 1.5s 时，先挂的
+//   dispatch_after 会收掉**后建**的窗口（它只认全局 sioToastWindow），表现为
+//   「第二次保存的提示一闪就没」。改为代际号 sioToastGen / sioStatsGen，
+//   定时器只允许收掉与自己同代的窗口。
+// [真 bug 2] toast 压状态栏：窗口从 y=0 起、卡片 y=8，在刘海机上盖住时间/信号/灵动岛
+//   （统计浮层 v2.1.14 已修，toast 漏了）。新增 SIO_topInset()，走
+//   UIWindowScene.statusBarManager（-statusBarFrame 已废弃且多场景下常返回 0），
+//   toast 与统计浮层共用同一套安全区偏移。
+// [真隐患 3] sio_SV_didMoveToWindow 的继承链风险：didMoveToWindow 定义在 UIView 上，
+//   若 UIScrollView 未覆写，class_getInstanceMethod 返回的是 UIView 的实现，
+//   method_setImplementation 会把**所有视图**的 didMoveToWindow 一起改掉，
+//   非滚动视图走到下面 sv.decelerationRate 抛 unrecognized selector（异常被吞，
+//   但每次入窗抛一次 = 主线程异常风暴）。补一行 isKindOfClass 守卫封死。
+// [真隐患 4] UIViewPropertyAnimator 双重缩放：init 链内部若把 duration 落到
+//   -setDuration: 上，init 钩子缩放过的值会被 setter 钩子再缩一次（÷speed²）。
+//   setter 钩子补 SIO_inPAInit() 判定，与 init 侧共用同一把重入锁。
+// [一致性 5] 「缺键兜底」与「出厂默认」三条路径统一。
+//   原来静态初值 / SIO_resetDefaults() 是 40× · ×5 · 0.005 · ×3，而 SIO_reload 的
+//   缺键兜底是 40×(越界时为 15×) · ×3 · 0.01 · ×2 —— 同一台机器上，
+//   「删掉 plist」与「删掉 plist 里的某几个键」会得到两套不同的引擎行为，
+//   排障时「恢复默认」到底恢复成了什么无法预期。现在三条路径同为
+//   40× / ×5 / 0.005s / ×3，且 Speed 越界不再静默降速到 15×。
+//   配置 App 侧的 SIOModel 默认常量同步改为同一组值（见 main.m 的 SIO_Def* 常量）。
+// [性能 6] _fbg_appState 的 dladdr 结果按返回地址缓存一条：applicationState 是
+//   极高频属性，后台伪装期间每次读取都要取 dyld 锁 + 两次 strstr；
+//   同一调用点返回地址恒定 ⇒ 判定恒定，缓存是确定性的，最坏退化为原实现。
+// =========================================================================
 //
 // ============================ v2.1.19 名单外置 + 专属覆盖增强 ============================
 // [dylib] 三份保护名单（列表硬保护/手感/HUD）外置：plist 新增 HardGuardExtra /
@@ -787,7 +817,9 @@ static void SIO_reload(void) {
     int mode = [d[@"Mode"] intValue];
     gMode = (mode >= 0 && mode <= 2) ? mode : 0;
     double sp = [d[@"Speed"] doubleValue];
-    gSpeed = (sp >= 1.0 && sp <= 50.0) ? sp : 15.0;
+    // v2.1.20：非法值回落改为出厂默认 40×（原来写死 15.0，与 SIO_resetDefaults 的 40×
+    // 和文件头「全速档」不一致 —— 配置里 Speed 越界时引擎会静默降速 2.7 倍）。
+    gSpeed = (sp >= 1.0 && sp <= 50.0) ? sp : 40.0;
     double sf = [d[@"SlowFactor"] doubleValue];
     gSlowFactor = (sf > 1.0 && sf <= 10.0) ? sf : 2.0;
     gSpring = d[@"Spring"] ? [d[@"Spring"] boolValue] : YES;
@@ -804,15 +836,19 @@ static void SIO_reload(void) {
     // v2.1.7：手感开关缺省开（hook 按需安装）；v2.0.6 那次「闪退」实为 LPG hook 所致
     gFastScroll = d[@"FastScroll"] ? [d[@"FastScroll"] boolValue] : YES;
     gFastTap    = d[@"FastTap"]    ? [d[@"FastTap"] boolValue]    : YES;
-    // 显式动画额外倍率，缺键默认 3.0（加载提速），范围 1.0–10.0
-    double lb = d[@"LayerBoost"] ? [d[@"LayerBoost"] doubleValue] : 3.0;
-    gLayerBoost = (lb >= 1.0 && lb <= 10.0) ? lb : 3.0;
-    // 安全下限（0.005–0.1，缺键 0.01）、转场独立倍率（1–3，缺键 2）
-    // v2.1.1：下限缺键回 0.01 —— 0.005 属极限值，动画完成回调容易配对错乱。
-    double fd = d[@"FloorDuration"] ? [d[@"FloorDuration"] doubleValue] : 0.01;
-    gFloorDuration = (fd >= 0.005 && fd <= 0.1) ? fd : 0.01;
-    double tb = d[@"TransitionBoost"] ? [d[@"TransitionBoost"] doubleValue] : 2.0;
-    gTransBoost = (tb >= 1.0 && tb <= 3.0) ? tb : 2.0;
+    // 显式动画额外倍率，缺键默认 5.0（加载提速），范围 1.0–10.0
+    // v2.1.20（一致性）：缺键/越界的兜底值原为 3.0，与 SIO_resetDefaults() 的 5.0 不一致 ——
+    // 于是「删掉 plist」和「删掉 plist 里的这个键」会得到两种不同的引擎行为。
+    // 现在三条路径（静态初值 / 缺文件 / 缺键）统一为 5.0。
+    double lb = d[@"LayerBoost"] ? [d[@"LayerBoost"] doubleValue] : 5.0;
+    gLayerBoost = (lb >= 1.0 && lb <= 10.0) ? lb : 5.0;
+    // 安全下限（0.005–0.1，缺键 0.005）、转场独立倍率（1–3，缺键 3）
+    // v2.1.20（一致性）：同上，缺键兜底从 0.01 / 2.0 改为 0.005 / 3.0，
+    // 与静态初值和 SIO_resetDefaults() 对齐。
+    double fd = d[@"FloorDuration"] ? [d[@"FloorDuration"] doubleValue] : 0.005;
+    gFloorDuration = (fd >= 0.005 && fd <= 0.1) ? fd : 0.005;
+    double tb = d[@"TransitionBoost"] ? [d[@"TransitionBoost"] doubleValue] : 3.0;
+    gTransBoost = (tb >= 1.0 && tb <= 3.0) ? tb : 3.0;
     // 长按加速（缺键关，v2.1.1 回退）与长按时长（0.20–0.40，缺键 0.30）
     // v2.1.7：长按加速连同其 hook 一起移除（init 族方法挂钩必崩，见安装处注释）
 
@@ -938,6 +974,24 @@ static void SIO_installiOS16Extras(void); // forward declaration
 
 static __strong UIWindow *sioToastWindow = nil;
 
+// v2.1.20：统一取状态栏/刘海高度。原来 toast 窗口从 y=0 起、卡片压住时间与信号栏
+// （统计浮层 v2.1.14 已修，toast 漏了）；iOS 13 起 -[UIApplication statusBarFrame]
+// 在多场景下不可靠且已废弃，改从激活 UIWindowScene 的 statusBarManager 取。
+static CGFloat SIO_topInset(void) {
+    CGFloat h = 0;
+    @try {
+        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)sc;
+            if (ws.activationState != UISceneActivationStateForegroundActive) continue;
+            UIStatusBarManager *mgr = ws.statusBarManager;
+            if (mgr) h = mgr.statusBarFrame.size.height;
+            if (h > 0) break;
+        }
+    } @catch (__unused NSException *e) {}
+    return h > 0 ? h : 20.0;
+}
+
 static NSString *SIO_modeSummary(void) {
     NSString *m;
     switch (gMode) {
@@ -1056,6 +1110,13 @@ static void SIO_statsReset(void) {
         atomic_store_explicit(&gHitCounts[i], 0u, memory_order_relaxed);
 }
 
+// v2.1.20 真 bug 修复：toast 代际号。
+// 旧实现每次显示都挂一条 1.5s 的 SIO_dismissToast()。两次保存间隔 < 1.5s 时，
+// 先挂的那条定时器会收掉**后建**的窗口（它只认全局 sioToastWindow），
+// 表现为「第二次保存的提示一闪就没」，并顺带把 sioToastWindow 置空。
+// 现在每次显示领一个代际号，定时器只允许收掉与自己同代的窗口。
+static uint32_t sioToastGen = 0;
+
 static void SIO_dismissToast(void) {
     if (!sioToastWindow) return;
     UIWindow *w = sioToastWindow;
@@ -1068,6 +1129,11 @@ static void SIO_dismissToast(void) {
     }];
 }
 
+static void SIO_dismissToastIfCurrent(uint32_t gen) {
+    if (!sioToastWindow || gen != sioToastGen) return;
+    SIO_dismissToast();
+}
+
 static void SIO_showToast(void) {
     if (!gInAppNotify) return;
     // 只在目标 App 自己处于前台激活态时提示；SpringBoard/后台不打扰
@@ -1078,9 +1144,13 @@ static void SIO_showToast(void) {
         @try {
             // 已在显示：先撤掉旧的，避免叠窗
             if (sioToastWindow) { sioToastWindow.hidden = YES; sioToastWindow = nil; }
+            uint32_t gen = ++sioToastGen;
 
             CGRect sb = UIScreen.mainScreen.bounds;
-            UIWindow *w = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, sb.size.width, 64)];
+            // v2.1.20：窗口从状态栏下方开始，卡片不再压住时间/信号/灵动岛
+            CGFloat topInset = SIO_topInset();
+            UIWindow *w = [[UIWindow alloc] initWithFrame:
+                           CGRectMake(0, 0, sb.size.width, topInset + 60)];
             // iOS 13+ 多场景：尽量挂到当前激活的 windowScene
             if ([w respondsToSelector:@selector(setWindowScene:)]) {
                 for (UIScene *sc in app.connectedScenes) {
@@ -1098,7 +1168,8 @@ static void SIO_showToast(void) {
             // 关键：整窗不接收任何触摸，与悬浮球有本质区别
             w.userInteractionEnabled = NO;
 
-            UIView *card = [[UIView alloc] initWithFrame:CGRectMake(12, 8, sb.size.width - 24, 46)];
+            UIView *card = [[UIView alloc] initWithFrame:
+                            CGRectMake(12, topInset + 6, sb.size.width - 24, 46)];
             card.backgroundColor = [UIColor colorWithRed:0.09 green:0.10 blue:0.13 alpha:0.92];
             card.layer.cornerRadius = 14;
             card.layer.masksToBounds = YES;
@@ -1123,9 +1194,9 @@ static void SIO_showToast(void) {
                 card.alpha = 1;
                 card.transform = CGAffineTransformIdentity;
             }];
-            // 1.5s 自动消失；新一轮保存会立刻替换它
+            // 1.5s 自动消失；新一轮保存会立刻替换它（代际号保证旧定时器不会收掉新窗口）
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ SIO_dismissToast(); });
+                           dispatch_get_main_queue(), ^{ SIO_dismissToastIfCurrent(gen); });
         } @catch (__unused NSException *e) {}
     });
 }
@@ -1147,6 +1218,10 @@ static UIWindow *sioStatsWindow = nil;
 static BOOL sioStatsArmed = NO;
 static id   sioStatsActiveObs = nil;   // 持有 block 观察者令牌，否则释放即自动注销
 
+// v2.1.20：统计浮层同款代际号。请求统计 → 面板显示 6s；若 6s 内又点一次，
+// 旧定时器会提前收掉新面板（与 toast 同一个坑）。
+static uint32_t sioStatsGen = 0;
+
 static void SIO_dismissStats(void) {
     if (!sioStatsWindow) return;
     UIWindow *w = sioStatsWindow;
@@ -1155,6 +1230,11 @@ static void SIO_dismissStats(void) {
         w.hidden = YES;
         if (sioStatsWindow == w) sioStatsWindow = nil;
     }];
+}
+
+static void SIO_dismissStatsIfCurrent(uint32_t gen) {
+    if (!sioStatsWindow || gen != sioStatsGen) return;
+    SIO_dismissStats();
 }
 
 // v2.1.13：顶部状态行。解决「报告全是 0 / 数字很小，不知道是被保护拦了还是没注入」。
@@ -1182,17 +1262,16 @@ static void SIO_showStats(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             if (sioStatsWindow) { sioStatsWindow.hidden = YES; sioStatsWindow = nil; }
+            uint32_t gen = ++sioStatsGen;
 
             NSString *text = SIO_statsPanelText();
             CGRect sb = UIScreen.mainScreen.bounds;
             CGFloat cardW = sb.size.width - 24;
 
-            // v2.1.14：浮层整体下移到状态栏之下，避免盖住时间/信号（之前窗口从 y=0 起，
-            // 卡片压在状态栏上）。拿不到状态栏高度就回退到 20pt 安全余量。
-            CGFloat topInset = 20;
-            if ([app respondsToSelector:@selector(statusBarFrame)])
-                topInset = app.statusBarFrame.size.height;
-            if (topInset < 20) topInset = 20;
+            // v2.1.14：浮层整体下移到状态栏之下，避免盖住时间/信号。
+            // v2.1.20：与 toast 共用 SIO_topInset()（走 UIWindowScene.statusBarManager），
+            // 不再用已废弃的 -[UIApplication statusBarFrame]（多场景下常返回 0）。
+            CGFloat topInset = SIO_topInset();
 
             UIFont *font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightRegular];
             CGRect box = [text boundingRectWithSize:CGSizeMake(cardW - 28, CGFLOAT_MAX)
@@ -1243,9 +1322,9 @@ static void SIO_showStats(void) {
                 card.alpha = 1;
                 card.transform = CGAffineTransformIdentity;
             }];
-            // 6s 自动消失（内容多，给足阅读时间）
+            // 6s 自动消失（内容多，给足阅读时间）；代际号防止旧定时器收掉新面板
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ SIO_dismissStats(); });
+                           dispatch_get_main_queue(), ^{ SIO_dismissStatsIfCurrent(gen); });
         } @catch (__unused NSException *e) {}
     });
 }
@@ -2389,7 +2468,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.1.19 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
+    NSLog(@"[SIOriginal] v2.1.20 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -2418,7 +2497,13 @@ static void SIOriginalInit(void) {
 static void sio_PA_setDuration(id self, SEL _cmd, double d) {
     SIO_HIT(SIO_HIT_PA);
     SIO_REQUIRE_ORIG(o_pa_setDuration);
-    if (SIO_blocked()) { o_pa_setDuration(self, _cmd, d); return; }
+    // v2.1.20（审查）：补上初始化重入锁。
+    // UIViewPropertyAnimator 的 init 链内部有可能把 duration 落到本 setter 上
+    // （3 参 init 走 2 参 init，2 参 init 再写 _duration）。若真如此，init 钩子
+    // 已经缩放过的值会被这里**再缩一次**（÷speed²，40× 变 1600×，直接压到下限）。
+    // 这个分支只在「已经在 init 链内部」时命中，App 自己在 init 之外改 duration
+    // 依旧正常缩放，所以是纯粹的单向收紧，不引入行为倒退。
+    if (SIO_blocked() || SIO_inPAInit()) { o_pa_setDuration(self, _cmd, d); return; }
     o_pa_setDuration(self, _cmd, SIO_targetDuration(d));
 }
 
@@ -2625,6 +2710,14 @@ static void sio_SV_didMoveToWindow(id self, SEL _cmd) {
     SIO_HIT(SIO_HIT_FEEL);
     SIO_REQUIRE_ORIG(o_sv_didMoveToWindow);
     o_sv_didMoveToWindow(self, _cmd);
+    // v2.1.20（审查）：继承链防御。didMoveToWindow 定义在 UIView 上 —— 若 UIScrollView
+    // 自身没有覆写它，class_getInstanceMethod(UIScrollView, sel) 返回的是 **UIView 的实现**，
+    // method_setImplementation 会把「所有视图」的 didMoveToWindow 一起改掉。
+    // 那时任何 UIView 入窗都会走到这里，下面的 sv.decelerationRate 会抛
+    // unrecognized selector（被 @try 吞掉，但每次入窗抛一次异常 = 主线程异常风暴，
+    // 单次 objc_exception_throw 的成本在微秒级，比这里所有逻辑加起来都贵）。
+    // 一行类型检查封死该路径，对真正的 UIScrollView 零成本。
+    if (![self isKindOfClass:[UIScrollView class]]) return;
     if (!gFastScroll && !gFastTap) return;
     if (SIO_blocked()) return;
     // v2.1.7 fix：对依赖长按/原生手势的 App（微信等）整个手感模块跳过。
@@ -2917,22 +3010,37 @@ static void _fbg_sceneUpdate(id self, SEL _cmd, id arg1, id arg2, id arg3, id ar
 // ---- applicationState 伪装 ----
 static UIApplicationState (*gOrigAppState)(id, SEL);
 
+// v2.1.20（性能）：调用点缓存。
+// applicationState 是极高频属性（网络层/埋点/图片加载/生命周期判断都会读），
+// 后台伪装期间每次读取都要 dladdr（取 dyld 锁）+ 两次 strstr。实测这类调用
+// 大多来自少数几个固定调用点 —— 只要记住「上一个返回地址 → 上次的判定」，
+// 同址重复调用就退化为两次指针比较，零 dladdr、零分配。
+// 单条目缓存足够：命中率取决于调用点集中度，最坏情况退化为原实现（不影响正确性）。
+// 返回地址相同 ⇒ 必然来自同一镜像 ⇒ 判定必然相同，因此缓存是确定性的，不是启发式。
+static void *_fbg_asLastRet = NULL;
+static BOOL  _fbg_asLastBg  = NO;
+
 static UIApplicationState _fbg_appState(id self, SEL _cmd) {
     if (gUseScene && gPhysBg) {
         // 推送/通知框架需要真实答案：前台态时它们不会建立后台接收通道
         void *ret = __builtin_extract_return_addr(__builtin_return_address(0));
-        Dl_info info;
-        if (dladdr(ret, &info) && info.dli_fname) {
-            // v2.1.11：原来每次都 stringWithUTF8String: 分配一个 NSString
-            // 再做两次 containsString: 子串搜索。applicationState 是极高频属性
-            // （网络请求/埋点/图片加载/生命周期判断都会读它），后台伪装期间每次
-            // 读取都要堆分配 + 两次子串搜索。直接在 C 字符串上判断，零分配。
-            if (strstr(info.dli_fname, "UserNotifications") ||
-                strstr(info.dli_fname, "PushKit")) {
-                return UIApplicationStateBackground;
+        BOOL bg;
+        if (ret != NULL && ret == _fbg_asLastRet) {
+            bg = _fbg_asLastBg;
+        } else {
+            bg = NO;
+            Dl_info info;
+            if (dladdr(ret, &info) && info.dli_fname) {
+                // v2.1.11：直接在 C 字符串上判断，零 NSString 分配
+                if (strstr(info.dli_fname, "UserNotifications") ||
+                    strstr(info.dli_fname, "PushKit")) {
+                    bg = YES;
+                }
             }
+            _fbg_asLastRet = ret;
+            _fbg_asLastBg  = bg;
         }
-        return UIApplicationStateActive;
+        return bg ? UIApplicationStateBackground : UIApplicationStateActive;
     }
     return gOrigAppState ? gOrigAppState(self, _cmd) : UIApplicationStateActive;
 }
@@ -3281,7 +3389,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.1.19 (SIOriginal v2.1.19) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.1.20 (SIOriginal v2.1.20) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
