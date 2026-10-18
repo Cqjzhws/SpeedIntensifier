@@ -32,7 +32,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.1.12";
+static NSString * const SIO_VERSION = @"v2.1.13";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -1716,7 +1716,9 @@ static UILabel *SIOSectionTitle(NSString *t) {
          "然后立刻切回去 —— 统计浮层会在那个 App 顶部显示 6 秒。\n"
          "看什么：哪一项数字大，就说明这个 App 的动画主要走那条路"
          "（比如 ListTV 大就调列表相关、LayerAdd 大就调显式动画倍率 LayerBoost）。\n"
-         "全是 0 说明它走了我们没覆盖的路径 —— 这就是以前要手工拆包才能发现的盲区。\n"
+         "浮层第一行是状态行，会写明该 App 命中了哪道闸门"
+         "（总开关关闭 / 黑名单 / 列表⛔硬保护 / 手感⛔跳过 / HUD⛔跳过 / 全部生效）；"
+         "数字很小或全 0 先看这一行 —— 多半是被保护名单按设计拦住了，不是没注入。\n"
          "每次保存配置后计数清零，所以看到的都是当前参数下的分布。",
         12, [UIColor secondaryLabelColor]);
     hsNote.numberOfLines = 0;
