@@ -1,4 +1,4 @@
-// SIOriginal — 原版重制                                        v2.1.15
+// SIOriginal — 原版重制                                        v2.1.16
 //
 // ============================ v2.1.10 全量审计修复 ============================
 // 逐行审计 dylib（2407 行）+ 配置 App（1797 行）后修掉的四类问题：
@@ -108,6 +108,20 @@
 //   等 UIApplicationDidBecomeActiveNotification 到达时再弹（SIO_onDidBecomeActive）。
 //   观察者令牌存 sioStatsActiveObs —— block 观察者不持有就会随返回值释放并自动注销，
 //   与 v2.1.10 的 AVAudioSession 是同一个坑。
+// =========================================================================
+//
+// ============================ v2.1.16 统计面板自解释（行为不变） ============================
+// 用户选择「保持现状，只把面板标注清楚」。微信等被保护 App 上看统计浮层时，
+// 手感/HUD 桶计数很高（如微信 Feel 9167）却被闸门全拦 → 看着像「生效很多」实为一个没应用。
+// 根因：SIO_HIT 在 hook 第一行、闸门之前计数，记的是「调用」不是「生效」。
+// 本轮只改面板呈现，不动任何加速/保护行为：
+// [P-1] 每个桶拆成「调用 N / 生效 M」两个数。生效 = 未被当前闸门拦掉的计数。
+//       闸门状态在一次热重载内恒定，故按当前 gEnabled/gSelfBlacklisted/gSelfFeelProtected/
+//       gSelfHudProtected/gListAccel/gHUDFast/gWKFastShow/gFastScroll/gFastTap 推算，
+//       确定性正确，无需改动 70 处 hook（零编译风险）。
+// [P-2] 整桶被闸门拦掉的（如微信手感/HUD、关掉的列表加速）标 ⛔已跳过；
+//       浮层头部汇总「调用总数 / 生效总数」，0 命中文案保留。
+// [P-3] 配置 App 统计卡片说明同步改写为「调用=hook 被命中次数，生效=未被闸门拦截的次数」。
 // =========================================================================
 //
 // ============================ v2.1.7 真·闪退修复 ============================
@@ -869,15 +883,45 @@ static NSString *SIO_statsLogLine(void) {
 // → 这里必须先前向声明，否则 clang 报「implicit declaration」。
 static NSString *SIO_statsStatusLine(void);
 
-// 浮层版：只列非零项（22 项全列在手机上读不完），按命中数降序，最多 8 行。
+// v2.1.16：面板自解释。SIO_HIT 在 hook 第一行、闸门之前计数 → 它记的是
+// 「调用」不是「生效」。被保护闸门拦掉的桶（手感/HUD/列表/总开关）会把调用数堆得很高
+// 却一个都没应用，看着像「生效很多」实为 0。v2.1.16 把每个桶拆成「调用 / 生效」两个数，
+// 并把整桶被拦掉的标 ⛔已跳过，不再误导。闸门状态在一次热重载内恒定，故按当前状态推算
+// 「是否整桶被拦」是确定性的，无需改动 70 处 hook（零编译风险）。
+static BOOL SIO_bucketSkipped(int slot) {
+    // 总开关关 / 全局黑名单：所有动画/列表/手感/HUD 全部跳过
+    if (!gEnabled || gSelfBlacklisted) return YES;
+    switch (slot) {
+        case SIO_HIT_LIST_TV:
+        case SIO_HIT_LIST_CV:
+            return !gListAccel;                                  // 列表加速关
+        case SIO_HIT_FEEL:
+            return gSelfFeelProtected || (!gFastScroll && !gFastTap);
+        case SIO_HIT_HUD_AI:
+        case SIO_HIT_HUD_SV:
+        case SIO_HIT_HUD_MB:
+            return gSelfHudProtected || !gHUDFast;
+        case SIO_HIT_WK:
+            return gSelfHudProtected || !gWKFastShow;
+        default:
+            return NO;   // 纯动画族：仅受总开关/黑名单影响（已在上层处理）
+    }
+}
+
+// 浮层版：只列非零项（22 项全列在手机上读不完），按调用数降序，最多 8 行。
 // 全为 0 时给一句明确的诊断提示 —— 这正是 F-A 想暴露的「走了未覆盖路径」信号。
 static NSString *SIO_statsPanelText(void) {
     NSMutableArray *rows = [NSMutableArray array];
-    uint32_t total = 0;
+    uint32_t totalCalled = 0, totalApplied = 0;
     for (int i = 0; i < SIO_HIT__COUNT; i++) {
-        uint32_t v = atomic_load_explicit(&gHitCounts[i], memory_order_relaxed);
-        total += v;
-        if (v) [rows addObject:@[ @(v), [NSString stringWithUTF8String:kSIOHitNames[i]] ]];
+        uint32_t called = atomic_load_explicit(&gHitCounts[i], memory_order_relaxed);
+        totalCalled += called;
+        BOOL skipped = SIO_bucketSkipped(i);
+        uint32_t applied = skipped ? 0 : called;
+        totalApplied += applied;
+        if (called)
+            [rows addObject:@[ @(called), @(applied), @(skipped),
+                               [NSString stringWithUTF8String:kSIOHitNames[i]] ]];
     }
     // v2.1.13：状态行必须在最上面。过去只给数字，用户在被保护的 App 上看到一片 0
     // 会误判成「没生效」，实际是三道闸门把它拦住了（顺丰骑士就是这种情况）。
@@ -890,10 +934,18 @@ static NSString *SIO_statsPanelText(void) {
         return [b[0] compare:a[0]];
     }];
     NSMutableString *s = [NSMutableString stringWithFormat:
-        @"SIOriginal 命中统计（共 %u 次）\n%@", total, SIO_statsStatusLine()];
+        @"SIOriginal 命中统计（调用 %u / 生效 %u）\n%@", totalCalled, totalApplied, SIO_statsStatusLine()];
     NSUInteger n = MIN(rows.count, (NSUInteger)8);
     for (NSUInteger i = 0; i < n; i++) {
-        [s appendFormat:@"\n%@  %@", rows[i][1], rows[i][0]];
+        NSArray *r = rows[i];
+        uint32_t c = [r[0] unsignedIntValue];
+        uint32_t a = [r[1] unsignedIntValue];
+        BOOL sk = [r[2] boolValue];
+        NSString *name = r[3];
+        if (sk)
+            [s appendFormat:@"\n⛔ %@ 调用%u/生效0", name, c];
+        else
+            [s appendFormat:@"\n%@ 调用%u/生效%u", name, c, a];
     }
     if (rows.count > n) [s appendFormat:@"\n…及其他 %lu 项", (unsigned long)(rows.count - n)];
     return s;
@@ -2236,7 +2288,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.1.15 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
+    NSLog(@"[SIOriginal] v2.1.16 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -3102,7 +3154,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.1.15 (SIOriginal v2.1.15) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.1.16 (SIOriginal v2.1.16) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
