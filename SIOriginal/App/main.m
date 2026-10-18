@@ -36,7 +36,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.1.18";
+static NSString * const SIO_VERSION = @"v2.1.19";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -186,6 +186,9 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"HUDFast"])           d[@"HUDFast"]           = @YES;
     if (!d[@"WKFastShow"])        d[@"WKFastShow"]        = @YES;
     if (!d[@"Blacklist"])  d[@"Blacklist"]  = @[ @"com.tencent.wework" ];
+    if (!d[@"HardGuardExtra"])     d[@"HardGuardExtra"]     = @[];   // v2.1.19 名单外置
+    if (!d[@"FeelProtectedExtra"]) d[@"FeelProtectedExtra"] = @[];
+    if (!d[@"HudProtectedExtra"])  d[@"HudProtectedExtra"]  = @[];
     if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
     if (!d[@"FUBGAudioKeep"])    d[@"FUBGAudioKeep"]    = @YES;
@@ -211,6 +214,8 @@ static NSArray *SIOConfigKeys(void) {
                   // AppOverrides 里的 HUDDelay 也因此一直是死的。
                   @"HUDDelay",
                   @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
+                  // v2.1.19：三份额外名单键（名单外置，登记白名单才能写进 plist）
+                  @"HardGuardExtra", @"FeelProtectedExtra", @"HudProtectedExtra",
                   @"AppOverrides" ];
     });
     return keys;
@@ -720,6 +725,10 @@ static UILabel *SIOSectionTitle(NSString *t) {
 @property (strong) UISegmentedControl *ovMode, *ovLayer, *ovFloor, *ovTrans;
 // 高级页：黑名单
 @property (strong) UITextView *blacklist;
+// v2.1.19：三份保护名单的额外部分（用户可编辑，多行 bundle id，支持 * 通配）
+@property (strong) UITextView *hardGuardExtraView, *feelExtraView, *hudExtraView;
+// v2.1.19：专属覆盖版手感/HUD 保护（按 App 单独强制保护/不保护）
+@property (strong) UISwitch *ovFeelProtect, *ovHudProtect;
 
 - (void)loadControlValues;
 - (BOOL)save;
@@ -770,6 +779,13 @@ static UILabel *SIOSectionTitle(NSString *t) {
         self.blacklist.text = [[(NSString *)blv componentsSeparatedByString:@","]
                                componentsJoinedByString:@"\n"];
     }
+    // v2.1.19：三份保护名单额外部分回显（默认空）
+    id hge = c[@"HardGuardExtra"];
+    self.hardGuardExtraView.text = [hge isKindOfClass:[NSArray class]] ? [hge componentsJoinedByString:@"\n"] : @"";
+    id fe = c[@"FeelProtectedExtra"];
+    self.feelExtraView.text = [fe isKindOfClass:[NSArray class]] ? [fe componentsJoinedByString:@"\n"] : @"";
+    id hue = c[@"HudProtectedExtra"];
+    self.hudExtraView.text = [hue isKindOfClass:[NSArray class]] ? [hue componentsJoinedByString:@"\n"] : @"";
 
     self.swRM.on = ReadAx(@"ReduceMotionEnabled");
     self.swCF.on = ReadAx(@"PreferCrossFadeTransitions");
@@ -847,6 +863,9 @@ static UILabel *SIOSectionTitle(NSString *t) {
     self.ovWKFast.on  = mine[@"WKFastShow"]        ? [mine[@"WKFastShow"]        boolValue] : YES;
     self.ovHUDDelay.selectedSegmentIndex = mine[@"HUDDelay"]
         ? HUDDelayIndexFor([mine[@"HUDDelay"] doubleValue]) : 2;   // 缺键 = 0.15s（跟随默认档）
+    // v2.1.19：手感/HUD 保护按 App（缺键 = 不额外强制，跟随全局名单）
+    self.ovFeelProtect.on = mine[@"FeelProtected"] ? [mine[@"FeelProtected"] boolValue] : NO;
+    self.ovHudProtect.on  = mine[@"HudProtected"]  ? [mine[@"HudProtected"] boolValue]  : NO;
 
     BOOL guarded = [HardGuardBundles() containsObject:bid];
     self.ovList.enabled = !guarded;
@@ -882,6 +901,18 @@ static UILabel *SIOSectionTitle(NSString *t) {
         if (t.length) [bl addObject:t];
     }
     return bl;
+}
+
+// v2.1.19：通用「多行文本 → 数组」，供三份额外名单复用。
+- (NSArray *)listFromView:(UITextView *)v {
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *line in [v.text componentsSeparatedByCharactersInSet:
+                            [NSCharacterSet newlineCharacterSet]]) {
+        NSString *t = [line stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceCharacterSet]];
+        if (t.length) [out addObject:t];
+    }
+    return out;
 }
 
 // v2.1.9：专属覆盖输入框支持一次填多个 Bundle ID（逗号 / 空格 / 换行分隔），去重去空。
@@ -923,6 +954,10 @@ static UILabel *SIOSectionTitle(NSString *t) {
     cfg[@"WKFastShow"] = @(self.swWKFast.on);
     cfg[@"HUDDelay"] = @(HUDDelayForIndex((int)self.segHUDDelay.selectedSegmentIndex));
     cfg[@"Blacklist"] = [self blacklistFromView];
+    // v2.1.19：三份额外名单写入
+    cfg[@"HardGuardExtra"]     = [self listFromView:self.hardGuardExtraView];
+    cfg[@"FeelProtectedExtra"] = [self listFromView:self.feelExtraView];
+    cfg[@"HudProtectedExtra"]  = [self listFromView:self.hudExtraView];
 
     cfg[@"FUBGEnabled"] = @(self.swFUBG.on);
     cfg[@"FUBGSceneFake"] = @(self.swFUBGScene.on);
@@ -960,6 +995,9 @@ static UILabel *SIOSectionTitle(NSString *t) {
                 @"HUDFast":           @(self.ovHUDFast.on),
                 @"WKFastShow":        @(self.ovWKFast.on),
                 @"HUDDelay":          @(HUDDelayForIndex((int)self.ovHUDDelay.selectedSegmentIndex)),
+                // v2.1.19：手感/HUD 保护按 App 单独设置
+                @"FeelProtected":     @(self.ovFeelProtect.on),
+                @"HudProtected":      @(self.ovHudProtect.on),
             };
         } else {
             [ovOut removeObjectForKey:ovBid];
@@ -1545,6 +1583,37 @@ static UILabel *SIOSectionTitle(NSString *t) {
     [m.blacklist.heightAnchor constraintEqualToConstant:110].active = YES;
     [self.stack addArrangedSubview:blacklistTitle];
     [self.stack addArrangedSubview:m.blacklist];
+
+    // v2.1.19：三份保护名单的额外部分（名单外置 —— 改名单不再需要重新注入 dylib）
+    UILabel *hgeTitle = SIOSectionTitle(@"列表硬保护·额外名单（每行一个 Bundle ID，结尾 * 前缀；命中则列表加速恒关，内置 SpringBoard 不可删）");
+    m.hardGuardExtraView = [[UITextView alloc] init];
+    m.hardGuardExtraView.font = [UIFont systemFontOfSize:14];
+    m.hardGuardExtraView.layer.borderColor = [UIColor separatorColor].CGColor;
+    m.hardGuardExtraView.layer.borderWidth = 0.5;
+    m.hardGuardExtraView.layer.cornerRadius = 10;
+    [m.hardGuardExtraView.heightAnchor constraintEqualToConstant:72].active = YES;
+    [self.stack addArrangedSubview:hgeTitle];
+    [self.stack addArrangedSubview:m.hardGuardExtraView];
+
+    UILabel *feTitle = SIOSectionTitle(@"手感保护·额外名单（命中则滑行/点按全跳过；内置微信/QQ/信息/企业微信不可删）");
+    m.feelExtraView = [[UITextView alloc] init];
+    m.feelExtraView.font = [UIFont systemFontOfSize:14];
+    m.feelExtraView.layer.borderColor = [UIColor separatorColor].CGColor;
+    m.feelExtraView.layer.borderWidth = 0.5;
+    m.feelExtraView.layer.cornerRadius = 10;
+    [m.feelExtraView.heightAnchor constraintEqualToConstant:72].active = YES;
+    [self.stack addArrangedSubview:feTitle];
+    [self.stack addArrangedSubview:m.feelExtraView];
+
+    UILabel *hudTitle = SIOSectionTitle(@"HUD 保护·额外名单（命中则转圈不改；内置微信/QQ/信息/企业微信/支付宝不可删）");
+    m.hudExtraView = [[UITextView alloc] init];
+    m.hudExtraView.font = [UIFont systemFontOfSize:14];
+    m.hudExtraView.layer.borderColor = [UIColor separatorColor].CGColor;
+    m.hudExtraView.layer.borderWidth = 0.5;
+    m.hudExtraView.layer.cornerRadius = 10;
+    [m.hudExtraView.heightAnchor constraintEqualToConstant:72].active = YES;
+    [self.stack addArrangedSubview:hudTitle];
+    [self.stack addArrangedSubview:m.hudExtraView];
 }
 
 - (void)changed { [self.model refreshDynamicLabels]; }
@@ -1671,6 +1740,9 @@ static UILabel *SIOSectionTitle(NSString *t) {
     m.ovWKFast  = [[UISwitch alloc] init];
     m.ovHUDDelay = [[UISegmentedControl alloc]
         initWithItems:@[ @"0.05s", @"0.10s", @"0.15s", @"0.30s", @"0.50s" ]];
+    // v2.1.19：手感/HUD 保护按 App 单独设置
+    m.ovFeelProtect = [[UISwitch alloc] init];
+    m.ovHudProtect  = [[UISwitch alloc] init];
     m.ovGuard = SIOLabel(@"", 12, [UIColor secondaryLabelColor]);
 
     [self.stack addArrangedSubview:SIOCard(@[
@@ -1695,6 +1767,8 @@ static UILabel *SIOSectionTitle(NSString *t) {
         SIORow(@"网页提前显形", m.ovWKFast, nil),
         SIOLabel(@"转圈延迟（专属）", 15, [UIColor labelColor]),
         m.ovHUDDelay,
+        SIORow(@"手感保护（专属，强制跳过滑行/点按）", m.ovFeelProtect, nil),
+        SIORow(@"HUD 保护（专属，强制不改转圈）", m.ovHudProtect, nil),
         m.ovGuard,
     ], 10)];
 
