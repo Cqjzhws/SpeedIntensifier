@@ -653,7 +653,7 @@ static BOOL SIO_listHardBlocked(void) {
     NSString *bid = SIO_bundleID();
     if (!bid.length) return NO;
     if ([blocked containsObject:bid]) return YES;
-    return [SIO_bidInList(bid, gHardGuardExtra)];
+    return SIO_bidInList(bid, gHardGuardExtra);
 }
 
 // v1.8.16：内置保活排除名单 —— 这些进程绝不参与真后台保活。
@@ -694,7 +694,7 @@ static BOOL SIO_feelProtected(void) {
     NSString *bid = SIO_bundleID();
     if (!bid.length) return NO;
     if ([list containsObject:bid]) return YES;
-    return [SIO_bidInList(bid, gFeelExtra)];
+    return SIO_bidInList(bid, gFeelExtra);
 }
 
 // 本进程是否命中 App 覆盖 / 是否被列表硬保护（供启动日志与配置排查）
@@ -716,7 +716,7 @@ static BOOL SIO_hudProtected(void) {
     NSString *bid = SIO_bundleID();
     if (!bid.length) return NO;
     if ([hlist containsObject:bid]) return YES;
-    return [SIO_bidInList(bid, gHudExtra)];
+    return SIO_bidInList(bid, gHudExtra);
 }
 
 static BOOL gHasAppOverride   = NO;
