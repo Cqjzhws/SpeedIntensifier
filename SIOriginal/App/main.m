@@ -32,7 +32,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.1.13";
+static NSString * const SIO_VERSION = @"v2.1.14";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -44,8 +44,10 @@ static NSString * const SIO_VERSION = @"v2.1.13";
 static NSArray *HardGuardBundles(void) {
     static NSArray *a;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ a = @[ @"com.sfic.knight",        // 顺丰同城骑士
-                                   @"com.apple.springboard" ]; });  // 桌面进程
+    dispatch_once(&once, ^{
+        // v2.1.14：移除 com.sfic.knight（与 dylib SIO_listHardBlocked 同步，否则成假开关）。
+        a = @[ @"com.apple.springboard" ];  // 桌面进程
+    });
     return a;
 }
 
