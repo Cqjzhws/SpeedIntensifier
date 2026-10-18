@@ -1,4 +1,27 @@
-// SIOriginal — 原版重制                                        v2.1.7
+// SIOriginal — 原版重制                                        v2.1.10
+//
+// ============================ v2.1.10 全量审计修复 ============================
+// 逐行审计 dylib（2407 行）+ 配置 App（1797 行）后修掉的四类问题：
+//
+// [真 bug 1] 保活音频引擎从未启动 —— 本轮最要紧的一处。
+//   FUBGEntry 把 UIApplicationDidEnterBackgroundNotification 注册到 **Darwin 通知中心**，
+//   而那是 App 进程内 NSNotificationCenter 发出的通知，Darwin 总线上永远收不到。
+//   后果：gPhysBg 恒为 NO → 音频断言 / 看门狗自愈 / 通知横幅伪装 / 来电中断恢复 /
+//   线路变化恢复 五个子系统全部静默失效。场景伪装不受影响（直接 hook 场景更新），
+//   所以保活「看起来能用」，洞一直没被发现。已改回进程内注册。
+// [真 bug 2] AVAudioSession 两个观察者没持有 token（返回值被丢弃 → token 释放即注销），
+//   来电中断恢复与耳机/蓝牙切换恢复同样形同虚设。已用 _fbg_obs 强引用持有。
+// [真 bug 3] 慢放模式被「瞬时打开」踩掉（回归）。SIO_transitionDuration 的
+//   `if (gEnabled && gInstantTransition) return 0.001;` 不看 gMode，选了慢放时
+//   导航/模态/Tab 转场依然 1ms 完成 —— 这正是 v1.8.12 修过的老毛病（当时是硬编码 0.0），
+//   v2.1.8 加瞬时打开时又踩回去了。已改为 gMode != 1 时才走瞬时。
+// [真 bug 4] 热重载竞态。SIO_reload / _fbg_loadPref 在 Darwin 回调线程改 20+ 个全局
+//   （含 gExclude 数组指针），主线程 hook 并发读 → 遍历中数组被换掉 → EXC_BAD_ACCESS。
+//   两个 reload 均已改为主线程串行执行。
+// [微优化] sio_AIstartAnim 每次调用分配 @YES → 复用 kCFBooleanTrue + ASSIGN，零分配。
+// [一致性] 文件头 / 启动日志 / FUBG 日志三处版本号统一为 v2.1.10。
+// =========================================================================
+//
 // ============================ v2.1.7 真·闪退修复 ============================
 // v2.1.1 没修好 —— 因为真凶不是默认值，是一个**无条件安装**的坏 hook。
 //
@@ -691,9 +714,16 @@ static void SIO_showToast(void) {
 static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
                                 CFNotificationName name, const void *object,
                                 CFDictionaryRef userInfo) {
-    SIO_reload();
-    // v2.0.0：热重载成功后在目标 App 内给出短暂、不拦截触摸的生效提示
-    SIO_showToast();
+    // v2.1.10 竞态修复：Darwin 回调在通知线程上执行，直接改全局会与主线程上正在跑的
+    // 动画 hook 并发读写（派生量、黑名单、模式等二十来个变量）。统一丢到主线程串行执行：
+    // 通知线程只做一次派发，代价可忽略，换来的是 reload 期间不会再读到半新半旧的配置。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            SIO_reload();
+            // v2.0.0：热重载成功后在目标 App 内给出短暂、不拦截触摸的生效提示
+            SIO_showToast();
+        } @catch (__unused NSException *e) {}
+    });
 }
 
 // ---------- 微信图片预览「放大态」全局旁路（v1.8.4） ----------
@@ -1080,7 +1110,10 @@ static void sio_CASpring_damp(id self, SEL _cmd, double v) {
 // v2.0.0：在全局模式换算之后，再叠加转场独立倍率 TransitionBoost（仅加速/瞬切，
 // 慢放不叠加），同样受 FloorDuration 下限保护。
 static inline double SIO_transitionDuration(void) {
-    if (gEnabled && gInstantTransition) return 0.001;
+    // v2.1.10 真 bug 修复：原来这一行不看 gMode，导致「慢放」模式下导航/模态/Tab 转场
+    // 依然被瞬时打开压成 1ms —— 慢放对转场彻底失效。这正是 v1.8.12 专门修过的老毛病
+    // （当时是硬编码 0.0），v2.1.8 加瞬时打开时又踩回去了。慢放优先级高于瞬时打开。
+    if (gEnabled && gMode != 1 && gInstantTransition) return 0.001;
     double d = SIO_targetDuration(0.35);
     if (gEnabled && gMode != 1 && gTransBoost > 1.0001 && d > 0.0) {
         d = d / gTransBoost;
@@ -1363,13 +1396,17 @@ static const void *kSIOAIDelayMark = &kSIOAIDelayMark;
 static void sio_AIstartAnim(id self, SEL _cmd) {
     SIO_REQUIRE_ORIG(o_AIstartAnim);
     if (SIO_blocked() || !gHUDFast || SIO_hudProtected()) { o_AIstartAnim(self, _cmd); return; }
-    objc_setAssociatedObject(self, kSIOAIDelayMark, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // v2.1.10 微优化：原来每次 startAnimating 都新建一个 @YES（NSNumber 分配）。
+    // 这里改复用不朽常量 kCFBooleanTrue + ASSIGN 策略，与 SIO_markAnimScaled 同一套做法：
+    // 常量永不释放，ASSIGN 不会悬垂，热路径（下拉刷新/列表加载）零分配。
+    objc_setAssociatedObject(self, kSIOAIDelayMark,
+                             (__bridge id)kCFBooleanTrue, OBJC_ASSOCIATION_ASSIGN);
     __weak id wself = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gHUDDelay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         id s = wself;
         if (!s || !objc_getAssociatedObject(s, kSIOAIDelayMark)) return;
-        objc_setAssociatedObject(s, kSIOAIDelayMark, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(s, kSIOAIDelayMark, nil, OBJC_ASSOCIATION_ASSIGN);
         o_AIstartAnim(s, _cmd);
     });
 }
@@ -1377,7 +1414,7 @@ static void sio_AIstartAnim(id self, SEL _cmd) {
 static void sio_AIstopAnim(id self, SEL _cmd) {
     SIO_REQUIRE_ORIG(o_AIstopAnim);
     // Always cancel any pending deferred start, then stop immediately.
-    objc_setAssociatedObject(self, kSIOAIDelayMark, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(self, kSIOAIDelayMark, nil, OBJC_ASSOCIATION_ASSIGN);
     o_AIstopAnim(self, _cmd);
 }
 
@@ -1621,7 +1658,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.1.8 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d)",
+    NSLog(@"[SIOriginal] v2.1.10 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -1975,6 +2012,10 @@ static BOOL    gHasAudioMode = NO;
 static AVAudioPlayer *gPlayer = nil;
 static UIBackgroundTaskIdentifier gTask = 0;   // 0 = 无桥接任务（UIBackgroundTaskInvalid 非文件级编译期常量）
 static NSTimer *gWatchdog = nil;
+// v2.1.10：强引用 NSNotificationCenter 的 block 观察者 token。
+// addObserverForName:queue:usingBlock: 返回的 token 一旦被释放，观察随即注销 ——
+// 原来两个 AVAudioSession 观察者的返回值都被丢弃了，回调永远等不到。
+static NSMutableArray *_fbg_obs = nil;
 
 #pragma mark - 配置
 
@@ -2260,17 +2301,23 @@ static void _fbg_onInterruption(NSNotification *note) {
 }
 
 #pragma mark - 生命周期 / Darwin
+//
+// v2.1.10 真 bug 修复（本轮最要紧的一处）：
+// 原来前后台感知是把 UIApplicationDidEnterBackgroundNotification /
+// UIApplicationWillEnterForegroundNotification 注册到 **Darwin 通知中心**上。
+// Darwin 中心是系统级广播总线，只接收 notify_post() 发出的名字；而这两个通知是
+// App 进程内 NSNotificationCenter 发出的，永远不会出现在 Darwin 总线上 ——
+// 于是两个回调从未被触发，gPhysBg 恒为 NO，直接导致五个子系统静默失效：
+//   音频断言 / 看门狗自愈 / 通知横幅伪装 / 来电中断恢复 / 线路变化恢复。
+// 场景伪装不受影响（它直接 hook 场景更新，不依赖 gPhysBg），所以保活「看起来能用」，
+// 这个洞一直没被发现。现在改回进程内 NSNotificationCenter 注册。
 
-static void _fbg_onEnterBackground(CFNotificationCenterRef c, void *o, CFStringRef n,
-                                   const void *obj, CFDictionaryRef info) {
-    (void)c; (void)o; (void)n; (void)obj; (void)info;
+static void _fbg_onEnterBackground(NSNotification *note) {
     gPhysBg = YES;
     _fbg_startAudio();
 }
 
-static void _fbg_onEnterForeground(CFNotificationCenterRef c, void *o, CFStringRef n,
-                                   const void *obj, CFDictionaryRef info) {
-    (void)c; (void)o; (void)n; (void)obj; (void)info;
+static void _fbg_onEnterForeground(NSNotification *note) {
     gPhysBg = NO;
     // 回前台只暂停播放、保留会话（mix 模式下不与 App 音频冲突）
     if (gPlayer.isPlaying) [gPlayer pause];
@@ -2283,11 +2330,17 @@ static void _fbg_onEnterForeground(CFNotificationCenterRef c, void *o, CFStringR
 static void _fbg_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n,
                               const void *obj, CFDictionaryRef info) {
     (void)c; (void)o; (void)n; (void)obj; (void)info;
-    _fbg_loadPref();
-    NSLog(@"[FUBG] prefs reloaded: active=%d scene=%d audio=%d override=%d",
-          gActive, gUseScene, gUseAudio, gHasAppOverride);
-    if (!gUseAudio && gPhysBg) _fbg_stopAudio(NO);
-    if (gUseAudio && gPhysBg && (!gPlayer || !gPlayer.isPlaying)) _fbg_startAudio();
+    // v2.1.10：与动画侧同样改为主线程串行 reload。_fbg_loadPref 会把 gExclude
+    // 换成新数组，若此刻另线程正在 for-in 遍历旧数组，数组被释放即 EXC_BAD_ACCESS。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            _fbg_loadPref();
+            NSLog(@"[FUBG] prefs reloaded: active=%d scene=%d audio=%d override=%d",
+                  gActive, gUseScene, gUseAudio, gHasAppOverride);
+            if (!gUseAudio && gPhysBg) _fbg_stopAudio(NO);
+            if (gUseAudio && gPhysBg && (!gPlayer || !gPlayer.isPlaying)) _fbg_startAudio();
+        } @catch (__unused NSException *e) {}
+    });
 }
 
 #pragma mark - 入口
@@ -2306,21 +2359,34 @@ static void FUBGEntry(void) {
             _fbg_installSceneHooks();
         });
 
+        _fbg_obs = [NSMutableArray array];
+
+        // v2.1.10：生命周期改回进程内 NSNotificationCenter（Darwin 总线收不到，
+        // 详见本文件「生命周期 / Darwin」处的说明）。token 必须被持有，否则立即注销。
+        id obBg = [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationDidEnterBackgroundNotification
+                        object:nil queue:[NSOperationQueue mainQueue]
+                   usingBlock:^(__unused NSNotification *n){ _fbg_onEnterBackground(n); }];
+        id obFg = [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationWillEnterForegroundNotification
+                        object:nil queue:[NSOperationQueue mainQueue]
+                   usingBlock:^(__unused NSNotification *n){ _fbg_onEnterForeground(n); }];
+        if (obBg) [_fbg_obs addObject:obBg];
+        if (obFg) [_fbg_obs addObject:obFg];
+
+        // 配置热重载是跨进程的（配置 App 用 Darwin 广播），这一条继续走 Darwin 中心。
         CFNotificationCenterRef dc = CFNotificationCenterGetDarwinNotifyCenter();
-        CFNotificationCenterAddObserver(dc, NULL, _fbg_onEnterBackground,
-            (__bridge CFStringRef)UIApplicationDidEnterBackgroundNotification, NULL,
-            CFNotificationSuspensionBehaviorDeliverImmediately);
-        CFNotificationCenterAddObserver(dc, NULL, _fbg_onEnterForeground,
-            (__bridge CFStringRef)UIApplicationWillEnterForegroundNotification, NULL,
-            CFNotificationSuspensionBehaviorDeliverImmediately);
         CFNotificationCenterAddObserver(dc, NULL, _fbg_onPrefReload,
             (__bridge CFStringRef)kNotifyName, NULL,
             CFNotificationSuspensionBehaviorDeliverImmediately);
 
-        [[NSNotificationCenter defaultCenter] addObserverForName:AVAudioSessionInterruptionNotification
+        // v2.1.10：AVAudioSession 两个观察者的 token 原来被丢弃，回调永远等不到。
+        id obInt = [[NSNotificationCenter defaultCenter]
+            addObserverForName:AVAudioSessionInterruptionNotification
             object:nil queue:[NSOperationQueue mainQueue]
             usingBlock:^(NSNotification *n){ _fbg_onInterruption(n); }];
-        [[NSNotificationCenter defaultCenter] addObserverForName:AVAudioSessionRouteChangeNotification
+        id obRoute = [[NSNotificationCenter defaultCenter]
+            addObserverForName:AVAudioSessionRouteChangeNotification
             object:nil queue:[NSOperationQueue mainQueue]
             usingBlock:^(__unused NSNotification *n){
                 if (gUseAudio && gPhysBg) {
@@ -2330,6 +2396,8 @@ static void FUBGEntry(void) {
                     });
                 }
             }];
+        if (obInt)   [_fbg_obs addObject:obInt];
+        if (obRoute) [_fbg_obs addObject:obRoute];
 
         dispatch_async(dispatch_get_main_queue(), ^{
             if (gUseAudio) {
@@ -2339,7 +2407,7 @@ static void FUBGEntry(void) {
             }
         });
 
-        NSLog(@"[FUBG] v2.1.7 (SIOriginal v2.1.7) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.1.10 (SIOriginal v2.1.10) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
