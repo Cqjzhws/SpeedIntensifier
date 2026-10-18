@@ -28,14 +28,24 @@ extern int reboot(int);
 
 static NSString * const PrefPath  = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
 static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
+// v2.1.12（F-A）：请求前台 App 弹出 hook 命中统计浮层。
+// 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
+static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.1.11";
+static NSString * const SIO_VERSION = @"v2.1.12";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
+// v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
+//   当前实际影响为零（SpringBoard 在 TrollStore/TrollFools 下根本注入不进去，且即便
+//   用户给它设了覆盖，dylib 侧硬保护也会拦下来，最终行为安全），但这是一致性契约：
+//   一旦将来把淘宝/京东等重列表 App 补进 dylib 名单而这里不同步，就会出现真正的
+//   假开关 —— UI 显示「列表加速：开」、实际被硬关。这正是 v2.1.0 清理过的那类问题。
+//   ⚠ 改这里必须同步改 dylib 的 SIO_listHardBlocked()，反之亦然。
 static NSArray *HardGuardBundles(void) {
     static NSArray *a;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ a = @[ @"com.sfic.knight" ]; });
+    dispatch_once(&once, ^{ a = @[ @"com.sfic.knight",        // 顺丰同城骑士
+                                   @"com.apple.springboard" ]; });  // 桌面进程
     return a;
 }
 
@@ -188,7 +198,7 @@ static NSArray *SIOConfigKeys(void) {
                   @"InAppNotify",
                   // v2.1.9：瞬时打开三件套（新键登记白名单才能被写入 plist）
                   @"InstantTransition", @"HUDFast", @"WKFastShow",
-                  // v2.1.11：HUD 延迟。不登记白名单就写不进 plist，
+                  // v2.1.12：HUD 延迟。不登记白名单就写不进 plist，
                   // AppOverrides 里的 HUDDelay 也因此一直是死的。
                   @"HUDDelay",
                   @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
@@ -265,7 +275,7 @@ static void WriteAx(NSString *key, BOOL val) {
     d[key] = @(val);
     [d writeToFile:AxPath atomically:YES];
 }
-// v2.1.11：批量写 Accessibility.plist。save() 里原来连调三次 WriteAx，
+// v2.1.12：批量写 Accessibility.plist。save() 里原来连调三次 WriteAx，
 // 每次都是「读整个 plist → 改一个键 → 写回」，共 3 读 3 写。合成一次 IO。
 // 注意 WriteAx 本身是有 merge 的（不会清空系统其它键），这里只是消除重复 IO。
 static void WriteAxBatch(NSDictionary *kv) {
@@ -310,7 +320,7 @@ static int DragIndexForCoeff(double c) {
     if (c > 0.0 && c < 0.04)   return 4;
     return 0;
 }
-// v2.1.11：HUD 延迟档位 0=0.05s 1=0.10s 2=0.15s(默认) 3=0.30s 4=0.50s
+// v2.1.12：HUD 延迟档位 0=0.05s 1=0.10s 2=0.15s(默认) 3=0.30s 4=0.50s
 // dylib 侧校验范围 0.02–1.0，档位值全部落在范围内。
 static double HUDDelayForIndex(int i) {
     switch (i) {
@@ -665,7 +675,10 @@ static UILabel *SIOSectionTitle(NSString *t) {
 @property (strong) UISwitch *swNotify;
 // v2.1.9：瞬时打开三件套（dylib 侧三个键缺键即默认开，这里给它们补上可视化开关）
 @property (strong) UISwitch *swInstant, *swHUDFast, *swWKFast;
-// v2.1.11：HUD 延迟。dylib 侧实现完整（转圈延后多久才显形）且有范围校验，
+// v2.1.12（审查 N-6）：导入时若版本与本机不同，写入这里由 doImport 提示。
+// 不阻断导入 —— 否则用户升级后旧配置全部作废，比不校验更糟。
+@property (copy) NSString *importWarning;
+// v2.1.12：HUD 延迟。dylib 侧实现完整（转圈延后多久才显形）且有范围校验，
 // 但 App 侧从来没有入口 —— 不在 SIOConfigKeys 白名单、save() 不写、无 UI，
 // 于是 gHUDDelay 永远锁死在 0.15s。这个参数对「转圈闪一下」的抑制效果影响很大，
 // 网络快的 App 可以调到 0.05s 更激进地压闪现，网络慢的该调大免得用户以为卡死。
@@ -683,7 +696,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
 // 但 v2.1.9 的 save() 构造覆盖字典时漏了它们，导致开了专属覆盖的 App
 // 无法单独关掉瞬时打开（想用它排查白屏就没招）。
 @property (strong) UISwitch *ovInstant, *ovHUDFast, *ovWKFast;
-// v2.1.11：专属覆盖版 HUD 延迟（dylib 支持按 App 读，App 侧此前无入口）
+// v2.1.12：专属覆盖版 HUD 延迟（dylib 支持按 App 读，App 侧此前无入口）
 @property (strong) UISegmentedControl *ovHUDDelay;
 @property (strong) UISlider *ovSpeed;
 @property (strong) UILabel *ovSpeedLabel, *ovGuard;
@@ -727,7 +740,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     self.swInstant.on = c[@"InstantTransition"] ? [c[@"InstantTransition"] boolValue] : YES;
     self.swHUDFast.on = c[@"HUDFast"] ? [c[@"HUDFast"] boolValue] : YES;
     self.swWKFast.on  = c[@"WKFastShow"]  ? [c[@"WKFastShow"]  boolValue] : YES;
-    // v2.1.11：HUD 延迟（0.05 / 0.10 / 0.15 / 0.30 / 0.50），缺键 0.15
+    // v2.1.12：HUD 延迟（0.05 / 0.10 / 0.15 / 0.30 / 0.50），缺键 0.15
     self.segHUDDelay.selectedSegmentIndex =
         HUDDelayIndexFor(c[@"HUDDelay"] ? [c[@"HUDDelay"] doubleValue] : 0.15);
     self.blacklist.text = [c[@"Blacklist"] componentsJoinedByString:@"\n"];
@@ -924,7 +937,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     cfg[@"AppOverrides"] = ovOut;
 
     BOOL ok = WriteConfig(cfg);
-    // v2.1.11：三个辅助开关合并为一次「读 → 改 3 键 → 写」
+    // v2.1.12：三个辅助开关合并为一次「读 → 改 3 键 → 写」
     WriteAxBatch(@{ @"ReduceMotionEnabled":        @(self.swRM.on),
                     @"PreferCrossFadeTransitions": @(self.swCF.on),
                     @"ReduceTransparencyEnabled":  @(self.swRT.on) });
@@ -981,7 +994,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     self.swInstant.on = YES;
     self.swHUDFast.on = YES;
     self.swWKFast.on = YES;
-    // v2.1.11：预设统一把 HUD 延迟压到 0.05s（激进抑制转圈闪现）。
+    // v2.1.12：预设统一把 HUD 延迟压到 0.05s（激进抑制转圈闪现）。
     // 觉得加载圈消失太快、看不出"在加载"，可在手感页调回 0.15s 或更长。
     self.segHUDDelay.selectedSegmentIndex = 0;
 
@@ -1042,6 +1055,19 @@ static UILabel *SIOSectionTitle(NSString *t) {
         return @"剪贴板内容不是有效的 JSON 配置";
     NSDictionary *d = obj;
 
+    // v2.1.12（审查 N-6）：校验来源标记 + 版本差异警告。
+    // 原来只校验 JSON 合法性 —— 任意 JSON 只要键名碰巧匹配就会被接受，
+    // 跨大版本导入也毫无提示。
+    self.importWarning = nil;
+    NSString *fmt = d[@"_format"];
+    if (![fmt isKindOfClass:[NSString class]] || ![fmt isEqualToString:@"SIOriginalConfig"])
+        return @"不是 SIOriginal 导出的配置（缺少 _format 标记，或标记不匹配）";
+    NSString *ver = d[@"_version"];
+    if ([ver isKindOfClass:[NSString class]] && ![ver isEqualToString:SIO_VERSION])
+        self.importWarning = [NSString stringWithFormat:
+            @"⚠️ 配置来自 %@，本机是 %@。已按兼容方式导入，但部分新开关可能未包含在内，"
+             "建议导入后逐页确认一遍。", ver, SIO_VERSION];
+
     // 布尔键
     NSArray *boolKeys = @[ @"Enabled", @"Spring", @"Extra", @"ListAccel", @"ZoomAccel",
                            @"FastScroll", @"FastTap", @"InAppNotify",
@@ -1069,7 +1095,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
         self.segLayer.selectedSegmentIndex = LayerIndexForBoost([d[@"LayerBoost"] doubleValue]);
     if ([d[@"TransitionBoost"] isKindOfClass:[NSNumber class]])
         self.segTrans.selectedSegmentIndex = TransIndexFor([d[@"TransitionBoost"] doubleValue]);
-    // v2.1.11：HUD 延迟是数值键（不是布尔），单独处理
+    // v2.1.12：HUD 延迟是数值键（不是布尔），单独处理
     if ([d[@"HUDDelay"] isKindOfClass:[NSNumber class]])
         self.segHUDDelay.selectedSegmentIndex = HUDDelayIndexFor([d[@"HUDDelay"] doubleValue]);
     if ([d[@"Blacklist"] isKindOfClass:[NSArray class]]) {
@@ -1230,7 +1256,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
 - (void)buildContent {}
 - (void)uiApplied {}
 
-// v2.1.11：原来全文件只有这一处 addObserver、0 处 removeObserver、0 处 dealloc。
+// v2.1.12：原来全文件只有这一处 addObserver、0 处 removeObserver、0 处 dealloc。
 // 当前不会崩（4 个 VC 被 AppDelegate 强持有、生命周期等同进程），但一旦后续改成
 // 懒加载或动态增删 Tab，VC 释放后通知回调会访问已释放对象。补上注销。
 - (void)dealloc {
@@ -1443,7 +1469,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
         SIORowSub(@"加载圈 / HUD 加速", @"转圈延后 0.15s 才显形，SVProgressHUD/MBProgressHUD 立即消失", m.swHUDFast),
         SIORowSub(@"网页提前显形", @"WKWebView 加载进度过 10% 后拒绝再被隐藏，网页更早露出来", m.swWKFast),
     ], 14)];
-    // v2.1.11：HUD 延迟 —— dylib 支持调但配置端一直锁死在 0.15s，现在开放
+    // v2.1.12：HUD 延迟 —— dylib 支持调但配置端一直锁死在 0.15s，现在开放
     m.segHUDDelay = [[UISegmentedControl alloc]
         initWithItems:@[ @"0.05s", @"0.10s", @"0.15s", @"0.30s", @"0.50s" ]];
     [self.stack addArrangedSubview:SIOSectionTitle(@"转圈延迟 · 越短越不闪")];
@@ -1539,7 +1565,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     double c = DragCoeffForIndex(idx);
     if (!m.swEnabled.on) {
         m.lblDrag.textColor = [UIColor secondaryLabelColor];
-        m.lblDrag.text = @"总开关当前关闭：保存后此项会被清成原生值（v2.1.11 起），先开总开关再选档位。";
+        m.lblDrag.text = @"总开关当前关闭：保存后此项会被清成原生值（v2.1.12 起），先开总开关再选档位。";
         return;
     }
     if (idx == 4) {
@@ -1563,6 +1589,8 @@ static UILabel *SIOSectionTitle(NSString *t) {
 @interface SIOAdvancedVC : SIOPageVC <UITextFieldDelegate>
 @property (strong) UITextView *reportView;
 @property (strong) UIButton  *checkPill;   // v2.1.9：保留引用以便点击后改标题给反馈
+// v2.1.12（F-A）：请求目标 App 上报 hook 命中统计
+- (void)doRequestStats;
 @end
 @implementation SIOAdvancedVC
 
@@ -1672,6 +1700,28 @@ static UILabel *SIOSectionTitle(NSString *t) {
     [self.stack addArrangedSubview:SIOCard(@[ self.checkPill, self.reportView ], 10)];
     [self doCheck];
 
+    // ---- v2.1.12（F-A）：hook 命中统计 ----
+    // 统计的是**目标 App 进程内**各条加速路径被走过多少次，dylib 侧受沙盒限制写不进
+    // plist，所以做成「这里发 Darwin 通知 → 目标 App 内弹浮层」：
+    // 点完按钮切到你想看的 App，浮层会在那儿显示 6 秒。
+    [self.stack addArrangedSubview:SIOSectionTitle(@"运行时命中统计")];
+    UIButton *hs = SIOPill(@"📊 请求当前 App 上报命中统计",
+                           [UIColor whiteColor], [UIColor systemIndigoColor]);
+    hs.layer.borderWidth = 1;
+    hs.layer.borderColor = [UIColor systemIndigoColor].CGColor;
+    [hs addTarget:self action:@selector(doRequestStats)
+             forControlEvents:UIControlEventTouchUpInside];
+    UILabel *hsNote = SIOLabel(
+        @"用法：先切到你想看的 App 并随便滑动/翻几页，再切回来点这个按钮，"
+         "然后立刻切回去 —— 统计浮层会在那个 App 顶部显示 6 秒。\n"
+         "看什么：哪一项数字大，就说明这个 App 的动画主要走那条路"
+         "（比如 ListTV 大就调列表相关、LayerAdd 大就调显式动画倍率 LayerBoost）。\n"
+         "全是 0 说明它走了我们没覆盖的路径 —— 这就是以前要手工拆包才能发现的盲区。\n"
+         "每次保存配置后计数清零，所以看到的都是当前参数下的分布。",
+        12, [UIColor secondaryLabelColor]);
+    hsNote.numberOfLines = 0;
+    [self.stack addArrangedSubview:SIOCard(@[ hs, hsNote ], 10)];
+
     // ---- 电源 ----
     [self.stack addArrangedSubview:SIOSectionTitle(@"电源操作（会先自动保存）")];
     UIButton *rs = SIOPill(@"🔄 注销 SpringBoard", [UIColor whiteColor], [UIColor systemBlueColor]);
@@ -1755,16 +1805,38 @@ static UILabel *SIOSectionTitle(NSString *t) {
     }
     BOOL ok = [self.model save];
     [self doCheck];
+    // v2.1.12（N-6）：跨版本导入的警告拼在成功消息后面，不阻断
+    NSString *msg = ok ? [self.model summary] : @"控件已更新，但 plist 写入失败，请检查权限。";
+    if (ok && self.model.importWarning.length)
+        msg = [NSString stringWithFormat:@"%@\n\n%@", self.model.importWarning, [self.model summary]];
     UIAlertController *a = [UIAlertController
         alertControllerWithTitle:ok ? @"✅ 导入成功并已保存" : @"⚠️ 已导入但保存失败"
-        message:ok ? [self.model summary] : @"控件已更新，但 plist 写入失败，请检查权限。"
+        message:msg
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+// v2.1.12（F-A）：广播统计请求。dylib 收到后在**当前前台 App** 内弹浮层。
+- (void)doRequestStats {
+    CFNotificationCenterPostNotification(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        (__bridge CFStringRef)NotifyStatsKey, NULL, NULL, YES);
+    UIImpactFeedbackGenerator *fb = [[UIImpactFeedbackGenerator alloc]
+        initWithStyle:UIImpactFeedbackStyleMedium];
+    [fb impactOccurred];
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"📊 已广播统计请求"
+        message:@"现在立刻切回目标 App，浮层会在它顶部显示 6 秒。\n\n"
+                 "注意：只有前台运行的那个 App 会响应；如果切过去没看到，"
+                 "说明该 App 里 dylib 未注入或未在前台。"
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
 }
 
 - (void)doCheck {
-    // v2.1.9：点击反馈 —— 震动 + 按钮标题短暂变化 + 报告含检测时间，肉眼可见「真的重新检测了」
+// v2.1.9：点击反馈 —— 震动 + 按钮标题短暂变化 + 报告含检测时间，肉眼可见「真的重新检测了」
     self.reportView.text = [self.model checkReport];
     [self.reportView setContentOffset:CGPointZero animated:NO];
     if (self.checkPill) {
