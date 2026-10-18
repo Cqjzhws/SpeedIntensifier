@@ -1,4 +1,4 @@
-// SIOriginal — 原版重制                                        v2.1.11
+// SIOriginal — 原版重制                                        v2.1.12
 //
 // ============================ v2.1.10 全量审计修复 ============================
 // 逐行审计 dylib（2407 行）+ 配置 App（1797 行）后修掉的四类问题：
@@ -262,6 +262,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <stdatomic.h>   // v2.1.12（F-A）：hook 命中计数器用 _Atomic + memory_order_relaxed
 // v2.1.11：strstr 用于 _fbg_appState 热路径上的 C 字符串判定（零分配），显式引入。
 #include <string.h>
 #include <dlfcn.h>
@@ -277,6 +278,9 @@
 #define kPrefDomain  @"com.apple.UIKit"
 #define kPrefPath    @"/var/Managed Preferences/mobile/com.apple.UIKit.plist"
 #define kNotifyName  @"com.local.sioriginal.settingschanged"
+// v2.1.12（F-A）：配置 App 发这个通知，请求 dylib 在当前前台 App 内弹出命中统计浮层。
+// 名字必须与配置 App 侧 NotifyStatsKey 完全一致，否则按钮按了没反应。
+#define kNotifyStats @"com.local.sioriginal.requeststats"
 
 // ---------- 配置 ----------
 // v2.1.11 注释订正（行为不变，只改注释）：
@@ -340,6 +344,69 @@ static inline BOOL SIO_inUIViewAnim(void)   { return (BOOL)(intptr_t)pthread_get
 static inline void SIO_setUIViewAnim(BOOL v){ pthread_setspecific(gInUIViewAnimKey, (void *)(intptr_t)(v ? 1 : 0)); }
 static inline BOOL SIO_inPAInit(void)       { return (BOOL)(intptr_t)pthread_getspecific(gInPAInitKey); }
 static inline void SIO_setPAInit(BOOL v)    { pthread_setspecific(gInPAInitKey, (void *)(intptr_t)(v ? 1 : 0)); }
+
+// =========================================================================
+// v2.1.12（F-A）运行时 hook 命中统计
+// -------------------------------------------------------------------------
+// 背景：文件末尾那份「拆包证据」是**手工**对单个已解密 App 做的静态分析
+// （解析 __objc_classname / __objc_methname 再逐个比对）。它有三个硬限制：
+//   ① 只能针对单个 App，且每次都要手工做一遍
+//   ② 静态分析看不到调用频率 —— 被引用 ≠ 被高频调用
+//   ③ 发现不了「走了完全没覆盖的路径」（只能告诉你已知的 API 用没用）
+// 计数器补上的是第 ②③ 条：运行时实测每个入口被走过多少次。
+//
+// 用途：
+//   · 精准调参 —— 用户报「某 App 转圈变慢」，一看统计就知道它主要走哪条路，
+//     该调 LayerBoost 还是全局 Speed，不用再猜
+//   · 暴露真盲区 —— 若某 App 动画完全没被加速而 22 个计数**全是 0**，
+//     直接证明它走了未覆盖的路径（静态拆包给不出这个结论）
+//   · 验证 hook 是否真的生效 —— 某个计数器长期为 0 说明那条路在目标 App 上
+//     根本没被走到（v1.8.12 那个「元类 bug 导致 hook 从未生效」的问题，
+//     如果当时有计数器，一眼就能看出来）
+//
+// 开销：memory_order_relaxed 单次自增，arm64 上是一条 ldxr/stxr 或普通 add。
+// 对照这些 hook 内部本来就要做 SIO_blocked() 判断、CATransaction begin/commit、
+// block 捕获，一次整数自增完全在噪声以下。纯观测，不改变任何 hook 行为。
+//
+// 注意：只统计「做加速决策的入口」。像 sio_AIstopAnim（取消延迟）、
+// sio_WKClass / sio_WKdeferHide（内部辅助）不算 hook 命中，不计入。
+// =========================================================================
+enum {
+    SIO_HIT_CAANIM = 0,   // CAAnimation setDuration:
+    SIO_HIT_CATX,         // CATransaction setAnimationDuration:
+    SIO_HIT_SPRING,       // CASpringAnimation mass/stiffness/damping
+    SIO_HIT_LAYER_ADD,    // CALayer addAnimation:forKey:
+    SIO_HIT_UVBLOCK,      // UIView animateWithDuration: 系列（含 transition）
+    SIO_HIT_KEYFRAME,     // UIView animateKeyframesWithDuration:
+    SIO_HIT_SYSANIM,      // UIView performSystemAnimation:
+    SIO_HIT_OLDSTYLE,     // UIView setAnimationDuration:/Delay:（老式 API）
+    SIO_HIT_NAV,          // UINavigationController push/pop/setViewControllers
+    SIO_HIT_PRESENT,      // present/dismiss/transitionFromViewController
+    SIO_HIT_TAB,          // UITabBarController 切换
+    SIO_HIT_LIST_TV,      // UITableView 系列（17 个）
+    SIO_HIT_LIST_CV,      // UICollectionView 系列（9 个）
+    SIO_HIT_PA,           // UIViewPropertyAnimator 系列（7 个）
+    SIO_HIT_SV_SCROLL,    // UIScrollView setContentOffset:/scrollRectToVisible:
+    SIO_HIT_SV_ZOOM,      // UIScrollView setZoomScale:/zoomToRect:
+    SIO_HIT_FEEL,         // 手感：didMoveToWindow / decelerationRate / delaysContentTouches
+    SIO_HIT_HUD_AI,       // UIActivityIndicatorView startAnimating
+    SIO_HIT_HUD_SV,       // SVProgressHUD dismissWithDelay:
+    SIO_HIT_HUD_MB,       // MBProgressHUD hide:
+    SIO_HIT_WK,           // WKWebView setHidden:
+    SIO_HIT_NOTIFY,       // UNUserNotificationCenter willPresent（保活场景伪装）
+    SIO_HIT__COUNT
+};
+static _Atomic uint32_t gHitCounts[SIO_HIT__COUNT];
+// 名字表：日志与浮层都用它，保证两者口径一致（顺序必须与上面的 enum 严格对应）
+static const char * const kSIOHitNames[SIO_HIT__COUNT] = {
+    "CAAnim", "CATx", "CASpring", "LayerAdd", "UIViewBlock", "Keyframe",
+    "SysAnim", "OldStyle", "Nav", "Present", "Tab", "ListTV", "ListCV",
+    "PA", "SVScroll", "SVZoom", "Feel", "HUD_AI", "HUD_SV", "HUD_MB",
+    "WK", "Notify"
+};
+#define SIO_HIT(slot) \
+    atomic_fetch_add_explicit(&gHitCounts[(slot)], 1u, memory_order_relaxed)
+// ===================== F-A 命中统计定义结束 =====================
 
 // v1.8.12：原 IMP 判空（红线规则 #4）。方法不存在时 hook 不会被安装，这里是纯防御：
 // 万一 orig 为空，直接放弃本次拦截，绝不对空指针发消息。
@@ -452,6 +519,9 @@ static NSDictionary *SIO_appOverride(NSDictionary *root) {
 // 名单来源为本项目实测记录 —— 这些 App 的列表 UI 与 TV/CV 变更类 hook 冲突，
 // 会破坏列表状态机导致卡死/崩溃。安全项 fail-safe，不接受"忘了关"。
 static BOOL SIO_listHardBlocked(void) {
+    // v2.1.12（审查 N-2）：这份名单在配置 App 侧有一份镜像 SIOModel.m 里的
+    // HardGuardBundles()。⚠ 改这里必须同步改那里，反之亦然 ——
+    // 两边不一致会让专属覆盖页显示「列表加速：开」而实际被硬关，即假开关。
     static NSArray *blocked = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -723,6 +793,50 @@ static NSString *SIO_modeSummary(void) {
     return s;
 }
 
+// ---- v2.1.12（F-A）：命中统计导出 ----
+// 日志版：全量 22 项，一行，供连 Mac 看 Console 用。
+static NSString *SIO_statsLogLine(void) {
+    NSMutableString *s = [NSMutableString stringWithString:@"[SIOriginal] hook hits:"];
+    for (int i = 0; i < SIO_HIT__COUNT; i++) {
+        uint32_t v = atomic_load_explicit(&gHitCounts[i], memory_order_relaxed);
+        [s appendFormat:@" %s=%u", kSIOHitNames[i], v];
+    }
+    return s;
+}
+
+// 浮层版：只列非零项（22 项全列在手机上读不完），按命中数降序，最多 8 行。
+// 全为 0 时给一句明确的诊断提示 —— 这正是 F-A 想暴露的「走了未覆盖路径」信号。
+static NSString *SIO_statsPanelText(void) {
+    NSMutableArray *rows = [NSMutableArray array];
+    uint32_t total = 0;
+    for (int i = 0; i < SIO_HIT__COUNT; i++) {
+        uint32_t v = atomic_load_explicit(&gHitCounts[i], memory_order_relaxed);
+        total += v;
+        if (v) [rows addObject:@[ @(v), [NSString stringWithUTF8String:kSIOHitNames[i]] ]];
+    }
+    if (!rows.count) {
+        return @"SIOriginal 命中统计\n本次运行 0 命中 —— 该 App 的动画走了未覆盖的路径";
+    }
+    [rows sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
+        return [b[0] compare:a[0]];
+    }];
+    NSMutableString *s = [NSMutableString stringWithFormat:
+        @"SIOriginal 命中统计（共 %u 次）", total];
+    NSUInteger n = MIN(rows.count, (NSUInteger)8);
+    for (NSUInteger i = 0; i < n; i++) {
+        [s appendFormat:@"\n%@  %@", rows[i][1], rows[i][0]];
+    }
+    if (rows.count > n) [s appendFormat:@"\n…及其他 %lu 项", (unsigned long)(rows.count - n)];
+    return s;
+}
+
+// 清零：热重载时先 dump 上一次的再清零，这样每次改完配置得到的都是
+// 「新参数下的命中分布」，不用手动做减法。
+static void SIO_statsReset(void) {
+    for (int i = 0; i < SIO_HIT__COUNT; i++)
+        atomic_store_explicit(&gHitCounts[i], 0u, memory_order_relaxed);
+}
+
 static void SIO_dismissToast(void) {
     if (!sioToastWindow) return;
     UIWindow *w = sioToastWindow;
@@ -797,6 +911,106 @@ static void SIO_showToast(void) {
     });
 }
 
+// ---- v2.1.12（F-A）：命中统计浮层 ----
+// 与 toast 同一套无感浮层机制（不拦触摸、自动消失），但卡片更高、多行、停留更久。
+// 为什么不做成「写进 plist 让配置 App 读」：dylib 跑在目标 App 进程内，受目标 App
+// 沙盒限制，写不了 /var/Managed Preferences/mobile/（该目录 root 拥有、App 只读）。
+// 所以改成「配置 App 发 Darwin 通知 → dylib 收到后在目标 App 内弹浮层」，
+// 不需要 Mac、不需要持久化，用户在目标 App 里当场就能看到。
+static UIWindow *sioStatsWindow = nil;
+
+static void SIO_dismissStats(void) {
+    if (!sioStatsWindow) return;
+    UIWindow *w = sioStatsWindow;
+    [UIView animateWithDuration:0.25 animations:^{ w.alpha = 0; }
+                     completion:^(BOOL finished) {
+        w.hidden = YES;
+        if (sioStatsWindow == w) sioStatsWindow = nil;
+    }];
+}
+
+static void SIO_showStats(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    if (app.applicationState != UIApplicationStateActive) return;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            if (sioStatsWindow) { sioStatsWindow.hidden = YES; sioStatsWindow = nil; }
+
+            NSString *text = SIO_statsPanelText();
+            CGRect sb = UIScreen.mainScreen.bounds;
+            CGFloat cardW = sb.size.width - 24;
+
+            UIFont *font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightRegular];
+            CGRect box = [text boundingRectWithSize:CGSizeMake(cardW - 28, CGFLOAT_MAX)
+                                            options:NSStringDrawingUsesLineFragmentOrigin
+                                         attributes:@{ NSFontAttributeName: font }
+                                            context:nil];
+            CGFloat cardH = MIN(MAX(box.size.height + 24, 64), sb.size.height - 120);
+
+            UIWindow *w = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, sb.size.width,
+                                                                     cardH + 20)];
+            if ([w respondsToSelector:@selector(setWindowScene:)]) {
+                for (UIScene *sc in app.connectedScenes) {
+                    if (sc.activationState == UISceneActivationStateForegroundActive &&
+                        [sc isKindOfClass:[UIWindowScene class]]) {
+                        w.windowScene = (UIWindowScene *)sc;
+                        break;
+                    }
+                }
+            }
+            w.windowLevel = UIWindowLevelStatusBar + 2;
+            w.backgroundColor = [UIColor clearColor];
+            w.rootViewController = [UIViewController new];
+            w.rootViewController.view.backgroundColor = [UIColor clearColor];
+            w.userInteractionEnabled = NO;
+
+            UIView *card = [[UIView alloc] initWithFrame:CGRectMake(12, 10, cardW, cardH)];
+            card.backgroundColor = [UIColor colorWithRed:0.07 green:0.08 blue:0.11 alpha:0.95];
+            card.layer.cornerRadius = 16;
+            card.layer.masksToBounds = YES;
+            card.userInteractionEnabled = NO;
+            card.alpha = 0;
+            card.transform = CGAffineTransformMakeTranslation(0, -14);
+
+            UILabel *label = [[UILabel alloc]
+                initWithFrame:CGRectMake(14, 12, cardW - 28, cardH - 24)];
+            label.text = text;
+            label.textColor = [UIColor colorWithRed:0.62 green:0.90 blue:1.0 alpha:1.0];
+            label.font = font;
+            label.textAlignment = NSTextAlignmentLeft;
+            label.numberOfLines = 0;
+            label.userInteractionEnabled = NO;
+            [card addSubview:label];
+            [w.rootViewController.view addSubview:card];
+
+            w.hidden = NO;
+            sioStatsWindow = w;
+            [UIView animateWithDuration:0.25 animations:^{
+                card.alpha = 1;
+                card.transform = CGAffineTransformIdentity;
+            }];
+            // 6s 自动消失（内容多，给足阅读时间）
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ SIO_dismissStats(); });
+        } @catch (__unused NSException *e) {}
+    });
+}
+
+// v2.1.12（F-A）：收到配置 App 的统计请求 → 在当前前台 App 内弹浮层。
+// 同样遵守 v2.1.10 的竞态约定：Darwin 回调在通知线程，UI 操作必须回主线程。
+static void SIO_onStatsRequest(CFNotificationCenterRef center, void *observer,
+                               CFNotificationName name, const void *object,
+                               CFDictionaryRef userInfo) {
+    (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            NSLog(@"%@", SIO_statsLogLine());   // 有 Mac 的话 Console 里也留一份
+            SIO_showStats();
+        } @catch (__unused NSException *e) {}
+    });
+}
+
 static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
                                 CFNotificationName name, const void *object,
                                 CFDictionaryRef userInfo) {
@@ -809,6 +1023,10 @@ static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
             // v2.1.11：热重载也打印一行完整状态。原来启动日志只在 constructor 打一次，
             // 用户最常见的报障是「我改了配置但没生效」，而当时无法区分是
             // 没写进 plist / dylib 没收到通知 / 收到了但命中保护名单。现在三种情况可分辨。
+            // v2.1.12（F-A）：先 dump「自上次重载以来」的命中分布再清零。
+            // 这样每次改完配置拿到的都是新参数下的分布，不用手动做减法。
+            NSLog(@"%@", SIO_statsLogLine());
+            SIO_statsReset();
             NSLog(@"[SIOriginal] reload in %@: enabled=%d mode=%d speed=%.1f "
                   @"hudProtected=%d feelProtected=%d listHardGuarded=%d "
                   @"blacklisted=%d override=%d physBg=%d",
@@ -950,6 +1168,10 @@ static id     (*o_pa_initWithDurTP)(id, SEL, double, id, void (^)(void));
 static id     (*o_pa_initWithDurCP)(id, SEL, double, CGPoint, CGPoint, void (^)(void));
 static id     (*o_pa_initWithDurSpring)(id, SEL, double, double, void (^)(void));
 static id     (*o_pa_runningPA)(id, SEL, double, double, UIViewAnimationOptions, void (^)(void), void (^)(BOOL));
+// v2.1.12（F-D）：startAnimationAfterDelay: —— 纯 setter 类方法，只接受一个 NSTimeInterval，
+// 属于本项目自己定义的「风险最低的一类 hook」。补上是覆盖面兜底：
+// 拆包证据只证明 Knight.app 没用它，不代表普遍情况。
+static void   (*o_pa_startAfterDelay)(id, SEL, NSTimeInterval);
 
 // ---- UIScrollView 滚动动画 ----
 static void   (*o_sv_setContentOffset)(id, SEL, CGPoint, BOOL);
@@ -997,6 +1219,7 @@ static void   (*o_MBHUDHide)(id, SEL, BOOL);                            // -MBPr
 #pragma mark - CAAnimation（核心：仅基类，子类自动继承）
 
 static void sio_CAAnim_setDuration(id self, SEL _cmd, double d) {
+    SIO_HIT(SIO_HIT_CAANIM);
     SIO_REQUIRE_ORIG(o_CAAnim_setDuration);
     if (SIO_blocked()) { o_CAAnim_setDuration(self, _cmd, d); return; }
     // v2.1.7 fix + v2.1.8 opt：CAKeyframeAnimation 用 0.05s 下限加速。
@@ -1023,6 +1246,7 @@ static void sio_CAAnim_setDuration(id self, SEL _cmd, double d) {
 #pragma mark - CATransaction
 
 static void sio_CATransaction_setDur(id self, SEL _cmd, double d) {
+    SIO_HIT(SIO_HIT_CATX);
     SIO_REQUIRE_ORIG(o_CATransaction_setDur);
     if (SIO_inUIViewAnim() || SIO_blocked()) {
         o_CATransaction_setDur(self, _cmd, d);
@@ -1048,6 +1272,7 @@ static inline double SIO_targetDelay(double delay) {
 }
 
 static void sio_UV_anim_d(Class self, SEL _cmd, double d, void (^a)(void)) {
+    SIO_HIT(SIO_HIT_UVBLOCK);
     SIO_REQUIRE_ORIG(o_UV_anim_d);
     if (SIO_blocked()) { o_UV_anim_d(self, _cmd, d, a); return; }
     BOOL wasAnim = SIO_inUIViewAnim();
@@ -1057,6 +1282,7 @@ static void sio_UV_anim_d(Class self, SEL _cmd, double d, void (^a)(void)) {
 }
 
 static void sio_UV_anim_dc(Class self, SEL _cmd, double d, void (^a)(void), void (^c)(BOOL)) {
+    SIO_HIT(SIO_HIT_UVBLOCK);
     SIO_REQUIRE_ORIG(o_UV_anim_dc);
     if (SIO_blocked()) { o_UV_anim_dc(self, _cmd, d, a, c); return; }
     BOOL wasAnim = SIO_inUIViewAnim();
@@ -1067,6 +1293,7 @@ static void sio_UV_anim_dc(Class self, SEL _cmd, double d, void (^a)(void), void
 
 static void sio_UV_anim_ddoc(Class self, SEL _cmd, double d, double delay, UIViewAnimationOptions o,
                              void (^a)(void), void (^c)(BOOL)) {
+    SIO_HIT(SIO_HIT_UVBLOCK);
     SIO_REQUIRE_ORIG(o_UV_anim_ddoc);
     if (SIO_blocked()) { o_UV_anim_ddoc(self, _cmd, d, delay, o, a, c); return; }
     BOOL wasAnim = SIO_inUIViewAnim();
@@ -1077,6 +1304,7 @@ static void sio_UV_anim_ddoc(Class self, SEL _cmd, double d, double delay, UIVie
 
 static void sio_UV_anim_spring(Class self, SEL _cmd, double d, double damp, double vel,
                                UIViewAnimationOptions o, void (^a)(void), void (^c)(BOOL)) {
+    SIO_HIT(SIO_HIT_UVBLOCK);
     SIO_REQUIRE_ORIG(o_UV_anim_spring);
     if (SIO_blocked()) { o_UV_anim_spring(self, _cmd, d, damp, vel, o, a, c); return; }
     BOOL wasAnim = SIO_inUIViewAnim();
@@ -1089,6 +1317,7 @@ static void sio_UV_anim_spring(Class self, SEL _cmd, double d, double damp, doub
 
 static void sio_UV_trans(Class self, SEL _cmd, UIView *v, double d, UIViewAnimationOptions o,
                          void (^a)(void), void (^c)(BOOL)) {
+    SIO_HIT(SIO_HIT_UVBLOCK);
     SIO_REQUIRE_ORIG(o_UV_trans);
     if (SIO_blocked()) { o_UV_trans(self, _cmd, v, d, o, a, c); return; }
     BOOL wasAnim = SIO_inUIViewAnim();
@@ -1099,6 +1328,7 @@ static void sio_UV_trans(Class self, SEL _cmd, UIView *v, double d, UIViewAnimat
 
 static void sio_UV_transFrom(Class self, SEL _cmd, UIView *a1, UIView *a2, double d,
                              UIViewAnimationOptions o, void (^an)(void), void (^c)(BOOL)) {
+    SIO_HIT(SIO_HIT_UVBLOCK);
     SIO_REQUIRE_ORIG(o_UV_transFrom);
     if (SIO_blocked()) { o_UV_transFrom(self, _cmd, a1, a2, d, o, an, c); return; }
     BOOL wasAnim = SIO_inUIViewAnim();
@@ -1112,6 +1342,7 @@ static void sio_UV_transFrom(Class self, SEL _cmd, UIView *a1, UIView *a2, doubl
 // 旧代码/部分定制转场只用 completion 变体；与带动画段版本同机制，直接改写时长。
 static void sio_UV_transFromNoAnim(Class self, SEL _cmd, UIView *a1, UIView *a2, double d,
                                    UIViewAnimationOptions o, void (^c)(BOOL)) {
+    SIO_HIT(SIO_HIT_UVBLOCK);
     SIO_REQUIRE_ORIG(o_UV_transFromNoAnim);
     if (SIO_blocked()) { o_UV_transFromNoAnim(self, _cmd, a1, a2, d, o, c); return; }
     BOOL wasAnim = SIO_inUIViewAnim();
@@ -1127,6 +1358,7 @@ static void sio_UV_transFromNoAnim(Class self, SEL _cmd, UIView *a1, UIView *a2,
 // options 参数用 NSUInteger 承接（UIViewKeyframeAnimationOptions 底层即 NSUInteger，ABI 一致）。
 static void sio_UV_anim_keyframes(Class self, SEL _cmd, double d, double delay, NSUInteger o,
                                   void (^a)(void), void (^c)(BOOL)) {
+    SIO_HIT(SIO_HIT_KEYFRAME);
     SIO_REQUIRE_ORIG(o_UV_anim_keyframes);
     if (SIO_blocked()) { o_UV_anim_keyframes(self, _cmd, d, delay, o, a, c); return; }
     BOOL wasAnim = SIO_inUIViewAnim();
@@ -1141,6 +1373,7 @@ static void sio_UV_anim_keyframes(Class self, SEL _cmd, double d, double delay, 
 // 不改写 animated 语义，避免影响系统对视图生命周期的收尾。
 static void sio_UV_systemAnim(Class self, SEL _cmd, NSUInteger anim, NSArray *views, NSUInteger o,
                               void (^a)(void), void (^c)(BOOL)) {
+    SIO_HIT(SIO_HIT_SYSANIM);
     SIO_REQUIRE_ORIG(o_UV_systemAnim);
     if (SIO_blocked()) { o_UV_systemAnim(self, _cmd, anim, views, o, a, c); return; }
     [CATransaction begin];
@@ -1161,6 +1394,7 @@ static void sio_UV_systemAnim(Class self, SEL _cmd, NSUInteger anim, NSArray *vi
 // 这套 API 在 iOS 13 起被标记 deprecated，但从未失效，老代码/SDK/第三方库里仍然大量存在；
 // 它不走 animateWithDuration: 系，我们此前的 8 个 UIView 块动画 hook 全部拦不到。
 static void sio_UV_setAnimDuration(Class self, SEL _cmd, double d) {
+    SIO_HIT(SIO_HIT_OLDSTYLE);
     SIO_REQUIRE_ORIG(o_UV_setAnimDuration);
     // 已在自己的一次块动画/转场包裹内 → 说明这次调用是 UIKit 内部转发出来的，原样透传防止二次缩放
     if (SIO_blocked() || SIO_inUIViewAnim()) { o_UV_setAnimDuration(self, _cmd, d); return; }
@@ -1173,6 +1407,7 @@ static void sio_UV_setAnimDuration(Class self, SEL _cmd, double d) {
 }
 
 static void sio_UV_setAnimDelay(Class self, SEL _cmd, double d) {
+    SIO_HIT(SIO_HIT_OLDSTYLE);
     SIO_REQUIRE_ORIG(o_UV_setAnimDelay);
     if (SIO_blocked() || SIO_inUIViewAnim()) { o_UV_setAnimDelay(self, _cmd, d); return; }
     // 延迟与块动画 animateWithDuration:delay: 保持同一套换算：
@@ -1186,6 +1421,7 @@ static void sio_UV_setAnimDelay(Class self, SEL _cmd, double d) {
 #pragma mark - CASpring（原版灵魂功能：参数缩放保持物理一致性）
 
 static void sio_CASpring_mass(id self, SEL _cmd, double v) {
+    SIO_HIT(SIO_HIT_SPRING);
     SIO_REQUIRE_ORIG(o_CASpring_mass);
     if (SIO_blocked() || !gSpring) { o_CASpring_mass(self, _cmd, v); return; }
     double m = SIO_springScale();
@@ -1193,6 +1429,7 @@ static void sio_CASpring_mass(id self, SEL _cmd, double v) {
 }
 
 static void sio_CASpring_stiff(id self, SEL _cmd, double v) {
+    SIO_HIT(SIO_HIT_SPRING);
     SIO_REQUIRE_ORIG(o_CASpring_stiff);
     if (SIO_blocked() || !gSpring) { o_CASpring_stiff(self, _cmd, v); return; }
     double m = SIO_springScale();
@@ -1200,6 +1437,7 @@ static void sio_CASpring_stiff(id self, SEL _cmd, double v) {
 }
 
 static void sio_CASpring_damp(id self, SEL _cmd, double v) {
+    SIO_HIT(SIO_HIT_SPRING);
     SIO_REQUIRE_ORIG(o_CASpring_damp);
     if (SIO_blocked() || !gSpring) { o_CASpring_damp(self, _cmd, v); return; }
     o_CASpring_damp(self, _cmd, v * SIO_springScale());
@@ -1231,6 +1469,7 @@ static inline double SIO_transitionDuration(void) {
 }
 
 static void sio_nav_push(id self, SEL _cmd, UIViewController *vc, BOOL anim) {
+    SIO_HIT(SIO_HIT_NAV);
     SIO_REQUIRE_ORIG(o_nav_push);
     if (SIO_blocked() || !gExtra || !anim) { o_nav_push(self, _cmd, vc, anim); return; }
     [CATransaction begin];
@@ -1241,6 +1480,7 @@ static void sio_nav_push(id self, SEL _cmd, UIViewController *vc, BOOL anim) {
 }
 
 static void sio_nav_pop(id self, SEL _cmd, BOOL anim) {
+    SIO_HIT(SIO_HIT_NAV);
     SIO_REQUIRE_ORIG(o_nav_pop);
     if (SIO_blocked() || !gExtra || !anim) { o_nav_pop(self, _cmd, anim); return; }
     [CATransaction begin];
@@ -1251,6 +1491,7 @@ static void sio_nav_pop(id self, SEL _cmd, BOOL anim) {
 }
 
 static void sio_nav_popTo(id self, SEL _cmd, UIViewController *vc, BOOL anim) {
+    SIO_HIT(SIO_HIT_NAV);
     SIO_REQUIRE_ORIG(o_nav_popTo);
     if (SIO_blocked() || !gExtra || !anim) { o_nav_popTo(self, _cmd, vc, anim); return; }
     [CATransaction begin];
@@ -1261,6 +1502,7 @@ static void sio_nav_popTo(id self, SEL _cmd, UIViewController *vc, BOOL anim) {
 }
 
 static void sio_nav_setVCs(id self, SEL _cmd, NSArray *vcs, BOOL anim) {
+    SIO_HIT(SIO_HIT_NAV);
     SIO_REQUIRE_ORIG(o_nav_setVCs);
     if (SIO_blocked() || !gExtra || !anim) { o_nav_setVCs(self, _cmd, vcs, anim); return; }
     [CATransaction begin];
@@ -1271,12 +1513,14 @@ static void sio_nav_setVCs(id self, SEL _cmd, NSArray *vcs, BOOL anim) {
 }
 
 static void sio_nav_privDur(id self, SEL _cmd, double d) {
+    SIO_HIT(SIO_HIT_NAV);
     SIO_REQUIRE_ORIG(o_nav_privDur);
     if (SIO_blocked() || !gExtra) { o_nav_privDur(self, _cmd, d); return; }
     o_nav_privDur(self, _cmd, SIO_targetDuration(d));
 }
 
 static void sio_vc_present(id self, SEL _cmd, UIViewController *vc, BOOL anim, void (^c)(void)) {
+    SIO_HIT(SIO_HIT_PRESENT);
     SIO_REQUIRE_ORIG(o_vc_present);
     if (SIO_blocked() || !gExtra || !anim) { o_vc_present(self, _cmd, vc, anim, c); return; }
     [CATransaction begin];
@@ -1287,6 +1531,7 @@ static void sio_vc_present(id self, SEL _cmd, UIViewController *vc, BOOL anim, v
 }
 
 static void sio_vc_dismiss(id self, SEL _cmd, BOOL anim, void (^c)(void)) {
+    SIO_HIT(SIO_HIT_PRESENT);
     SIO_REQUIRE_ORIG(o_vc_dismiss);
     if (SIO_blocked() || !gExtra || !anim) { o_vc_dismiss(self, _cmd, anim, c); return; }
     [CATransaction begin];
@@ -1303,6 +1548,7 @@ static void sio_vc_dismiss(id self, SEL _cmd, BOOL anim, void (^c)(void)) {
 static void sio_vc_transitionFrom(id self, SEL _cmd, UIViewController *from, UIViewController *to,
                                   double d, UIViewAnimationOptions o,
                                   void (^an)(void), void (^c)(BOOL)) {
+    SIO_HIT(SIO_HIT_PRESENT);
     SIO_REQUIRE_ORIG(o_vc_transitionFrom);
     if (SIO_blocked() || !gExtra) { o_vc_transitionFrom(self, _cmd, from, to, d, o, an, c); return; }
     o_vc_transitionFrom(self, _cmd, from, to, SIO_targetDuration(d), o, an, c);
@@ -1312,6 +1558,7 @@ static void sio_vc_transitionFrom(id self, SEL _cmd, UIViewController *from, UIV
 // UITabBarController 的选中切换此前未 hook（父项目 README 把它列为基础层 hook，
 // 但 SIOriginal 这一支一直缺失）。用 CATransaction 覆盖时长，不改动选中语义。
 static void sio_tab_setIndex(id self, SEL _cmd, NSUInteger idx) {
+    SIO_HIT(SIO_HIT_TAB);
     SIO_REQUIRE_ORIG(o_tab_setIndex);
     if (SIO_blocked() || !gExtra) { o_tab_setIndex(self, _cmd, idx); return; }
     [CATransaction begin];
@@ -1322,6 +1569,7 @@ static void sio_tab_setIndex(id self, SEL _cmd, NSUInteger idx) {
 }
 
 static void sio_tab_setVC(id self, SEL _cmd, UIViewController *vc) {
+    SIO_HIT(SIO_HIT_TAB);
     SIO_REQUIRE_ORIG(o_tab_setVC);
     if (SIO_blocked() || !gExtra) { o_tab_setVC(self, _cmd, vc); return; }
     [CATransaction begin];
@@ -1348,90 +1596,105 @@ static void SIO_listWrap(void (^block)(void)) {
 // ---- UITableView ----
 static void (*o_tv_selectRow)(id, SEL, NSIndexPath *, BOOL, UITableViewScrollPosition);
 static void sio_tv_selectRow(id self, SEL _cmd, NSIndexPath *ip, BOOL anim, UITableViewScrollPosition pos) {
+    SIO_HIT(SIO_HIT_LIST_TV);
     SIO_REQUIRE_ORIG(o_tv_selectRow);
     if (!SIO_listOK()) { o_tv_selectRow(self, _cmd, ip, anim, pos); return; }
     SIO_listWrap(^{ o_tv_selectRow(self, _cmd, ip, anim, pos); });
 }
 static void (*o_tv_deselectRow)(id, SEL, NSIndexPath *, BOOL);
 static void sio_tv_deselectRow(id self, SEL _cmd, NSIndexPath *ip, BOOL anim) {
+    SIO_HIT(SIO_HIT_LIST_TV);
     SIO_REQUIRE_ORIG(o_tv_deselectRow);
     if (!SIO_listOK()) { o_tv_deselectRow(self, _cmd, ip, anim); return; }
     SIO_listWrap(^{ o_tv_deselectRow(self, _cmd, ip, anim); });
 }
 static void (*o_tv_scrollToRow)(id, SEL, NSIndexPath *, UITableViewScrollPosition, BOOL);
 static void sio_tv_scrollToRow(id self, SEL _cmd, NSIndexPath *ip, UITableViewScrollPosition pos, BOOL anim) {
+    SIO_HIT(SIO_HIT_LIST_TV);
     SIO_REQUIRE_ORIG(o_tv_scrollToRow);
     if (!SIO_listOK()) { o_tv_scrollToRow(self, _cmd, ip, pos, anim); return; }
     SIO_listWrap(^{ o_tv_scrollToRow(self, _cmd, ip, pos, anim); });
 }
 static void (*o_tv_scrollNearest)(id, SEL, UITableViewScrollPosition, BOOL);
 static void sio_tv_scrollNearest(id self, SEL _cmd, UITableViewScrollPosition pos, BOOL anim) {
+    SIO_HIT(SIO_HIT_LIST_TV);
     SIO_REQUIRE_ORIG(o_tv_scrollNearest);
     if (!SIO_listOK()) { o_tv_scrollNearest(self, _cmd, pos, anim); return; }
     SIO_listWrap(^{ o_tv_scrollNearest(self, _cmd, pos, anim); });
 }
 static void (*o_tv_reloadData)(id, SEL);
 static void sio_tv_reloadData(id self, SEL _cmd) {
+    SIO_HIT(SIO_HIT_LIST_TV);
     SIO_REQUIRE_ORIG(o_tv_reloadData);
     if (!SIO_listOK()) { o_tv_reloadData(self, _cmd); return; }
     SIO_listWrap(^{ o_tv_reloadData(self, _cmd); });
 }
 static void (*o_tv_reloadRows)(id, SEL, NSArray *, UITableViewRowAnimation);
 static void sio_tv_reloadRows(id self, SEL _cmd, NSArray *ips, UITableViewRowAnimation a) {
+    SIO_HIT(SIO_HIT_LIST_TV);
     SIO_REQUIRE_ORIG(o_tv_reloadRows);
     if (!SIO_listOK()) { o_tv_reloadRows(self, _cmd, ips, a); return; }
     SIO_listWrap(^{ o_tv_reloadRows(self, _cmd, ips, a); });
 }
 static void (*o_tv_reloadSections)(id, SEL, NSIndexSet *, UITableViewRowAnimation);
 static void sio_tv_reloadSections(id self, SEL _cmd, NSIndexSet *sec, UITableViewRowAnimation a) {
+    SIO_HIT(SIO_HIT_LIST_TV);
     SIO_REQUIRE_ORIG(o_tv_reloadSections);
     if (!SIO_listOK()) { o_tv_reloadSections(self, _cmd, sec, a); return; }
     SIO_listWrap(^{ o_tv_reloadSections(self, _cmd, sec, a); });
 }
 static void (*o_tv_insertRows)(id, SEL, NSArray *, UITableViewRowAnimation);
 static void sio_tv_insertRows(id self, SEL _cmd, NSArray *ips, UITableViewRowAnimation a) {
+    SIO_HIT(SIO_HIT_LIST_TV);
     SIO_REQUIRE_ORIG(o_tv_insertRows);
     if (!SIO_listOK()) { o_tv_insertRows(self, _cmd, ips, a); return; }
     SIO_listWrap(^{ o_tv_insertRows(self, _cmd, ips, a); });
 }
 static void (*o_tv_deleteRows)(id, SEL, NSArray *, UITableViewRowAnimation);
 static void sio_tv_deleteRows(id self, SEL _cmd, NSArray *ips, UITableViewRowAnimation a) {
+    SIO_HIT(SIO_HIT_LIST_TV);
     SIO_REQUIRE_ORIG(o_tv_deleteRows);
     if (!SIO_listOK()) { o_tv_deleteRows(self, _cmd, ips, a); return; }
     SIO_listWrap(^{ o_tv_deleteRows(self, _cmd, ips, a); });
 }
 static void (*o_tv_moveRow)(id, SEL, NSIndexPath *, NSIndexPath *);
 static void sio_tv_moveRow(id self, SEL _cmd, NSIndexPath *from, NSIndexPath *to) {
+    SIO_HIT(SIO_HIT_LIST_TV);
     SIO_REQUIRE_ORIG(o_tv_moveRow);
     if (!SIO_listOK()) { o_tv_moveRow(self, _cmd, from, to); return; }
     SIO_listWrap(^{ o_tv_moveRow(self, _cmd, from, to); });
 }
 static void (*o_tv_insertSections)(id, SEL, NSIndexSet *, UITableViewRowAnimation);
 static void sio_tv_insertSections(id self, SEL _cmd, NSIndexSet *sec, UITableViewRowAnimation a) {
+    SIO_HIT(SIO_HIT_LIST_TV);
     SIO_REQUIRE_ORIG(o_tv_insertSections);
     if (!SIO_listOK()) { o_tv_insertSections(self, _cmd, sec, a); return; }
     SIO_listWrap(^{ o_tv_insertSections(self, _cmd, sec, a); });
 }
 static void (*o_tv_deleteSections)(id, SEL, NSIndexSet *, UITableViewRowAnimation);
 static void sio_tv_deleteSections(id self, SEL _cmd, NSIndexSet *sec, UITableViewRowAnimation a) {
+    SIO_HIT(SIO_HIT_LIST_TV);
     SIO_REQUIRE_ORIG(o_tv_deleteSections);
     if (!SIO_listOK()) { o_tv_deleteSections(self, _cmd, sec, a); return; }
     SIO_listWrap(^{ o_tv_deleteSections(self, _cmd, sec, a); });
 }
 static void (*o_tv_moveSection)(id, SEL, NSUInteger, NSUInteger);
 static void sio_tv_moveSection(id self, SEL _cmd, NSUInteger from, NSUInteger to) {
+    SIO_HIT(SIO_HIT_LIST_TV);
     SIO_REQUIRE_ORIG(o_tv_moveSection);
     if (!SIO_listOK()) { o_tv_moveSection(self, _cmd, from, to); return; }
     SIO_listWrap(^{ o_tv_moveSection(self, _cmd, from, to); });
 }
 static void (*o_tv_setEditing)(id, SEL, BOOL, BOOL);
 static void sio_tv_setEditing(id self, SEL _cmd, BOOL editing, BOOL anim) {
+    SIO_HIT(SIO_HIT_LIST_TV);
     SIO_REQUIRE_ORIG(o_tv_setEditing);
     if (!SIO_listOK()) { o_tv_setEditing(self, _cmd, editing, anim); return; }
     SIO_listWrap(^{ o_tv_setEditing(self, _cmd, editing, anim); });
 }
 static void (*o_tv_batchUpdates)(id, SEL, void (^)(void), void (^)(BOOL));
 static void sio_tv_batchUpdates(id self, SEL _cmd, void (^updates)(void), void (^comp)(BOOL)) {
+    SIO_HIT(SIO_HIT_LIST_TV);
     SIO_REQUIRE_ORIG(o_tv_batchUpdates);
     if (!SIO_listOK()) { o_tv_batchUpdates(self, _cmd, updates, comp); return; }
     SIO_listWrap(^{ o_tv_batchUpdates(self, _cmd, updates, comp); });
@@ -1440,54 +1703,63 @@ static void sio_tv_batchUpdates(id self, SEL _cmd, void (^updates)(void), void (
 // ---- UICollectionView ----
 static void (*o_cv_reloadData)(id, SEL);
 static void sio_cv_reloadData(id self, SEL _cmd) {
+    SIO_HIT(SIO_HIT_LIST_CV);
     SIO_REQUIRE_ORIG(o_cv_reloadData);
     if (!SIO_listOK()) { o_cv_reloadData(self, _cmd); return; }
     SIO_listWrap(^{ o_cv_reloadData(self, _cmd); });
 }
 static void (*o_cv_reloadItems)(id, SEL, NSArray *);
 static void sio_cv_reloadItems(id self, SEL _cmd, NSArray *ips) {
+    SIO_HIT(SIO_HIT_LIST_CV);
     SIO_REQUIRE_ORIG(o_cv_reloadItems);
     if (!SIO_listOK()) { o_cv_reloadItems(self, _cmd, ips); return; }
     SIO_listWrap(^{ o_cv_reloadItems(self, _cmd, ips); });
 }
 static void (*o_cv_reloadSections)(id, SEL, NSArray *);
 static void sio_cv_reloadSections(id self, SEL _cmd, NSArray *secs) {
+    SIO_HIT(SIO_HIT_LIST_CV);
     SIO_REQUIRE_ORIG(o_cv_reloadSections);
     if (!SIO_listOK()) { o_cv_reloadSections(self, _cmd, secs); return; }
     SIO_listWrap(^{ o_cv_reloadSections(self, _cmd, secs); });
 }
 static void (*o_cv_insertItems)(id, SEL, NSArray *);
 static void sio_cv_insertItems(id self, SEL _cmd, NSArray *ips) {
+    SIO_HIT(SIO_HIT_LIST_CV);
     SIO_REQUIRE_ORIG(o_cv_insertItems);
     if (!SIO_listOK()) { o_cv_insertItems(self, _cmd, ips); return; }
     SIO_listWrap(^{ o_cv_insertItems(self, _cmd, ips); });
 }
 static void (*o_cv_deleteItems)(id, SEL, NSArray *);
 static void sio_cv_deleteItems(id self, SEL _cmd, NSArray *ips) {
+    SIO_HIT(SIO_HIT_LIST_CV);
     SIO_REQUIRE_ORIG(o_cv_deleteItems);
     if (!SIO_listOK()) { o_cv_deleteItems(self, _cmd, ips); return; }
     SIO_listWrap(^{ o_cv_deleteItems(self, _cmd, ips); });
 }
 static void (*o_cv_moveItem)(id, SEL, NSIndexPath *, NSIndexPath *);
 static void sio_cv_moveItem(id self, SEL _cmd, NSIndexPath *from, NSIndexPath *to) {
+    SIO_HIT(SIO_HIT_LIST_CV);
     SIO_REQUIRE_ORIG(o_cv_moveItem);
     if (!SIO_listOK()) { o_cv_moveItem(self, _cmd, from, to); return; }
     SIO_listWrap(^{ o_cv_moveItem(self, _cmd, from, to); });
 }
 static void (*o_cv_scrollToItem)(id, SEL, NSIndexPath *, UICollectionViewScrollPosition, BOOL);
 static void sio_cv_scrollToItem(id self, SEL _cmd, NSIndexPath *ip, UICollectionViewScrollPosition pos, BOOL anim) {
+    SIO_HIT(SIO_HIT_LIST_CV);
     SIO_REQUIRE_ORIG(o_cv_scrollToItem);
     if (!SIO_listOK()) { o_cv_scrollToItem(self, _cmd, ip, pos, anim); return; }
     SIO_listWrap(^{ o_cv_scrollToItem(self, _cmd, ip, pos, anim); });
 }
 static void (*o_cv_selectItem)(id, SEL, NSIndexPath *, BOOL, UICollectionViewScrollPosition);
 static void sio_cv_selectItem(id self, SEL _cmd, NSIndexPath *ip, BOOL anim, UICollectionViewScrollPosition pos) {
+    SIO_HIT(SIO_HIT_LIST_CV);
     SIO_REQUIRE_ORIG(o_cv_selectItem);
     if (!SIO_listOK()) { o_cv_selectItem(self, _cmd, ip, anim, pos); return; }
     SIO_listWrap(^{ o_cv_selectItem(self, _cmd, ip, anim, pos); });
 }
 static void (*o_cv_deselectItem)(id, SEL, NSIndexPath *, BOOL);
 static void sio_cv_deselectItem(id self, SEL _cmd, NSIndexPath *ip, BOOL anim) {
+    SIO_HIT(SIO_HIT_LIST_CV);
     SIO_REQUIRE_ORIG(o_cv_deselectItem);
     if (!SIO_listOK()) { o_cv_deselectItem(self, _cmd, ip, anim); return; }
     SIO_listWrap(^{ o_cv_deselectItem(self, _cmd, ip, anim); });
@@ -1498,9 +1770,19 @@ static void sio_cv_deselectItem(id self, SEL _cmd, NSIndexPath *ip, BOOL anim) {
 // UIActivityIndicatorView: defer startAnimating by HUDDelay. If stopAnimating
 // arrives within that window (the vast majority of short requests), the spinner
 // is cancelled before it ever appears - kills the "flash of loader" entirely.
+//
+// v2.1.12（审查 N-5）：**慢放模式下 HUDDelay 刻意不放大**，这是有意决策，不是 bug。
+//   同为「延迟」，块动画的 delay 在慢放时按 gSlowFactor 放大（见 SIO_targetDelay），
+//   HUD 延迟不走任何缩放，固定用 gHUDDelay。理由：HUD 延迟的目的是「抑制转圈闪现」，
+//   这个目的在慢放模式下依然成立；若跟着放大，加载圈会迟迟不出现，用户会以为卡死
+//   —— 那正好是这个功能要消除的观感。
+//   反面意见（慢放是为了看清每个动画细节，转圈显隐也是动画的一部分）也成立，
+//   但权衡后选了前者。⚠ 请勿把这处当成 bug「修」掉；要改请连同这条注释一起改，
+//   因为它正是 P0-1 那类回归（新开关没考虑慢放语义）留下来的教训。
 static const void *kSIOAIDelayMark = &kSIOAIDelayMark;
 
 static void sio_AIstartAnim(id self, SEL _cmd) {
+    SIO_HIT(SIO_HIT_HUD_AI);
     SIO_REQUIRE_ORIG(o_AIstartAnim);
     if (SIO_blocked() || !gHUDFast || gSelfHudProtected) { o_AIstartAnim(self, _cmd); return; }
     // v2.1.10 微优化：原来每次 startAnimating 都新建一个 @YES（NSNumber 分配）。
@@ -1547,6 +1829,12 @@ static Class sio_WKClass(void) {
 static const void *kSIOWKHidePending = &kSIOWKHidePending;
 
 static void sio_WKdeferHide(id wv, int attempt) {
+    // v2.1.12（审查 N-3）：入口去重。原来 App 在 pending 期间再次 setHidden:YES
+    // （仍在 loading 且 progress > 0.1）时，会无条件再开一条延迟链 ——
+    // 连续 N 次调用产生 N 条并行链，最终 o_WKsetHidden(YES) 被调 N 次。
+    // setHidden: 本身幂等，危害仅限冗余，但快速切换隐藏状态的 App 上会累积无谓的
+    // dispatch_after。这里让后续调用直接复用已在跑的那条链。
+    if (attempt == 0 && objc_getAssociatedObject(wv, kSIOWKHidePending)) return;
     objc_setAssociatedObject(wv, kSIOWKHidePending,
                              (__bridge id)kCFBooleanTrue, OBJC_ASSOCIATION_ASSIGN);
     __weak id wself = wv;
@@ -1568,6 +1856,7 @@ static void sio_WKdeferHide(id wv, int attempt) {
 }
 
 static void sio_WKsetHidden(id self, SEL _cmd, BOOL hidden) {
+    SIO_HIT(SIO_HIT_WK);
     SIO_REQUIRE_ORIG(o_WKsetHidden);
     Class wkc = sio_WKClass();
     if (!wkc || ![self isKindOfClass:wkc]) { o_WKsetHidden(self, _cmd, hidden); return; }
@@ -1595,6 +1884,7 @@ static void sio_WKsetHidden(id self, SEL _cmd, BOOL hidden) {
 
 // SVProgressHUD class method +dismissWithDelay:completion: force near-zero delay.
 static void sio_SVHUDDelay(id self, SEL _cmd, NSTimeInterval delay, void (^completion)(void)) {
+    SIO_HIT(SIO_HIT_HUD_SV);
     SIO_REQUIRE_ORIG(o_SVHUDDelay);
     if (SIO_blocked() || !gHUDFast || gSelfHudProtected) {
         o_SVHUDDelay(self, _cmd, delay, completion); return;
@@ -1604,6 +1894,7 @@ static void sio_SVHUDDelay(id self, SEL _cmd, NSTimeInterval delay, void (^compl
 
 // MBProgressHUD instance method -hideAnimated: drop the hide animation.
 static void sio_MBHUDHide(id self, SEL _cmd, BOOL animated) {
+    SIO_HIT(SIO_HIT_HUD_MB);
     SIO_REQUIRE_ORIG(o_MBHUDHide);
     if (SIO_blocked() || !gHUDFast || gSelfHudProtected) { o_MBHUDHide(self, _cmd, animated); return; }
     o_MBHUDHide(self, _cmd, NO);
@@ -1628,6 +1919,11 @@ static void SIOriginalInit(void) {
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                     SIO_settingsChanged,
                                     (__bridge CFStringRef)kNotifyName, NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);
+    // v2.1.12（F-A）：请求命中统计浮层
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                    SIO_onStatsRequest,
+                                    (__bridge CFStringRef)kNotifyStats, NULL,
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
 
     Class caAnim = objc_getClass("CAAnimation");
@@ -1814,7 +2110,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.1.11 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
+    NSLog(@"[SIOriginal] v2.1.12 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -1841,6 +2137,7 @@ static void SIOriginalInit(void) {
 
 // duration setter — 拦截已创建 animator 的时长修改
 static void sio_PA_setDuration(id self, SEL _cmd, double d) {
+    SIO_HIT(SIO_HIT_PA);
     SIO_REQUIRE_ORIG(o_pa_setDuration);
     if (SIO_blocked()) { o_pa_setDuration(self, _cmd, d); return; }
     o_pa_setDuration(self, _cmd, SIO_targetDuration(d));
@@ -1848,6 +2145,7 @@ static void sio_PA_setDuration(id self, SEL _cmd, double d) {
 
 // v1.8.12：2 参指定初始化器（唯一在 App 代码里直接可见的 duration 入口）
 static id sio_PA_initWithDurTP2(id self, SEL _cmd, double d, id tp) {
+    SIO_HIT(SIO_HIT_PA);
     SIO_REQUIRE_ORIG_NIL(o_pa_initWithDurTP2);
     if (!SIO_blocked() && !SIO_inPAInit()) d = SIO_targetDuration(d);
     return o_pa_initWithDurTP2(self, _cmd, d, tp);
@@ -1855,6 +2153,7 @@ static id sio_PA_initWithDurTP2(id self, SEL _cmd, double d, id tp) {
 
 // initWithDuration:timingParameters:animations: — CA/CubicTimingParameters init
 static id sio_PA_initWithDurTP(id self, SEL _cmd, double d, id tp, void (^a)(void)) {
+    SIO_HIT(SIO_HIT_PA);
     SIO_REQUIRE_ORIG_NIL(o_pa_initWithDurTP);
     if (SIO_blocked() || SIO_inPAInit()) return o_pa_initWithDurTP(self, _cmd, d, tp, a);
     SIO_setPAInit(YES);
@@ -1865,6 +2164,7 @@ static id sio_PA_initWithDurTP(id self, SEL _cmd, double d, id tp, void (^a)(voi
 
 // initWithDuration:controlPoint1:controlPoint2:animations: — Bezier init
 static id sio_PA_initWithDurCP(id self, SEL _cmd, double d, CGPoint p1, CGPoint p2, void (^a)(void)) {
+    SIO_HIT(SIO_HIT_PA);
     SIO_REQUIRE_ORIG_NIL(o_pa_initWithDurCP);
     if (SIO_blocked() || SIO_inPAInit()) return o_pa_initWithDurCP(self, _cmd, d, p1, p2, a);
     SIO_setPAInit(YES);
@@ -1875,6 +2175,7 @@ static id sio_PA_initWithDurCP(id self, SEL _cmd, double d, CGPoint p1, CGPoint 
 
 // initWithDuration:springDampingRatio:animations: — Spring init
 static id sio_PA_initWithDurSpring(id self, SEL _cmd, double d, double dr, void (^a)(void)) {
+    SIO_HIT(SIO_HIT_PA);
     SIO_REQUIRE_ORIG_NIL(o_pa_initWithDurSpring);
     if (SIO_blocked() || SIO_inPAInit()) return o_pa_initWithDurSpring(self, _cmd, d, dr, a);
     SIO_setPAInit(YES);
@@ -1889,6 +2190,7 @@ static id sio_PA_initWithDurSpring(id self, SEL _cmd, double d, double dr, void 
 // 必然返回 NULL —— 该 hook 从未生效。安装处现已改为 SIO_swizzleClass(pa, …)。
 // 同时补上 delay 的同比缩放（原来 delay 完全没动，与块动画行为不一致）。
 static id sio_PA_runningPA(id self, SEL _cmd, double d, double delay, UIViewAnimationOptions opt, void (^a)(void), void (^c)(BOOL)) {
+    SIO_HIT(SIO_HIT_PA);
     SIO_REQUIRE_ORIG_NIL(o_pa_runningPA);
     // 该便捷构造器内部同样会走 initWithDuration:timingParameters:，
     // 必须加同一把重入锁，否则时长被缩放两次。
@@ -1897,6 +2199,22 @@ static id sio_PA_runningPA(id self, SEL _cmd, double d, double delay, UIViewAnim
     id r = o_pa_runningPA(self, _cmd, SIO_targetDuration(d), SIO_targetDelay(delay), opt, a, c);
     SIO_setPAInit(NO);
     return r;
+}
+
+// v2.1.12（F-D）：- [UIViewPropertyAnimator startAnimationAfterDelay:]
+// 「延迟多久才开始动画」的入口，与其他 delay 一样走 SIO_targetDelay 同比缩放
+// （加速缩短 / 慢放放大），与 runningPropertyAnimator… 里的 delay 处理保持一致。
+//
+// 关于 gInPAInit 这把锁：审查建议「必须与 initWithDuration: 共用同一把锁，否则双重缩放」。
+// 复核后认为不成立 —— 那把锁防的是**同一个 duration** 被 init 链缩放两次，
+// 而这里改的是 **delay**，与 duration 是两个不同的量，不存在双重缩放。
+// 但仍然保留 SIO_inPAInit() 检查，理由是防御性的：若 App 在 init 未返回时就调它，
+// 说明当前已处在一条缩放链内部，此时放行（走原生值）是最安全的 fail-safe。
+static void sio_PA_startAfterDelay(id self, SEL _cmd, NSTimeInterval delay) {
+    SIO_HIT(SIO_HIT_PA);
+    SIO_REQUIRE_ORIG(o_pa_startAfterDelay);
+    if (SIO_blocked() || SIO_inPAInit()) { o_pa_startAfterDelay(self, _cmd, delay); return; }
+    o_pa_startAfterDelay(self, _cmd, (NSTimeInterval)SIO_targetDelay(delay));
 }
 
 #pragma mark - UIScrollView 滚动动画
@@ -1926,6 +2244,7 @@ static BOOL SIO_svZoomEngaged(UIScrollView *sv) {
 }
 
 static void sio_SV_setContentOffset(id self, SEL _cmd, CGPoint p, BOOL animated) {
+    SIO_HIT(SIO_HIT_SV_SCROLL);
     SIO_REQUIRE_ORIG(o_sv_setContentOffset);
     if (SIO_blocked() || !animated || SIO_svZoomEngaged((UIScrollView *)self)) {
         o_sv_setContentOffset(self, _cmd, p, animated); return;
@@ -1946,6 +2265,7 @@ static void sio_SV_setContentOffset(id self, SEL _cmd, CGPoint p, BOOL animated)
 }
 
 static void sio_SV_scrollRect(id self, SEL _cmd, CGRect r, BOOL animated) {
+    SIO_HIT(SIO_HIT_SV_SCROLL);
     SIO_REQUIRE_ORIG(o_sv_scrollRect);
     if (SIO_blocked() || !animated || SIO_svZoomEngaged((UIScrollView *)self)) {
         o_sv_scrollRect(self, _cmd, r, animated); return;
@@ -1977,6 +2297,7 @@ static void sio_SV_scrollRect(id self, SEL _cmd, CGRect r, BOOL animated) {
 //   · 复用 SIO_svZoomEngaged：正在缩放 / 回弹中 / 当前已放大 → 一律原样透传。
 //   · 由 ZoomAccel 开关控制，默认关；可在 App 专属覆盖里为单个 App 打开。
 static void sio_SV_setZoomScale(id self, SEL _cmd, CGFloat s, BOOL animated) {
+    SIO_HIT(SIO_HIT_SV_ZOOM);
     SIO_REQUIRE_ORIG(o_sv_setZoomScale);
     if (SIO_blocked() || !gZoomAccel || !animated || SIO_svZoomEngaged((UIScrollView *)self)) {
         o_sv_setZoomScale(self, _cmd, s, animated); return;
@@ -1989,6 +2310,7 @@ static void sio_SV_setZoomScale(id self, SEL _cmd, CGFloat s, BOOL animated) {
 }
 
 static void sio_SV_zoomToRect(id self, SEL _cmd, CGRect r, BOOL animated) {
+    SIO_HIT(SIO_HIT_SV_ZOOM);
     SIO_REQUIRE_ORIG(o_sv_zoomToRect);
     if (SIO_blocked() || !gZoomAccel || !animated || SIO_svZoomEngaged((UIScrollView *)self)) {
         o_sv_zoomToRect(self, _cmd, r, animated); return;
@@ -2014,6 +2336,7 @@ static void sio_SV_zoomToRect(id self, SEL _cmd, CGRect r, BOOL animated) {
 // 滚动视图都会经过这里，一次覆盖全部来源；且此时视图已完成基本配置，
 // 不会被初始化流程覆盖掉。
 static void sio_SV_didMoveToWindow(id self, SEL _cmd) {
+    SIO_HIT(SIO_HIT_FEEL);
     SIO_REQUIRE_ORIG(o_sv_didMoveToWindow);
     o_sv_didMoveToWindow(self, _cmd);
     if (!gFastScroll && !gFastTap) return;
@@ -2035,18 +2358,21 @@ static void sio_SV_didMoveToWindow(id self, SEL _cmd) {
 // （例如某个列表页 viewDidAppear）再把 decelerationRate / delaysContentTouches
 // 改回去，旧版就"时灵时不灵"。setter 层钳回，开关真正全程生效。
 static void sio_SV_setDecelRate(id self, SEL _cmd, CGFloat rate) {
+    SIO_HIT(SIO_HIT_FEEL);
     SIO_REQUIRE_ORIG(o_sv_setDecelRate);
     if (!SIO_blocked() && gFastScroll && !gSelfFeelProtected) rate = UIScrollViewDecelerationRateFast;
     o_sv_setDecelRate(self, _cmd, rate);
 }
 
 static void sio_SV_setDelaysTouches(id self, SEL _cmd, BOOL b) {
+    SIO_HIT(SIO_HIT_FEEL);
     SIO_REQUIRE_ORIG(o_sv_setDelaysTouches);
     if (!SIO_blocked() && gFastTap && !gSelfFeelProtected) b = NO;
     o_sv_setDelaysTouches(self, _cmd, b);
 }
 
 static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
+    SIO_HIT(SIO_HIT_LAYER_ADD);
     SIO_REQUIRE_ORIG(o_layer_addAnim);
     // CAAnimation setDuration 基类 hook 已覆盖绝大多数情况，这里只兜底
     // 「App 从未调用 setDuration:、动画保持类默认时长」的动画（如 0.25s 默认值）。
@@ -2106,6 +2432,9 @@ static void SIO_installiOS16Extras(void) {
         // 传元类等于去根元类查找，必然 NULL —— 原来这一行是静默失效的死代码。
         SIO_swizzleClass(pa, @selector(runningPropertyAnimatorWithDuration:delay:options:animations:completion:),
                          (IMP)sio_PA_runningPA, (IMP *)&o_pa_runningPA);
+        // v2.1.12（F-D）：startAnimationAfterDelay: 覆盖面兜底
+        SIO_swizzleInstance(pa, @selector(startAnimationAfterDelay:),
+                            (IMP)sio_PA_startAfterDelay, (IMP *)&o_pa_startAfterDelay);
     }
 
     if (sv) {
@@ -2163,6 +2492,19 @@ static BOOL    gActive    = NO;   // 本 App 最终是否参与保活（总开�
 static BOOL    gUseScene  = NO;   // 本 App 是否启用场景伪装
 static BOOL    gUseAudio  = NO;   // 本 App 是否启用音频断言
 // gPhysBg 的定义已前移到文件前段（热重载日志要打印它）；注释见那里。
+
+// v2.1.12（审查 N-1）：保活侧出厂复位。
+// 动画侧 v2.1.11 已加 SIO_resetDefaults()，但保活侧这四个量不在它的覆盖范围里
+// （它们声明在本段，SIO_resetDefaults 定义在动画段，引用不到）。
+// 后果是「删掉 plist 恢复出厂默认」这条排障契约只在动画侧成立：动画参数回到默认，
+// 保活却沿用上一次的值（例如之前关掉的 FUBGAudioKeep 依然是关的），两侧不一致，
+// 反而更难判断。这里补上对称的复位，四个值必须与上面的静态初始化值一致。
+static void _fbg_resetDefaults(void) {
+    gFUBGEnabled = YES;
+    gSceneFake   = YES;
+    gAudioKeep   = YES;
+    gExclude     = @[];
+}
 static BOOL    gHasAudioMode = NO;
 
 static AVAudioPlayer *gPlayer = nil;
@@ -2194,7 +2536,12 @@ static void _fbg_recalc(void) {
 static void _fbg_loadPref(void) {
     @try {
         NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
-        if (d) {
+        if (!d) {
+            // v2.1.12（N-1）：与动画侧 SIO_resetDefaults() 对称。
+            // 原来这里只有 if (d)，缺文件时四个量沿用旧值且无日志。
+            _fbg_resetDefaults();
+            NSLog(@"[FUBG] prefs file missing/unreadable — reset to factory defaults");
+        } else {
             if (d[@"FUBGEnabled"])      gFUBGEnabled   = [d[@"FUBGEnabled"] boolValue];
             if (d[@"FUBGSceneFake"])    gSceneFake = [d[@"FUBGSceneFake"] boolValue];
             if (d[@"FUBGAudioKeep"])    gAudioKeep = [d[@"FUBGAudioKeep"] boolValue];
@@ -2328,6 +2675,7 @@ static SIO_WillPresentIMP SIO_origWillPresentFor(Class c) {
 static void _fbg_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center,
                              UNNotification *note,
                              void (^handler)(UNNotificationPresentationOptions)) {
+    SIO_HIT(SIO_HIT_NOTIFY);
     if (gUseScene && gPhysBg) {
         handler(UNNotificationPresentationOptionBanner |
                 UNNotificationPresentationOptionSound |
@@ -2335,7 +2683,18 @@ static void _fbg_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center
         return;
     }
     SIO_WillPresentIMP orig = SIO_origWillPresentFor([self class]);
-    if (orig) orig(self, _cmd, center, note, handler);
+    if (orig) {
+        orig(self, _cmd, center, note, handler);
+    } else {
+        // v2.1.12（审查 N-4）：UNUserNotificationCenterDelegate 的契约要求
+        // completionHandler 必须**恰好调用一次**；不调用会让该条通知的呈现被挂起。
+        // 取不到 orig 在实践中很难触发（hook 时 dc 与回调时 [self class] 通常是同一个类，
+        // 继承场景由 SIO_origWillPresentFor 沿 superclass 链兜底），但契约上这是缺口，
+        // 而补 else 是零成本的。按项目 fail-safe 哲学：绝不吞掉 handler。
+        handler(UNNotificationPresentationOptionBanner |
+                UNNotificationPresentationOptionSound |
+                UNNotificationPresentationOptionBadge);
+    }
 }
 
 static void (*gOrigUNSetDelegate)(id, SEL, id);
@@ -2592,6 +2951,9 @@ static void FUBGEntry(void) {
         CFNotificationCenterAddObserver(dc, NULL, _fbg_onPrefReload,
             (__bridge CFStringRef)kNotifyName, NULL,
             CFNotificationSuspensionBehaviorDeliverImmediately);
+        // 注：kNotifyStats（命中统计浮层请求）只在 SIOriginalInit 里注册一次。
+        // 本文件有两个 constructor（SIOriginalInit / FUBGEntry），两处都注册的话
+        // 回调会触发两次、浮层重复创建。
 
         // v2.1.10：AVAudioSession 两个观察者的 token 原来被丢弃，回调永远等不到。
         id obInt = [[NSNotificationCenter defaultCenter]
@@ -2614,7 +2976,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.1.11 (SIOriginal v2.1.11) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.1.12 (SIOriginal v2.1.12) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
