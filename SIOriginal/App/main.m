@@ -20,9 +20,13 @@ extern int posix_spawnattr_set_persona_np(const posix_spawnattr_t * __restrict, 
 extern int posix_spawnattr_set_persona_uid_np(const posix_spawnattr_t * __restrict, uid_t);
 extern int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t * __restrict, uid_t);
 
-// unistd.h 已声明 reboot()，补 RB_AUTOBOOT
+// v2.1.18 真 bug 修复：原来 `#define RB_AUTOBOOT 0` —— reboot(0) 必然 EINVAL，
+// root 助手退化到 killall -9 launchd（等效注销，并非 UI 承诺的「硬重启设备」）。
+// Darwin 真值 RB_AUTOBOOT = 0x08000004。不直接 include <sys/reboot.h>（iOS SDK 未必
+// 提供该头，硬 include 可能直接编译失败），改用 #ifndef 兜底真值；
+// 且 iOS SDK 的 unistd.h 不声明 reboot()，保留手工 extern 声明。
 #ifndef RB_AUTOBOOT
-#define RB_AUTOBOOT 0
+#define RB_AUTOBOOT 0x08000004
 #endif
 extern int reboot(int);
 
@@ -32,7 +36,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.1.16";
+static NSString * const SIO_VERSION = @"v2.1.18";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -85,8 +89,10 @@ static void SpawnRootNowait(NSString *path, NSArray *args) {
     for (NSUInteger i = 0; i < args.count; i++)
         argv[i + 1] = (char *)[args[i] UTF8String];
     argv[args.count + 1] = NULL;
-    posix_spawn(&pid, path.fileSystemRepresentation, NULL, &attr, argv, environ);
+    int rc = posix_spawn(&pid, path.fileSystemRepresentation, NULL, &attr, argv, environ);
     posix_spawnattr_destroy(&attr);
+    // v2.1.18（审查 P1-9）：原来返回值被忽略，失败即「点了没反应」。至少留痕便于排查。
+    if (rc != 0) NSLog(@"[SIO] SpawnRootNowait %@ failed: rc=%d (%s)", path, rc, strerror(rc));
 }
 
 static NSString *SIOReboot(void) {
@@ -157,8 +163,9 @@ static NSMutableDictionary *ReadConfig(void) {
     NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
     if (!d) d = [NSMutableDictionary dictionary];
     // v2.1.1：缺省值与 dylib SIO_reload 严格保持一致。
-    // 【重要】FastScroll / FastTap / FastLongPress 必须默认关 —— 仓库 v2.0.5 把它们
-    // 默认开启时曾出现「全部 APP 闪退」，v2.0.6 回退关闭后消失。v2.1.0 踩回这个坑。
+    // v2.1.18 注释订正（行为不变）：旧文「FastScroll / FastTap 必须默认关、曾致全闪退」
+    // 早已过时 —— 闪退真凶是长按 hook（init 族，v2.1.2 已整体移除），手感两项自
+    // v2.1.7 起全默认开且无闪退记录。dylib 侧同款注释 v2.1.11 已订正，这里漏改。
     if (!d[@"Enabled"])    d[@"Enabled"]    = @YES;
     if (!d[@"Mode"])       d[@"Mode"]       = @0;      // 0=加速
     if (!d[@"Speed"])      d[@"Speed"]      = @15.0;   // 极速倍率（纯时长缩放，无闪退记录）
@@ -253,14 +260,19 @@ static void SIO_MigrateV211(void) {
         if (dirty) {
             mkdir("/var/Managed Preferences", 0755);
             mkdir("/var/Managed Preferences/mobile", 0755);
+            // v2.1.18 修复：原来 writeToFile 失败也照样标记迁移完成，
+            // 幽灵键（FastLongPress/LongPressDuration）永久残留。现在只有写成功才标记；
+            // 失败下次启动重试，迁移本身幂等，无副作用。
             if ([cur writeToFile:PrefPath atomically:YES]) {
                 CFNotificationCenterPostNotification(
                     CFNotificationCenterGetDarwinNotifyCenter(),
                     (__bridge CFStringRef)NotifyKey, NULL, NULL, YES);
                 gMigratedDirty = YES;
+                [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"sio_migrated_v2_1_2"];
             }
+        } else {
+            [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"sio_migrated_v2_1_2"];
         }
-        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"sio_migrated_v2_1_2"];
     } @catch (__unused NSException *e) {}
 }
 
@@ -690,6 +702,9 @@ static UILabel *SIOSectionTitle(NSString *t) {
 @property (strong) UISegmentedControl *segDrag;
 @property (strong) UILabel *lblDrag;
 @property (strong) UISwitch *swFUBG, *swFUBGScene, *swFUBGAudio;
+// v2.1.18（审查 P1-8）：导入带回的 AppOverrides 暂存，由 save() 单次合并写盘
+//（原来导入路径自己 WriteConfig 一次、doImport 又 save() 一次 = 双写双通知、dylib 连续重载两次）。
+@property (copy) NSDictionary *importedOverrides;
 // 高级页：专属覆盖
 @property (strong) UITextField *ovBundle;
 @property (strong) UISwitch *ovOn, *ovSpring, *ovExtra, *ovList, *ovZoom;
@@ -745,7 +760,16 @@ static UILabel *SIOSectionTitle(NSString *t) {
     // v2.1.12：HUD 延迟（0.05 / 0.10 / 0.15 / 0.30 / 0.50），缺键 0.15
     self.segHUDDelay.selectedSegmentIndex =
         HUDDelayIndexFor(c[@"HUDDelay"] ? [c[@"HUDDelay"] doubleValue] : 0.15);
-    self.blacklist.text = [c[@"Blacklist"] componentsJoinedByString:@"\n"];
+    // v2.1.18 崩溃修复：原来无类型守卫 —— 旧版 plist 若把 Blacklist 存成字符串，
+    // 对 NSString 调 componentsJoinedByString: 直接 unrecognized selector、App 启动即崩。
+    // dylib 侧 SIO_reload 在 v1.8.12 修过同款 bug（见其注释），这里补上同一道防线。
+    id blv = c[@"Blacklist"];
+    if ([blv isKindOfClass:[NSArray class]]) {
+        self.blacklist.text = [blv componentsJoinedByString:@"\n"];
+    } else if ([blv isKindOfClass:[NSString class]]) {
+        self.blacklist.text = [[(NSString *)blv componentsSeparatedByString:@","]
+                               componentsJoinedByString:@"\n"];
+    }
 
     self.swRM.on = ReadAx(@"ReduceMotionEnabled");
     self.swCF.on = ReadAx(@"PreferCrossFadeTransitions");
@@ -910,6 +934,11 @@ static UILabel *SIOSectionTitle(NSString *t) {
     id ovAllRaw = [NSDictionary dictionaryWithContentsOfFile:PrefPath][@"AppOverrides"];
     NSMutableDictionary *ovOut = [ovAllRaw isKindOfClass:[NSDictionary class]]
                                  ? [ovAllRaw mutableCopy] : [NSMutableDictionary dictionary];
+    // v2.1.18（审查 P1-8）：先并入导入带回的覆盖项，再让 UI 当前编辑（下方循环）覆盖同名 bid
+    if (self.importedOverrides.count) {
+        [ovOut addEntriesFromDictionary:self.importedOverrides];
+        self.importedOverrides = nil;
+    }
     for (NSString *ovBid in ovIDs) {
         if (self.ovOn.on) {
             BOOL guarded = [HardGuardBundles() containsObject:ovBid];
@@ -974,8 +1003,8 @@ static UILabel *SIOSectionTitle(NSString *t) {
 }
 
 // 一键预设：改控件 → 发通知让页面刷新 → 由调用方负责 save
-// v2.1.1：基准值 = 「标准档」，且手感三项一律默认关（曾致全部 APP 闪退）。
-// 预设不再替用户打开它们 —— 想开自己在「手感」页手动开。
+// v2.1.18 注释订正：旧文「手感三项一律默认关」已过时 —— 闪退真凶（长按 init hook）
+// v2.1.2 已整体移除，预设自 v2.1.2 起把加速项全部默认打开（见下方代码）。
 - (void)applyPreset:(NSInteger)i {
     self.swEnabled.on = YES;
     self.segMode.selectedSegmentIndex = 0;
@@ -1110,26 +1139,23 @@ static UILabel *SIOSectionTitle(NSString *t) {
         self.segDrag.selectedSegmentIndex = DragIndexForCoeff([d[@"UIAnimationDragCoefficient"] doubleValue]);
 
     // v2.1.10：导出配置里含 AppOverrides，导入却整块丢弃 —— 导出/导入不对称。
-    // 覆盖项在 UI 上没有一一对应的控件可逐个回显，所以直接合并写回 plist，
-    // 再把第一个 bundle 填进输入框让 refreshOverrides 回显出来。
+    // v2.1.18（P1-8）：改为暂存 importedOverrides、由紧随的 save() 单次写盘，
+    // 再把第一个 bundle 填进输入框，save 后 refreshOverrides 回显。
     if ([d[@"AppOverrides"] isKindOfClass:[NSDictionary class]]) {
-        NSMutableDictionary *cfg = ReadConfig();
-        NSMutableDictionary *ov = [cfg[@"AppOverrides"] isKindOfClass:[NSDictionary class]]
-                                ? [cfg[@"AppOverrides"] mutableCopy] : [NSMutableDictionary dictionary];
+        // v2.1.18（审查 P1-8）：不再在这里 WriteConfig —— 暂存后由 doImport 紧随的
+        // save() 统一合并、单次写盘单次通知（dylib 只重载一次）。
+        NSMutableDictionary *pend = [NSMutableDictionary dictionary];
         NSDictionary *inc = d[@"AppOverrides"];
-        NSUInteger n = 0;
         for (id bid in inc) {
             if (![bid isKindOfClass:[NSString class]]) continue;
             id v = inc[bid];
             if (![v isKindOfClass:[NSDictionary class]]) continue;
-            ov[(NSString *)bid] = v; n++;
+            pend[(NSString *)bid] = v;
         }
-        if (n) {
-            cfg[@"AppOverrides"] = ov;
-            WriteConfig(cfg);
-            NSString *first = [ov.allKeys sortedArrayUsingSelector:@selector(compare:)].firstObject;
+        if (pend.count) {
+            self.importedOverrides = pend;
+            NSString *first = [pend.allKeys sortedArrayUsingSelector:@selector(compare:)].firstObject;
             if (first) self.ovBundle.text = first;
-            [self refreshOverrides];
         }
     }
 
@@ -1186,7 +1212,9 @@ static UILabel *SIOSectionTitle(NSString *t) {
     [r appendString:@"本 App 只负责写配置并发 Darwin 热重载通知；动画引擎 SIOriginal.dylib 需用 TrollFools 注入目标 App。保存配置后，前台目标 App 顶部会出现 1.5 秒生效提示（可在「手感」页关闭）。\n\n"];
 
     [r appendString:@"【硬保护】\n"];
-    [r appendFormat:@"列表 hook 恒关名单：%@、com.apple.springboard（防止黑屏/白苹果）。\n",
+    // v2.1.18 修复：原来格式串里硬编码「、com.apple.springboard」，而
+    // HardGuardBundles() 本身已含该项（v2.1.12 补入），自检输出会重复打印两遍。
+    [r appendFormat:@"列表 hook 恒关名单：%@（防止黑屏/白苹果）。\n",
         [HardGuardBundles() componentsJoinedByString:@"、"]];
 
     [r appendString:@"\n【v2.1.2 闪退修复（真凶已定位）】\n"];
@@ -1386,7 +1414,8 @@ static UILabel *SIOSectionTitle(NSString *t) {
 
     UILabel *hint = SIOLabel(
         @"出厂默认：加速 ×15 + 显式 ×3 + 转场 ×2 + 下限 0.01s。倍率是纯时长缩放，安全。"
-        @"「手感」页三项已改为默认关 —— 它们曾在 v2.0.5 导致全部 App 闪退，想用请逐个开并实测。"
+        @"「手感」页三项自 v2.1.2 起默认开（v2.0.5 全量闪退的真凶是长按 hook，已整体移除）；"
+        "若某 App 出现异常，到「手感」页逐项关闭实测。"
         @"若动画完成回调异常（转圈闪没、工具栏不回位），把时长下限调回 0.01s 或更高。",
         12, [UIColor secondaryLabelColor]);
     [self.stack addArrangedSubview:hint];
@@ -1468,7 +1497,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     [self.stack addArrangedSubview:SIOSectionTitle(@"瞬时打开 · 默认全开")];
     [self.stack addArrangedSubview:SIOCard(@[
         SIORowSub(@"瞬时打开页面", @"把导航/模态转场直接压到 1ms，点链接秒开新页（绕过转场倍率与时长下限）", m.swInstant),
-        SIORowSub(@"加载圈 / HUD 加速", @"转圈延后 0.15s 才显形，SVProgressHUD/MBProgressHUD 立即消失", m.swHUDFast),
+        SIORowSub(@"加载圈 / HUD 加速", @"转圈延后才显形（时长见下方「转圈延迟」，默认 0.15s），SVProgressHUD/MBProgressHUD 立即消失", m.swHUDFast),
         SIORowSub(@"网页提前显形", @"WKWebView 加载进度过 10% 后拒绝再被隐藏，网页更早露出来", m.swWKFast),
     ], 14)];
     // v2.1.12：HUD 延迟 —— dylib 支持调但配置端一直锁死在 0.15s，现在开放
@@ -1503,11 +1532,11 @@ static UILabel *SIOSectionTitle(NSString *t) {
     [self.stack addArrangedSubview:feelNote];
 
     UILabel *warn = SIOLabel(
-        @"⚠️ 硬保护名单：顺丰同城骑士 com.sfic.knight、桌面进程 com.apple.springboard —— 列表加速恒为关闭，任何配置都打不开（SpringBoard 打开会黑屏/白苹果）。淘宝/京东等重列表 App 也建议保持关闭。",
+        @"⚠️ 硬保护名单：桌面进程 com.apple.springboard —— 列表加速恒为关闭，任何配置都打不开（SpringBoard 打开会黑屏/白苹果）。顺丰同城骑士已于 v2.1.14 移出名单，现由开关控制。淘宝/京东等重列表 App 也建议保持关闭。",
         12, [UIColor systemOrangeColor]);
     [self.stack addArrangedSubview:warn];
 
-    UILabel *blacklistTitle = SIOSectionTitle(@"黑名单（每行一个 Bundle ID，命中则完全不加速）");
+    UILabel *blacklistTitle = SIOSectionTitle(@"黑名单（每行一个 Bundle ID，精确匹配，命中则完全不加速且不保活；结尾加 * 按前缀排除整个家族，动画/保活两侧同语义）");
     m.blacklist = [[UITextView alloc] init];
     m.blacklist.font = [UIFont systemFontOfSize:14];
     m.blacklist.layer.borderColor = [UIColor separatorColor].CGColor;
@@ -1814,6 +1843,8 @@ static UILabel *SIOSectionTitle(NSString *t) {
         return;
     }
     BOOL ok = [self.model save];
+    // v2.1.18（审查 P1-8）：导入的 AppOverrides 已随 save() 落盘，这里刷新回显
+    [self.model refreshOverrides];
     [self doCheck];
     // v2.1.12（N-6）：跨版本导入的警告拼在成功消息后面，不阻断
     NSString *msg = ok ? [self.model summary] : @"控件已更新，但 plist 写入失败，请检查权限。";
