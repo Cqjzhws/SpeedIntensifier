@@ -1,4 +1,4 @@
-// SIOriginal — 原版重制                                        v2.1.14
+// SIOriginal — 原版重制                                        v2.1.15
 //
 // ============================ v2.1.10 全量审计修复 ============================
 // 逐行审计 dylib（2407 行）+ 配置 App（1797 行）后修掉的四类问题：
@@ -95,6 +95,19 @@
 //       卡死/崩溃」；v2.1.8 记录 FastScroll 把 decelRate 锁 0.99 导致订单列表飞太快难抢单。
 //       若骑士出现异常，把两行加回即可恢复，无需改别处。
 // [V-3] 命中统计浮层下移状态栏之下（之前窗口从 y=0 起，卡片压住时间/信号）。
+// =========================================================================
+//
+// =================== v2.1.15 统计浮层在「常驻后台 App」不弹 ===================
+// 现象：微信能弹统计浮层，顺丰骑士怎么都不弹（也不崩）。
+// 根因：SIO_onStatsRequest 收到 Darwin 通知后直接调 SIO_showStats()，而后者开头有
+//   `if (app.applicationState != UIApplicationStateActive) return;`。
+//   · 微信被系统挂起 → 通知要等它恢复到前台才投递，那时已 Active → 能弹；
+//   · 顺丰骑士这类要持续定位的 App 在后台仍活着 → 通知到达即处理，此时是 Background
+//     → 被 active 检查 return 掉，之后回到前台也不会补弹。
+// 修法：收到请求只置 sioStatsArmed=YES；若当时已 Active 才立即弹，否则挂起，
+//   等 UIApplicationDidBecomeActiveNotification 到达时再弹（SIO_onDidBecomeActive）。
+//   观察者令牌存 sioStatsActiveObs —— block 观察者不持有就会随返回值释放并自动注销，
+//   与 v2.1.10 的 AVAudioSession 是同一个坑。
 // =========================================================================
 //
 // ============================ v2.1.7 真·闪退修复 ============================
@@ -975,6 +988,15 @@ static void SIO_showToast(void) {
 // 不需要 Mac、不需要持久化，用户在目标 App 里当场就能看到。
 static UIWindow *sioStatsWindow = nil;
 
+// v2.1.15：把「收到请求」与「弹浮层」解耦。
+// 背景：常驻后台的 App（顺丰骑士这类要持续定位的）在后台仍活着，Darwin 通知到达时
+// 立刻被处理，此时 applicationState 是 Background → SIO_showStats 的 active 检查直接
+// return，浮层永远不出现；而微信这类被系统挂起的 App，通知要等它恢复到前台才处理，
+// 那时已经是 Active，所以一直能弹。这就是「微信有、骑士没有」的真正原因。
+// 改法：收到请求只置位 sioStatsArmed，等这个 App 回到前台（DidBecomeActive）再弹。
+static BOOL sioStatsArmed = NO;
+static id   sioStatsActiveObs = nil;   // 持有 block 观察者令牌，否则释放即自动注销
+
 static void SIO_dismissStats(void) {
     if (!sioStatsWindow) return;
     UIWindow *w = sioStatsWindow;
@@ -1080,6 +1102,7 @@ static void SIO_showStats(void) {
 
 // v2.1.12（F-A）：收到配置 App 的统计请求 → 在当前前台 App 内弹浮层。
 // 同样遵守 v2.1.10 的竞态约定：Darwin 回调在通知线程，UI 操作必须回主线程。
+// v2.1.15：不再无脑 SIO_showStats()。后台态先挂起请求，回到前台再弹（见 sioStatsArmed 注释）。
 static void SIO_onStatsRequest(CFNotificationCenterRef center, void *observer,
                                CFNotificationName name, const void *object,
                                CFDictionaryRef userInfo) {
@@ -1087,9 +1110,23 @@ static void SIO_onStatsRequest(CFNotificationCenterRef center, void *observer,
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             NSLog(@"%@", SIO_statsLogLine());   // 有 Mac 的话 Console 里也留一份
-            SIO_showStats();
+            sioStatsArmed = YES;
+            if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
+                sioStatsArmed = NO;             // 已在前台，直接弹
+                SIO_showStats();
+            }
+            // 否则保持 armed，等 SIO_onDidBecomeActive 把它弹出来
         } @catch (__unused NSException *e) {}
     });
+}
+
+// v2.1.15：App 回到前台时，如果之前挂着一笔统计请求，就现在弹。
+// 这解决了「常驻后台的 App 收到请求时不是 Active、浮层永不出现」的问题。
+static void SIO_onDidBecomeActive(NSNotification *note) {
+    (void)note;
+    if (!sioStatsArmed) return;
+    sioStatsArmed = NO;
+    SIO_showStats();
 }
 
 static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
@@ -2006,6 +2043,14 @@ static void SIOriginalInit(void) {
                                     SIO_onStatsRequest,
                                     (__bridge CFStringRef)kNotifyStats, NULL,
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
+    // v2.1.15：常驻后台的 App 收到请求时不是 Active，浮层会被 active 检查挡掉。
+    // 这里挂一个回到前台的观察者，把挂起的请求补弹出来。令牌必须持有，
+    // 否则 block 观察者随返回值释放、立即自动注销（与 v2.1.10 的 AVAudioSession 同坑）。
+    sioStatsActiveObs = [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidBecomeActiveNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *note) { SIO_onDidBecomeActive(note); }];
 
     Class caAnim = objc_getClass("CAAnimation");
     Class catx   = objc_getClass("CATransaction");
@@ -2191,7 +2236,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.1.14 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
+    NSLog(@"[SIOriginal] v2.1.15 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -3057,7 +3102,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.1.14 (SIOriginal v2.1.14) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.1.15 (SIOriginal v2.1.15) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
