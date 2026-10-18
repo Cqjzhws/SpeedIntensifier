@@ -1,4 +1,12 @@
-// SIOriginal — 原版重制                                        v2.1.18
+// SIOriginal — 原版重制                                        v2.1.19
+//
+// ============================ v2.1.19 名单外置 + 专属覆盖增强 ============================
+// [dylib] 三份保护名单（列表硬保护/手感/HUD）外置：plist 新增 HardGuardExtra /
+//   FeelProtectedExtra / HudProtectedExtra 三个额外名单键（数组，支持 * 通配），与内置
+//   安全网名单 union（内置不可删，额外只增不减）；reload 时解析并重算 gSelfFeel/HudProtected。
+//   专属覆盖新增 FeelProtected / HudProtected 两个键：按 App 单独强制保护（YES）/强制
+//   不保护（NO），不写则跟随名单 —— 以前这俩只能靠全局名单。
+// =========================================================================
 //
 // ============================ v2.1.18 审查修复（两轮合并） ============================
 // 本轮 = v2.1.17 修复 + 外部审查报告核实后采纳项，全部基于 v2.1.16 原始源码重做：
@@ -601,14 +609,37 @@ static NSDictionary *SIO_appOverride(NSDictionary *root) {
     return [mine isKindOfClass:[NSDictionary class]] ? (NSDictionary *)mine : nil;
 }
 
+// v2.1.19（名单外置）：三份保护名单的「用户额外」部分，plist 可配置、reload 时更新。
+// 内置名单仍是安全网（不可删，否则黑屏/白苹果），额外名单只增不减、支持 * 通配。
+static NSArray *gHardGuardExtra = nil;
+static NSArray *gFeelExtra      = nil;
+static NSArray *gHudExtra       = nil;
+
+// 名单匹配：精确 + 结尾 * 前缀（与黑名单同语义，v2.1.18 审查 P0-1）。
+static BOOL SIO_bidInList(NSString *bid, NSArray *list) {
+    for (id it in list) {
+        if (![it isKindOfClass:[NSString class]]) continue;
+        NSString *s = [(NSString *)it stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceCharacterSet]];
+        if (!s.length) continue;
+        if ([s hasSuffix:@"*"]) {
+            if (s.length > 1 && [bid hasPrefix:[s substringToIndex:s.length - 1]]) return YES;
+        } else if ([bid isEqualToString:s]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
 // 列表 hook 硬保护名单。
 // 名单内 App 的 ListAccel 恒为 NO：全局开关、App 覆盖都无法打开。
 // 名单来源为本项目实测记录 —— 这些 App 的列表 UI 与 TV/CV 变更类 hook 冲突，
 // 会破坏列表状态机导致卡死/崩溃。安全项 fail-safe，不接受"忘了关"。
 static BOOL SIO_listHardBlocked(void) {
-    // v2.1.12（审查 N-2）：这份名单在配置 App 侧有一份镜像 SIOModel.m 里的
-    // HardGuardBundles()。⚠ 改这里必须同步改那里，反之亦然 ——
-    // 两边不一致会让专属覆盖页显示「列表加速：开」而实际被硬关，即假开关。
+    // v2.1.12（审查 N-2）：这份名单在配置 App 侧有一份镜像 HardGuardBundles()。
+    // ⚠ 改这里必须同步改那里，反之亦然 —— 两边不一致会让专属覆盖页显示
+    // 「列表加速：开」而实际被硬关，即假开关。
+    // v2.1.19（名单外置）：内置名单 + 用户额外名单 gHardGuardExtra（plist 可配）。
     static NSArray *blocked = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -621,7 +652,8 @@ static BOOL SIO_listHardBlocked(void) {
     });
     NSString *bid = SIO_bundleID();
     if (!bid.length) return NO;
-    return [blocked containsObject:bid];
+    if ([blocked containsObject:bid]) return YES;
+    return [SIO_bidInList(bid, gHardGuardExtra)];
 }
 
 // v1.8.16：内置保活排除名单 —— 这些进程绝不参与真后台保活。
@@ -648,6 +680,7 @@ static BOOL SIO_feelProtected(void) {
     // FastScroll locks decelerationRate to 0.99 (fast), which cut each swipe to one or
     // two order cells ("one cell at a time" feel). Skip the whole feel module for this
     // app; ListAccel is already hard-guarded here, so only the animation speedup stays active.
+    // v2.1.19（名单外置）：内置名单 + 用户额外名单 gFeelExtra（plist 可配）。
     static NSArray *list = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -659,7 +692,9 @@ static BOOL SIO_feelProtected(void) {
         ];
     });
     NSString *bid = SIO_bundleID();
-    return bid.length && [list containsObject:bid];
+    if (!bid.length) return NO;
+    if ([list containsObject:bid]) return YES;
+    return [SIO_bidInList(bid, gFeelExtra)];
 }
 
 // 本进程是否命中 App 覆盖 / 是否被列表硬保护（供启动日志与配置排查）
@@ -679,7 +714,9 @@ static BOOL SIO_hudProtected(void) {
         ];
     });
     NSString *bid = SIO_bundleID();
-    return bid.length && [hlist containsObject:bid];
+    if (!bid.length) return NO;
+    if ([hlist containsObject:bid]) return YES;
+    return [SIO_bidInList(bid, gHudExtra)];
 }
 
 static BOOL gHasAppOverride   = NO;
@@ -722,6 +759,9 @@ static void SIO_resetDefaults(void) {
     gWKFastShow    = YES;
     gSelfBlacklisted = NO;
     gHasAppOverride  = NO;
+    gHardGuardExtra = @[];   // v2.1.19：额外名单复位（删 plist 恢复默认时一并清空）
+    gFeelExtra      = @[];
+    gHudExtra       = @[];
 }
 
 static void SIO_reload(void) {
@@ -731,6 +771,9 @@ static void SIO_reload(void) {
         SIO_resetDefaults();
         NSLog(@"[SIOriginal] prefs file missing/unreadable at %@ — reset to factory defaults",
               kPrefPath);
+        // v2.1.19：额外名单已复位，重算手感/HUD 命中（只剩内置名单）。
+        gSelfHudProtected  = SIO_hudProtected();
+        gSelfFeelProtected = SIO_feelProtected();
         // 配置缺失也要执行硬保护，保证"没有配置文件"时顺丰同城同样安全
         gListHardGuarded = SIO_listHardBlocked();
         if (gListHardGuarded) gListAccel = NO;
@@ -812,6 +855,18 @@ static void SIO_reload(void) {
         }
     }
 
+    // v2.1.19（名单外置）：三份保护名单的用户额外部分 + 手感/HUD 命中结果重算。
+    // 内置名单命中在 SIO_feelProtected()/SIO_hudProtected() 内已算，这里补上额外名单，
+    // 并把结果刷新到进程布尔（热重载会重新走这里，配置改了立即生效）。
+    id hge = d[@"HardGuardExtra"];
+    gHardGuardExtra = [hge isKindOfClass:[NSArray class]] ? hge : @[];
+    id fe = d[@"FeelProtectedExtra"];
+    gFeelExtra = [fe isKindOfClass:[NSArray class]] ? fe : @[];
+    id hue = d[@"HudProtectedExtra"];
+    gHudExtra = [hue isKindOfClass:[NSArray class]] ? hue : @[];
+    gSelfHudProtected  = SIO_hudProtected();
+    gSelfFeelProtected = SIO_feelProtected();
+
     // ---- v1.8.14：App 级覆盖（在全局之后应用，优先级更高） ----
     NSDictionary *ovr = SIO_appOverride(d);
     gHasAppOverride = (ovr != nil);
@@ -860,6 +915,10 @@ static void SIO_reload(void) {
             if (hd2 >= 0.02 && hd2 <= 1.0) gHUDDelay = hd2;
         }
         if (ovr[@"WKFastShow"])        gWKFastShow        = [ovr[@"WKFastShow"]        boolValue];
+        // v2.1.19（专属覆盖增强）：手感/HUD 保护可按 App 单独覆盖 —— 显式 YES 强制保护、
+        // NO 强制不保护（覆盖名单结果），不写则跟随名单。
+        if (ovr[@"FeelProtected"]) gSelfFeelProtected = [ovr[@"FeelProtected"] boolValue];
+        if (ovr[@"HudProtected"])  gSelfHudProtected  = [ovr[@"HudProtected"] boolValue];
     }
 
     // ---- v1.8.14：列表 hook 硬保护，必须放在所有覆盖之后，优先级最高 ----
@@ -2330,7 +2389,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.1.18 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
+    NSLog(@"[SIOriginal] v2.1.19 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -3222,7 +3281,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.1.18 (SIOriginal v2.1.18) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.1.19 (SIOriginal v2.1.19) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
