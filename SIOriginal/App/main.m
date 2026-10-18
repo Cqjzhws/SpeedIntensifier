@@ -32,7 +32,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.1.14";
+static NSString * const SIO_VERSION = @"v2.1.15";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -1714,8 +1714,10 @@ static UILabel *SIOSectionTitle(NSString *t) {
     [hs addTarget:self action:@selector(doRequestStats)
              forControlEvents:UIControlEventTouchUpInside];
     UILabel *hsNote = SIOLabel(
-        @"用法：先切到你想看的 App 并随便滑动/翻几页，再切回来点这个按钮，"
-         "然后立刻切回去 —— 统计浮层会在那个 App 顶部显示 6 秒。\n"
+        @"用法：先在目标 App 里随便滑动/翻几页，再切回本 App 点这个按钮，"
+         "然后切回目标 App —— 统计浮层会在它回到前台时弹出并显示 6 秒。\n"
+         "（v2.1.15 起支持常驻后台的 App：顺丰骑士这类收请求时还在后台，浮层会挂起，"
+         "等你切回去才弹；以前会被「非前台不弹」直接挡掉。）\n"
          "看什么：哪一项数字大，就说明这个 App 的动画主要走那条路"
          "（比如 ListTV 大就调列表相关、LayerAdd 大就调显式动画倍率 LayerBoost）。\n"
          "浮层第一行是状态行，会写明该 App 命中了哪道闸门"
