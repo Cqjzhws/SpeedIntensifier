@@ -29,7 +29,7 @@ extern int reboot(int);
 static NSString * const PrefPath  = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
 static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.1.10";
+static NSString * const SIO_VERSION = @"v2.1.11";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 static NSArray *HardGuardBundles(void) {
@@ -188,6 +188,9 @@ static NSArray *SIOConfigKeys(void) {
                   @"InAppNotify",
                   // v2.1.9：瞬时打开三件套（新键登记白名单才能被写入 plist）
                   @"InstantTransition", @"HUDFast", @"WKFastShow",
+                  // v2.1.11：HUD 延迟。不登记白名单就写不进 plist，
+                  // AppOverrides 里的 HUDDelay 也因此一直是死的。
+                  @"HUDDelay",
                   @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
                   @"AppOverrides" ];
     });
@@ -262,6 +265,16 @@ static void WriteAx(NSString *key, BOOL val) {
     d[key] = @(val);
     [d writeToFile:AxPath atomically:YES];
 }
+// v2.1.11：批量写 Accessibility.plist。save() 里原来连调三次 WriteAx，
+// 每次都是「读整个 plist → 改一个键 → 写回」，共 3 读 3 写。合成一次 IO。
+// 注意 WriteAx 本身是有 merge 的（不会清空系统其它键），这里只是消除重复 IO。
+static void WriteAxBatch(NSDictionary *kv) {
+    if (!kv.count) return;
+    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:AxPath] mutableCopy];
+    if (!d) d = [NSMutableDictionary dictionary];
+    for (NSString *k in kv) d[k] = kv[k];
+    [d writeToFile:AxPath atomically:YES];
+}
 
 static double ReadUIKitDrag(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:PrefPath];
@@ -296,6 +309,24 @@ static int DragIndexForCoeff(double c) {
     if (c > 0.15 && c < 0.25)  return 1;
     if (c > 0.0 && c < 0.04)   return 4;
     return 0;
+}
+// v2.1.11：HUD 延迟档位 0=0.05s 1=0.10s 2=0.15s(默认) 3=0.30s 4=0.50s
+// dylib 侧校验范围 0.02–1.0，档位值全部落在范围内。
+static double HUDDelayForIndex(int i) {
+    switch (i) {
+        case 0:  return 0.05;
+        case 1:  return 0.10;
+        case 3:  return 0.30;
+        case 4:  return 0.50;
+        default: return 0.15;
+    }
+}
+static int HUDDelayIndexFor(double v) {
+    if (v <= 0.07) return 0;
+    if (v <= 0.12) return 1;
+    if (v <= 0.20) return 2;
+    if (v <= 0.40) return 3;
+    return 4;
 }
 static int DragMultiplierForCoeff(double c) {
     if (c > 0.04 && c < 0.06)  return 20;
@@ -634,6 +665,11 @@ static UILabel *SIOSectionTitle(NSString *t) {
 @property (strong) UISwitch *swNotify;
 // v2.1.9：瞬时打开三件套（dylib 侧三个键缺键即默认开，这里给它们补上可视化开关）
 @property (strong) UISwitch *swInstant, *swHUDFast, *swWKFast;
+// v2.1.11：HUD 延迟。dylib 侧实现完整（转圈延后多久才显形）且有范围校验，
+// 但 App 侧从来没有入口 —— 不在 SIOConfigKeys 白名单、save() 不写、无 UI，
+// 于是 gHUDDelay 永远锁死在 0.15s。这个参数对「转圈闪一下」的抑制效果影响很大，
+// 网络快的 App 可以调到 0.05s 更激进地压闪现，网络慢的该调大免得用户以为卡死。
+@property (strong) UISegmentedControl *segHUDDelay;
 // 系统页
 @property (strong) UISwitch *swRM, *swCF, *swRT;
 @property (strong) UISegmentedControl *segDrag;
@@ -647,6 +683,8 @@ static UILabel *SIOSectionTitle(NSString *t) {
 // 但 v2.1.9 的 save() 构造覆盖字典时漏了它们，导致开了专属覆盖的 App
 // 无法单独关掉瞬时打开（想用它排查白屏就没招）。
 @property (strong) UISwitch *ovInstant, *ovHUDFast, *ovWKFast;
+// v2.1.11：专属覆盖版 HUD 延迟（dylib 支持按 App 读，App 侧此前无入口）
+@property (strong) UISegmentedControl *ovHUDDelay;
 @property (strong) UISlider *ovSpeed;
 @property (strong) UILabel *ovSpeedLabel, *ovGuard;
 @property (strong) UISegmentedControl *ovMode, *ovLayer, *ovFloor, *ovTrans;
@@ -689,6 +727,9 @@ static UILabel *SIOSectionTitle(NSString *t) {
     self.swInstant.on = c[@"InstantTransition"] ? [c[@"InstantTransition"] boolValue] : YES;
     self.swHUDFast.on = c[@"HUDFast"] ? [c[@"HUDFast"] boolValue] : YES;
     self.swWKFast.on  = c[@"WKFastShow"]  ? [c[@"WKFastShow"]  boolValue] : YES;
+    // v2.1.11：HUD 延迟（0.05 / 0.10 / 0.15 / 0.30 / 0.50），缺键 0.15
+    self.segHUDDelay.selectedSegmentIndex =
+        HUDDelayIndexFor(c[@"HUDDelay"] ? [c[@"HUDDelay"] doubleValue] : 0.15);
     self.blacklist.text = [c[@"Blacklist"] componentsJoinedByString:@"\n"];
 
     self.swRM.on = ReadAx(@"ReduceMotionEnabled");
@@ -765,6 +806,8 @@ static UILabel *SIOSectionTitle(NSString *t) {
     self.ovInstant.on = mine[@"InstantTransition"] ? [mine[@"InstantTransition"] boolValue] : YES;
     self.ovHUDFast.on = mine[@"HUDFast"]           ? [mine[@"HUDFast"]           boolValue] : YES;
     self.ovWKFast.on  = mine[@"WKFastShow"]        ? [mine[@"WKFastShow"]        boolValue] : YES;
+    self.ovHUDDelay.selectedSegmentIndex = mine[@"HUDDelay"]
+        ? HUDDelayIndexFor([mine[@"HUDDelay"] doubleValue]) : 2;   // 缺键 = 0.15s（跟随默认档）
 
     BOOL guarded = [HardGuardBundles() containsObject:bid];
     self.ovList.enabled = !guarded;
@@ -839,6 +882,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     cfg[@"InstantTransition"] = @(self.swInstant.on);
     cfg[@"HUDFast"] = @(self.swHUDFast.on);
     cfg[@"WKFastShow"] = @(self.swWKFast.on);
+    cfg[@"HUDDelay"] = @(HUDDelayForIndex((int)self.segHUDDelay.selectedSegmentIndex));
     cfg[@"Blacklist"] = [self blacklistFromView];
 
     cfg[@"FUBGEnabled"] = @(self.swFUBG.on);
@@ -871,6 +915,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
                 @"InstantTransition": @(self.ovInstant.on),
                 @"HUDFast":           @(self.ovHUDFast.on),
                 @"WKFastShow":        @(self.ovWKFast.on),
+                @"HUDDelay":          @(HUDDelayForIndex((int)self.ovHUDDelay.selectedSegmentIndex)),
             };
         } else {
             [ovOut removeObjectForKey:ovBid];
@@ -879,9 +924,10 @@ static UILabel *SIOSectionTitle(NSString *t) {
     cfg[@"AppOverrides"] = ovOut;
 
     BOOL ok = WriteConfig(cfg);
-    WriteAx(@"ReduceMotionEnabled", self.swRM.on);
-    WriteAx(@"PreferCrossFadeTransitions", self.swCF.on);
-    WriteAx(@"ReduceTransparencyEnabled", self.swRT.on);
+    // v2.1.11：三个辅助开关合并为一次「读 → 改 3 键 → 写」
+    WriteAxBatch(@{ @"ReduceMotionEnabled":        @(self.swRM.on),
+                    @"PreferCrossFadeTransitions": @(self.swCF.on),
+                    @"ReduceTransparencyEnabled":  @(self.swRT.on) });
     // v2.1.9：总开关是最高优先级 —— 关闭时把 UIAnimationDragCoefficient 一并清掉。
     // 这是 iOS 原生读取的键，不经过 dylib：不清的话「启用动画引擎」关了，
     // UIKit 照样按 ×5/×10/×20 加速，总开关会被误认为假开关。
@@ -935,6 +981,9 @@ static UILabel *SIOSectionTitle(NSString *t) {
     self.swInstant.on = YES;
     self.swHUDFast.on = YES;
     self.swWKFast.on = YES;
+    // v2.1.11：预设统一把 HUD 延迟压到 0.05s（激进抑制转圈闪现）。
+    // 觉得加载圈消失太快、看不出"在加载"，可在手感页调回 0.15s 或更长。
+    self.segHUDDelay.selectedSegmentIndex = 0;
 
     switch (i) {
         case 0: // 极速：倍率再往上顶，显式/转场倍率拉到最大（纯时长缩放，安全）
@@ -996,8 +1045,8 @@ static UILabel *SIOSectionTitle(NSString *t) {
     // 布尔键
     NSArray *boolKeys = @[ @"Enabled", @"Spring", @"Extra", @"ListAccel", @"ZoomAccel",
                            @"FastScroll", @"FastTap", @"InAppNotify",
-                           @"InstantTransition", @"HUDFast", @"WKFastShow",
-                           @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep" ];
+                            @"InstantTransition", @"HUDFast", @"WKFastShow",
+                            @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep" ];
     for (NSString *k in boolKeys) {
         if (d[k]) {
             UISwitch *sw = [self switchForKey:k];
@@ -1020,6 +1069,9 @@ static UILabel *SIOSectionTitle(NSString *t) {
         self.segLayer.selectedSegmentIndex = LayerIndexForBoost([d[@"LayerBoost"] doubleValue]);
     if ([d[@"TransitionBoost"] isKindOfClass:[NSNumber class]])
         self.segTrans.selectedSegmentIndex = TransIndexFor([d[@"TransitionBoost"] doubleValue]);
+    // v2.1.11：HUD 延迟是数值键（不是布尔），单独处理
+    if ([d[@"HUDDelay"] isKindOfClass:[NSNumber class]])
+        self.segHUDDelay.selectedSegmentIndex = HUDDelayIndexFor([d[@"HUDDelay"] doubleValue]);
     if ([d[@"Blacklist"] isKindOfClass:[NSArray class]]) {
         NSMutableArray *lines = [NSMutableArray array];
         for (id x in d[@"Blacklist"])
@@ -1177,6 +1229,13 @@ static UILabel *SIOSectionTitle(NSString *t) {
 - (void)noteApplied { [self uiApplied]; }
 - (void)buildContent {}
 - (void)uiApplied {}
+
+// v2.1.11：原来全文件只有这一处 addObserver、0 处 removeObserver、0 处 dealloc。
+// 当前不会崩（4 个 VC 被 AppDelegate 强持有、生命周期等同进程），但一旦后续改成
+// 懒加载或动态增删 Tab，VC 释放后通知回调会访问已释放对象。补上注销。
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
 
 - (void)saveTapped {
     BOOL ok = [self.model save];
@@ -1384,6 +1443,17 @@ static UILabel *SIOSectionTitle(NSString *t) {
         SIORowSub(@"加载圈 / HUD 加速", @"转圈延后 0.15s 才显形，SVProgressHUD/MBProgressHUD 立即消失", m.swHUDFast),
         SIORowSub(@"网页提前显形", @"WKWebView 加载进度过 10% 后拒绝再被隐藏，网页更早露出来", m.swWKFast),
     ], 14)];
+    // v2.1.11：HUD 延迟 —— dylib 支持调但配置端一直锁死在 0.15s，现在开放
+    m.segHUDDelay = [[UISegmentedControl alloc]
+        initWithItems:@[ @"0.05s", @"0.10s", @"0.15s", @"0.30s", @"0.50s" ]];
+    [self.stack addArrangedSubview:SIOSectionTitle(@"转圈延迟 · 越短越不闪")];
+    [self.stack addArrangedSubview:SIOCard(@[
+        m.segHUDDelay,
+        SIOLabel(@"加载圈要延后多久才显形。网络快的 App 调短（0.05s）几乎看不到转圈闪现；"
+                 "网络慢的调长（0.30s–0.50s），否则用户会以为卡死。默认 0.15s。",
+                 12, [UIColor secondaryLabelColor]),
+    ], 10)];
+
     UILabel *instantNote = SIOLabel(
         @"注：IM 与支付类 App 在 dylib 内置保护名单内，这三项对它们自动不生效。"
         "若某个 App 出现打开白屏、内容没渲染完就切走，优先关掉「瞬时打开页面」和「网页提前显形」。",
@@ -1469,7 +1539,7 @@ static UILabel *SIOSectionTitle(NSString *t) {
     double c = DragCoeffForIndex(idx);
     if (!m.swEnabled.on) {
         m.lblDrag.textColor = [UIColor secondaryLabelColor];
-        m.lblDrag.text = @"总开关当前关闭：保存后此项会被清成原生值（v2.1.10 起），先开总开关再选档位。";
+        m.lblDrag.text = @"总开关当前关闭：保存后此项会被清成原生值（v2.1.11 起），先开总开关再选档位。";
         return;
     }
     if (idx == 4) {
@@ -1540,6 +1610,8 @@ static UILabel *SIOSectionTitle(NSString *t) {
     m.ovInstant = [[UISwitch alloc] init];
     m.ovHUDFast = [[UISwitch alloc] init];
     m.ovWKFast  = [[UISwitch alloc] init];
+    m.ovHUDDelay = [[UISegmentedControl alloc]
+        initWithItems:@[ @"0.05s", @"0.10s", @"0.15s", @"0.30s", @"0.50s" ]];
     m.ovGuard = SIOLabel(@"", 12, [UIColor secondaryLabelColor]);
 
     [self.stack addArrangedSubview:SIOCard(@[
@@ -1562,6 +1634,8 @@ static UILabel *SIOSectionTitle(NSString *t) {
         SIORow(@"瞬时打开页面", m.ovInstant, nil),
         SIORow(@"加载圈 / HUD 加速", m.ovHUDFast, nil),
         SIORow(@"网页提前显形", m.ovWKFast, nil),
+        SIOLabel(@"转圈延迟（专属）", 15, [UIColor labelColor]),
+        m.ovHUDDelay,
         m.ovGuard,
     ], 10)];
 
