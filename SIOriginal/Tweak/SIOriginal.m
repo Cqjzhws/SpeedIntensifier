@@ -1279,6 +1279,7 @@ static NSString *SIO_statsStatusLine(void);
 static BOOL gUseScene;
 // v2.3.0：统计状态行要显示保活是否生效，gActive 定义在下方 FUBG 段，同样先暂定声明。
 static BOOL gActive;
+static BOOL gUseAudio;
 
 static BOOL SIO_bucketSkipped(int slot) {
     // v2.1.18 真 bug 修复：Notify 由 _fbg_willPresent 计数，其闸门是保活侧 gUseScene
