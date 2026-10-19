@@ -1077,28 +1077,36 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     for (NSString *ovBid in ovIDs) {
         if (self.ovOn.on) {
             BOOL guarded = [HardGuardBundles() containsObject:ovBid];
-            ovOut[ovBid] = @{
-                @"Enabled":   @YES,
-                @"Mode":      @((int)self.ovMode.selectedSegmentIndex),
-                @"Speed":     @(round(self.ovSpeed.value * 10.0) / 10.0),
-                @"Spring":    @(self.ovSpring.on),
-                @"Extra":     @(self.ovExtra.on),
-                @"ListAccel": @(guarded ? NO : self.ovList.on),
-                @"ZoomAccel": @(self.ovZoom.on),
-                @"FastScroll": @(self.ovFastScroll.on),
-                @"FastTap":    @(self.ovFastTap.on),
-                @"LayerBoost": @(LayerBoostForIndex((int)self.ovLayer.selectedSegmentIndex)),
-                @"FloorDuration":   @(FloorForIndex((int)self.ovFloor.selectedSegmentIndex)),
-                @"TransitionBoost": @(TransForIndex((int)self.ovTrans.selectedSegmentIndex)),
-                // v2.1.10：瞬时打开三件套写入专属覆盖（dylib 会读，v2.1.9 漏了）
-                @"InstantTransition": @(self.ovInstant.on),
-                @"HUDFast":           @(self.ovHUDFast.on),
-                @"WKFastShow":        @(self.ovWKFast.on),
-                @"HUDDelay":          @(HUDDelayForIndex((int)self.ovHUDDelay.selectedSegmentIndex)),
-                // v2.1.19：手感/HUD 保护按 App 单独设置
-                @"FeelProtected":     @(self.ovFeelProtect.on),
-                @"HudProtected":      @(self.ovHudProtect.on),
-            };
+            // v2.1.20 修复（契约检查工具 config_contract.py 抓到，两版都存在）：
+            // 原来这里用 @{...} 整块替换该 App 的覆盖字典。dylib 认识 22 个覆盖键，
+            // 而本页只负责其中 18 个 —— SlowFactor / FUBGEnabled / FUBGSceneFake /
+            // FUBGAudioKeep 这 4 个没有编辑入口，于是「在 App 里改一个无关开关」
+            // 会把手工（或其它工具）写进这几个键的值一起冲掉，而且没有任何提示。
+            // 改为：先继承旧字典，再覆盖本页真正负责的键（未知键原样保留）。
+            NSMutableDictionary *ov = [ovOut[ovBid] isKindOfClass:[NSDictionary class]]
+                ? [ovOut[ovBid] mutableCopy]
+                : [NSMutableDictionary dictionary];
+            ov[@"Enabled"]   = @YES;
+            ov[@"Mode"]      = @((int)self.ovMode.selectedSegmentIndex);
+            ov[@"Speed"]     = @(round(self.ovSpeed.value * 10.0) / 10.0);
+            ov[@"Spring"]    = @(self.ovSpring.on);
+            ov[@"Extra"]     = @(self.ovExtra.on);
+            ov[@"ListAccel"] = @(guarded ? NO : self.ovList.on);
+            ov[@"ZoomAccel"] = @(self.ovZoom.on);
+            ov[@"FastScroll"] = @(self.ovFastScroll.on);
+            ov[@"FastTap"]    = @(self.ovFastTap.on);
+            ov[@"LayerBoost"] = @(LayerBoostForIndex((int)self.ovLayer.selectedSegmentIndex));
+            ov[@"FloorDuration"]   = @(FloorForIndex((int)self.ovFloor.selectedSegmentIndex));
+            ov[@"TransitionBoost"] = @(TransForIndex((int)self.ovTrans.selectedSegmentIndex));
+            // v2.1.10：瞬时打开三件套写入专属覆盖（dylib 会读，v2.1.9 漏了）
+            ov[@"InstantTransition"] = @(self.ovInstant.on);
+            ov[@"HUDFast"]           = @(self.ovHUDFast.on);
+            ov[@"WKFastShow"]        = @(self.ovWKFast.on);
+            ov[@"HUDDelay"]          = @(HUDDelayForIndex((int)self.ovHUDDelay.selectedSegmentIndex));
+            // v2.1.19：手感/HUD 保护按 App 单独设置
+            ov[@"FeelProtected"]     = @(self.ovFeelProtect.on);
+            ov[@"HudProtected"]      = @(self.ovHudProtect.on);
+            ovOut[ovBid] = ov;
         } else {
             [ovOut removeObjectForKey:ovBid];
         }
