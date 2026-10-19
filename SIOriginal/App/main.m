@@ -1,4 +1,4 @@
-// SIOriginal — 配置 App v2.3.2（TrollStore 安装）
+// SIOriginal — 配置 App v2.3.3（TrollStore 安装）
 // 重制版配套配置器：写 Managed Preferences plist + 发 Darwin 通知热重载。
 // v2.0.0：Tab 卡片式 UI、一键预设、配置导入/导出、注入环境自检、新引擎参数。
 // v2.1.20：① 出厂默认与 dylib 对齐（原来界面显示 ×15、引擎实际 40×，且一保存就降速）；
@@ -42,7 +42,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.3.2";
+static NSString * const SIO_VERSION = @"v2.3.3";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -328,12 +328,14 @@ static void WriteAx(NSString *key, BOOL val) {
 // v2.1.12：批量写 Accessibility.plist。save() 里原来连调三次 WriteAx，
 // 每次都是「读整个 plist → 改一个键 → 写回」，共 3 读 3 写。合成一次 IO。
 // 注意 WriteAx 本身是有 merge 的（不会清空系统其它键），这里只是消除重复 IO。
-static void WriteAxBatch(NSDictionary *kv) {
-    if (!kv.count) return;
+// v2.3.3（审查 P0/P3）：改为返回 BOOL，writeToFile 失败时上层可感知；
+// 原来 void 静默失败，save() 无法判断辅助功能三项是否真的落盘。
+static BOOL WriteAxBatch(NSDictionary *kv) {
+    if (!kv.count) return YES;
     NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:AxPath] mutableCopy];
     if (!d) d = [NSMutableDictionary dictionary];
     for (NSString *k in kv) d[k] = kv[k];
-    [d writeToFile:AxPath atomically:YES];
+    return [d writeToFile:AxPath atomically:YES];
 }
 
 static double ReadUIKitDrag(void) {
@@ -341,7 +343,8 @@ static double ReadUIKitDrag(void) {
     NSNumber *v = d[@"UIAnimationDragCoefficient"];
     return v ? v.doubleValue : 0.0;
 }
-static void WriteUIKitDrag(double coeff) {
+// v2.3.3：同上，改为返回 BOOL。
+static BOOL WriteUIKitDrag(double coeff) {
     NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
     if (!d) d = [NSMutableDictionary dictionary];
     if (coeff > 0.0) {
@@ -351,7 +354,7 @@ static void WriteUIKitDrag(double coeff) {
     }
     mkdir("/var/Managed Preferences", 0755);
     mkdir("/var/Managed Preferences/mobile", 0755);
-    [d writeToFile:PrefPath atomically:YES];
+    return [d writeToFile:PrefPath atomically:YES];
 }
 // 分档索引 → 系数：0=关闭 1=×5(0.2) 2=×10(0.1) 3=×20(0.05) 4=极端(0.0001)
 static double DragCoeffForIndex(int i) {
@@ -951,8 +954,11 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     NSDictionary *mine = [mineRaw isKindOfClass:[NSDictionary class]] ? mineRaw : nil;
 
     self.ovOn.on = (mine != nil);
-    double sp = mine[@"Speed"] ? [mine[@"Speed"] doubleValue] : 5.0;
-    if (sp < 1.0 || sp > 50.0) sp = 5.0;
+    // v2.3.3（审查 P1）：新建覆盖的缺省值原来写死 5.0 / 1.0 / 0.01 / 1.0，
+    // 与全局出厂档 40 / 5 / 0.005 / 3 完全不同 —— 用户新建覆盖保存后该 App 被静默降速。
+    // 缺省值统一用全局常量，与 dylib 出厂默认对齐。
+    double sp = mine[@"Speed"] ? [mine[@"Speed"] doubleValue] : SIO_DefSpeed;
+    if (sp < 1.0 || sp > 50.0) sp = SIO_DefSpeed;
     self.ovSpeed.value = (float)sp;
     self.ovSpeedLabel.text = [NSString stringWithFormat:@"专属倍率（当前 ×%.1f）", sp];
     int m = mine[@"Mode"] ? [mine[@"Mode"] intValue] : 0;
@@ -963,9 +969,9 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     self.ovZoom.on   = mine[@"ZoomAccel"] ? [mine[@"ZoomAccel"] boolValue] : NO;
     self.ovFastScroll.on = mine[@"FastScroll"] ? [mine[@"FastScroll"] boolValue] : NO;
     self.ovFastTap.on    = mine[@"FastTap"]    ? [mine[@"FastTap"] boolValue]    : NO;
-    self.ovLayer.selectedSegmentIndex = LayerIndexForBoost(mine[@"LayerBoost"] ? [mine[@"LayerBoost"] doubleValue] : 1.0);
-    self.ovFloor.selectedSegmentIndex = FloorIndexFor(mine[@"FloorDuration"] ? [mine[@"FloorDuration"] doubleValue] : 0.01);
-    self.ovTrans.selectedSegmentIndex = TransIndexFor(mine[@"TransitionBoost"] ? [mine[@"TransitionBoost"] doubleValue] : 1.0);
+    self.ovLayer.selectedSegmentIndex = LayerIndexForBoost(mine[@"LayerBoost"] ? [mine[@"LayerBoost"] doubleValue] : SIO_DefLayerBoost);
+    self.ovFloor.selectedSegmentIndex = FloorIndexFor(mine[@"FloorDuration"] ? [mine[@"FloorDuration"] doubleValue] : SIO_DefFloor);
+    self.ovTrans.selectedSegmentIndex = TransIndexFor(mine[@"TransitionBoost"] ? [mine[@"TransitionBoost"] doubleValue] : SIO_DefTransBoost);
     // v2.1.10：瞬时打开三件套回显（缺键与 dylib 默认一致 = 开）
     self.ovInstant.on = mine[@"InstantTransition"] ? [mine[@"InstantTransition"] boolValue] : YES;
     self.ovHUDFast.on = mine[@"HUDFast"]           ? [mine[@"HUDFast"]           boolValue] : YES;
@@ -1080,7 +1086,9 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     // App 专属覆盖（保留其它 bundle 的既有条目）
     // v2.1.9：支持一次填多个 Bundle ID（逗号/空格/换行分隔），保存时批量应用
     NSArray *ovIDs = [self ovBundleIDs];
-    id ovAllRaw = [NSDictionary dictionaryWithContentsOfFile:PrefPath][@"AppOverrides"];
+    // v2.3.3（审查 P2/性能）：原来这里再读一次 plist 取 AppOverrides，
+    // 但 ReadConfig()（L1050）已把整份 plist 读进 cfg，直接复用即可，省一次同步 IO。
+    id ovAllRaw = cfg[@"AppOverrides"];
     NSMutableDictionary *ovOut = [ovAllRaw isKindOfClass:[NSDictionary class]]
                                  ? [ovAllRaw mutableCopy] : [NSMutableDictionary dictionary];
     // v2.1.18（审查 P1-8）：先并入导入带回的覆盖项，再让 UI 当前编辑（下方循环）覆盖同名 bid
@@ -1140,18 +1148,21 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     }   // v2.3.2：!importing —— 导入路径不做 UI 回写（见上）
     cfg[@"AppOverrides"] = ovOut;
 
-    BOOL ok = WriteConfig(cfg);
-    // v2.1.12：三个辅助开关合并为一次「读 → 改 3 键 → 写」
-    WriteAxBatch(@{ @"ReduceMotionEnabled":        @(self.swRM.on),
-                    @"PreferCrossFadeTransitions": @(self.swCF.on),
-                    @"ReduceTransparencyEnabled":  @(self.swRT.on) });
-    // v2.1.9：总开关是最高优先级 —— 关闭时把 UIAnimationDragCoefficient 一并清掉。
-    // 这是 iOS 原生读取的键，不经过 dylib：不清的话「启用动画引擎」关了，
-    // UIKit 照样按 ×5/×10/×20 加速，总开关会被误认为假开关。
-    WriteUIKitDrag(self.swEnabled.on
+    // v2.3.3（审查 P0）：原来 WriteConfig 失败时 WriteAxBatch / WriteUIKitDrag 仍落盘，
+    // 但 save 只返回 WriteConfig 的 ok —— 用户看到「保存失败」，辅助功能三项与
+    // UIKit 拖拽系数其实已被改，下次保存还会带着这些"幽灵改动"。
+    // 现在聚合三者返回值：任一失败即返回 NO，让调用方知道并非整体成功。
+    BOOL ok       = WriteConfig(cfg);
+    BOOL axOk     = WriteAxBatch(@{ @"ReduceMotionEnabled":        @(self.swRM.on),
+                                    @"PreferCrossFadeTransitions": @(self.swCF.on),
+                                    @"ReduceTransparencyEnabled":  @(self.swRT.on) });
+    BOOL dragOk   = WriteUIKitDrag(self.swEnabled.on
                    ? DragCoeffForIndex((int)self.segDrag.selectedSegmentIndex)
                    : 0.0);
-    return ok;
+    if (!ok)       NSLog(@"[SIO] save: WriteConfig failed");
+    if (!axOk)     NSLog(@"[SIO] save: WriteAxBatch failed");
+    if (!dragOk)   NSLog(@"[SIO] save: WriteUIKitDrag failed");
+    return ok && axOk && dragOk;
 }
 
 // v2.1.20（功能增强）：恢复出厂设置。
@@ -1367,6 +1378,10 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
         }
     }
 
+    // v2.3.3（审查 P1）：导入后 ovBundle.text 已指向第一个 bundle，但 ovOn/ovSpeed 等
+    // 控件仍停留在上一个 bundle 的残留值。这里显式回显一次，保证控件与输入框一致；
+    // save() 成功后 doImport 还会再刷一次（显示导入的新覆盖值）。
+    [self refreshOverrides];
     [self refreshDynamicLabels];
     [[NSNotificationCenter defaultCenter] postNotificationName:kAppliedNote object:nil];
     return nil;
@@ -2067,9 +2082,15 @@ static BOOL gUIDirty = NO;
     m.ovHudProtect  = [[UISwitch alloc] init];
     m.ovGuard = SIOLabel(@"", 12, [UIColor secondaryLabelColor]);
 
+    // v2.3.3（功能加强）：新建覆盖时一键对齐当前全局配置，省去逐项手动调。
+    UIButton *cloneBtn = SIOPill(@"从当前全局配置复制", [UIColor systemIndigoColor], [UIColor whiteColor]);
+    [cloneBtn addTarget:self action:@selector(cloneGlobalToOverride)
+         forControlEvents:UIControlEventTouchUpInside];
+
     [self.stack addArrangedSubview:SIOCard(@[
         m.ovBundle,
         SIORow(@"为该 App 启用专属配置", m.ovOn, nil),
+        cloneBtn,
         m.ovSpeedLabel, m.ovSpeed,
         SIOLabel(@"专属模式", 15, [UIColor labelColor]), m.ovMode,
         SIOLabel(@"显式动画额外倍率", 15, [UIColor labelColor]), m.ovLayer,
@@ -2220,6 +2241,30 @@ static BOOL gUIDirty = NO;
 - (void)ovSpeedChanged {
     self.model.ovSpeedLabel.text =
         [NSString stringWithFormat:@"专属倍率（当前 ×%.1f）", self.model.ovSpeed.value];
+}
+// v2.3.3（功能加强）：把当前全局配置批量复制到专属覆盖控件。
+// 痛点：新建覆盖时缺省值（×5/×1/0.01s）与全局（×40/×5/0.005s）不一致，要逐项手动对齐。
+- (void)cloneGlobalToOverride {
+    SIOModel *m = self.model;
+    NSDictionary *g = ReadConfig();
+    m.ovSpeed.value  = g[@"Speed"]         ? [g[@"Speed"] floatValue]         : (float)SIO_DefSpeed;
+    m.ovMode.selectedSegmentIndex   = g[@"Mode"] ? [g[@"Mode"] intValue] : 0;
+    m.ovLayer.selectedSegmentIndex  = LayerIndexForBoost(g[@"LayerBoost"]      ? [g[@"LayerBoost"] doubleValue]      : SIO_DefLayerBoost);
+    m.ovFloor.selectedSegmentIndex  = FloorIndexFor(g[@"FloorDuration"]        ? [g[@"FloorDuration"] doubleValue]        : SIO_DefFloor);
+    m.ovTrans.selectedSegmentIndex  = TransIndexFor(g[@"TransitionBoost"]      ? [g[@"TransitionBoost"] doubleValue]      : SIO_DefTransBoost);
+    m.ovSpring.on     = g[@"Spring"]            ? [g[@"Spring"] boolValue]            : YES;
+    m.ovExtra.on      = g[@"Extra"]             ? [g[@"Extra"] boolValue]             : YES;
+    m.ovList.on       = g[@"ListAccel"]         ? [g[@"ListAccel"] boolValue]         : NO;
+    m.ovZoom.on       = g[@"ZoomAccel"]         ? [g[@"ZoomAccel"] boolValue]         : NO;
+    m.ovFastScroll.on = g[@"FastScroll"]        ? [g[@"FastScroll"] boolValue]        : NO;
+    m.ovFastTap.on    = g[@"FastTap"]           ? [g[@"FastTap"] boolValue]           : NO;
+    m.ovInstant.on    = g[@"InstantTransition"] ? [g[@"InstantTransition"] boolValue] : YES;
+    m.ovHUDFast.on    = g[@"HUDFast"]           ? [g[@"HUDFast"] boolValue]           : YES;
+    m.ovWKFast.on     = g[@"WKFastShow"]        ? [g[@"WKFastShow"] boolValue]        : YES;
+    m.ovHUDDelay.selectedSegmentIndex = g[@"HUDDelay"] ? HUDDelayIndexFor([g[@"HUDDelay"] doubleValue]) : 2;
+    [self ovSpeedChanged];
+    [self refreshDynamicLabels];
+    [self ovToggled];
 }
 - (void)ovToggled {
     SIOModel *m = self.model;
@@ -2406,7 +2451,7 @@ static BOOL gUIDirty = NO;
             [self doCheck];
             UIAlertController *r = [UIAlertController
                 alertControllerWithTitle:ok ? @"已套用安全模式" : @"套用后保存失败"
-                message:ok ? @"高风险加速项已全部关闭，倍率 ×5、下限 0.02s。"
+                message:ok ? @"高风险加速项已全部关闭，倍率 ×10、下限 0.02s。"
                              "确认某个 App 恢复正常后，再逐项打开定位。"
                            : @"配置已改，但 plist 写入失败，请检查 TrollStore 权限。"
                 preferredStyle:UIAlertControllerStyleAlert];

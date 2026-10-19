@@ -1,4 +1,4 @@
-// SIOriginal — 原版重制                                        v2.3.2
+// SIOriginal — 原版重制                                        v2.3.3
 //
 // ===================== v2.3.1 保活打磨（三处，省电 / 可观测）=====================
 // 不碰保活机制本身，只改三件事：
@@ -940,7 +940,11 @@ static void SIO_safeBootBegin(void) {
             @"stamp": @((double)[[NSDate date] timeIntervalSince1970]),
             @"ver": @"2.2.0",
         };
-        [now writeToFile:p atomically:YES];
+        // v2.3.3（审查 P2）：检查写入返回值。Caches 不可写时标记静默失败会导致
+        // gSafeCrashCount 无法累积、安全模式永不触发，fail-safe 失效。
+        if (![now writeToFile:p atomically:YES]) {
+            NSLog(@"[SIOriginal] WARNING: boot marker write failed at %@ — safe-boot counter disabled", p);
+        }
         if (gSafeMode) {
             NSLog(@"[SIOriginal] SAFE MODE engaged after 3 consecutive unfinished launches "
                   @"(risky hooks disabled for this launch)");
@@ -1211,8 +1215,11 @@ static void SIO_reload(void) {
     BOOL feelOn = (!gBlockedFast && !gSelfFeelProtected && (gFastScroll || gFastTap));
     // v2.3.2：只有「真的扫到前台场景」才算已施加；扫不到（App 在后台）就留 NO，
     // 等 SIO_onDidBecomeActive 补扫 —— 否则会永久卡在「开了没反应」。
+    // v2.3.3（审查 P2）：SIO_reload 已在主线程（constructor 或 Darwin 回调 hop 到主线程），
+    // 无需再 dispatch_async 一次主队列。多余的 hop 会让 gFeelApplied 赋值延后，
+    // 与下方 else 分支的赋值可能乱序。
     if (feelOn && !gFeelApplied) {
-        dispatch_async(dispatch_get_main_queue(), ^{ gFeelApplied = SIO_feelSweep(); });
+        gFeelApplied = SIO_feelSweep();
     } else if (!feelOn) {
         gFeelApplied = NO;
     }
@@ -2151,7 +2158,9 @@ static inline double SIO_transitionDuration(void) {
     // v2.1.10 真 bug 修复：原来这一行不看 gMode，导致「慢放」模式下导航/模态/Tab 转场
     // 依然被瞬时打开压成 1ms —— 慢放对转场彻底失效。这正是 v1.8.12 专门修过的老毛病
     // （当时是硬编码 0.0），v2.1.8 加瞬时打开时又踩回去了。慢放优先级高于瞬时打开。
-    if (gEnabled && gMode != 1 && gInstantTransition) return 0.001;
+    // v2.3.3（审查 P0）：原来硬编码 return 0.001，绕过了 FloorDuration 下限。
+    // 转场是最容易出完成回调配对故障的路径，必须受下限保护，与滚动瞬切分支一致。
+    if (gEnabled && gMode != 1 && gInstantTransition) return SIO_floor();
     double d = SIO_targetDuration(0.35);
     if (gEnabled && gMode != 1 && gTransBoost > 1.0001 && d > 0.0) {
         d = d * gInvTrans;   // v2.1.11：除法→乘法，与 gInvSpeed / gInvLayer 同一套
@@ -2817,7 +2826,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.3.2 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
+    NSLog(@"[SIOriginal] v2.3.3 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -3304,9 +3313,13 @@ static BOOL _fbg_isExcluded(void) {
 }
 
 static void _fbg_recalc(void) {
+    BOOL wasScene = gUseScene;
     gActive   = gFUBGEnabled && !_fbg_isExcluded();
     gUseScene = gActive && gSceneFake;
     gUseAudio = gActive && gAudioKeep;
+    // v2.3.3（审查 P2）：场景伪装关闭时清零上次吞 diff 时间戳，
+    // 避免状态行把"很久以前工作过"误判为"近期仍在工作"。
+    if (!gUseScene && wasScene) gSceneSwallowAt = 0;
 }
 
 static void _fbg_loadPref(void) {
@@ -3666,7 +3679,15 @@ static void _fbg_watchdogStart(void) {
 // 自愈轮询：仅在停摆时重建，兼顾可靠与耗电
 static void _fbg_watchdogFire(__unused NSTimer *t) {
     if (!gUseAudio || !gPhysBg) return;
-    if (gWatchdogBackoff > 0) { gWatchdogBackoff--; return; }
+    // v2.3.3（审查 P2）：退避结束时重置 strike。原来退避期间 strike 保持 ≥3，
+    // 恢复后首次失败就 ++=4 立即再次退避，只剩"一次"重试机会，与注释"连续3次失败才退避"不符。
+    if (gWatchdogBackoff > 0) {
+        if (--gWatchdogBackoff == 0) {
+            gWatchdogStrikes = 0;
+            NSLog(@"[FUBG] watchdog: backoff ended, strike counter reset");
+        }
+        return;
+    }
     @try {
         if (!gPlayer || !gPlayer.isPlaying) {
             NSLog(@"[FUBG] watchdog: player stopped, rebuilding (strike %d)", gWatchdogStrikes + 1);
@@ -3808,7 +3829,14 @@ static void FUBGEntry(void) {
                 if (gUseAudio && gPhysBg) {
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                                    dispatch_get_main_queue(), ^{
-                        if (gPlayer && !gPlayer.isPlaying) [gPlayer play];
+                        // v2.3.3（审查 P1）：原来只在 gPlayer 存在时 play，
+                        // 若 player 已为 nil（_fbg_buildAndPlay 失败/被系统释放），
+                        // 线路变化后音频保活永久失效。与中断恢复对齐，补重建分支。
+                        if (gPlayer) {
+                            if (!gPlayer.isPlaying) [gPlayer play];
+                        } else {
+                            _fbg_buildAndPlay();
+                        }
                     });
                 }
             }];
@@ -3817,7 +3845,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.3.2 (SIOriginal v2.3.2) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.3.3 (SIOriginal v2.3.3) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
