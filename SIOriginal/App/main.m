@@ -42,7 +42,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.4.0";
+static NSString * const SIO_VERSION = @"v2.4.1";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -1358,9 +1358,13 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     [[NSNotificationCenter defaultCenter] postNotificationName:kAppliedNote object:nil];
 }
 
-// 数值键范围与 dylib 接受区间逐项一致（越界值在 dylib 侧会被 clamp/回落 → 假开关）。
+// 数值键范围校验。区间逐项对齐 dylib 的判定：
+//   SIO_reload（SIOriginal.m L1054–L1097）与 App 覆盖读取处（同文件 L1157–L1189）。
+// loInclusive=NO 表示下界严格不等 —— dylib 对 SlowFactor 用 `f > 1.0`，
+// 取等号 1.0 会被判非法并静默回落 2.0；这类「多处一个等号就失效」的边界
+// 必须按严格比较拦下，否则校验放行 / 引擎回落，正是要清理的假开关形态。
 static void SIOCheckRange(NSMutableArray *problems, NSDictionary *d, NSString *key,
-                          double lo, double hi, NSString *scope) {
+                          double lo, double hi, BOOL loInclusive, NSString *scope) {
     id v = d[key];
     if (v == nil) return;   // 缺键 = 走默认，合法
     if (![v isKindOfClass:[NSNumber class]]) {
@@ -1368,18 +1372,24 @@ static void SIOCheckRange(NSMutableArray *problems, NSDictionary *d, NSString *k
         return;
     }
     double x = [v doubleValue];
-    if (x < lo || x > hi)
-        [problems addObject:[NSString stringWithFormat:@"%@%@=%g 越界（合法 %g–%g）", scope, key, x, lo, hi]];
+    if ((loInclusive ? (x < lo) : (x <= lo)) || x > hi)
+        [problems addObject:[NSString stringWithFormat:@"%@%@=%g 越界（合法 %@%g–%g）",
+                             scope, key, x, loInclusive ? @"" : @">", lo, hi]];
 }
 
 - (NSString *)validateConfig:(NSDictionary *)cfg {
     NSMutableArray *problems = [NSMutableArray array];
-    SIOCheckRange(problems, cfg, @"Speed",           1.0,   50.0, @"");
-    SIOCheckRange(problems, cfg, @"SlowFactor",      1.0,   20.0, @"");
-    SIOCheckRange(problems, cfg, @"FloorDuration",   0.005, 0.1,  @"");
-    SIOCheckRange(problems, cfg, @"LayerBoost",      1.0,   10.0, @"");
-    SIOCheckRange(problems, cfg, @"TransitionBoost", 1.0,   3.0,  @"");
-    SIOCheckRange(problems, cfg, @"HUDDelay",        0.05,  0.5,  @"");
+    // v2.4.1（审查修复）：区间原为 SlowFactor 1–20 / HUDDelay 0.05–0.5，与 dylib 不符 ——
+    //   SlowFactor：dylib 实际 (1.0, 10.0]，10<值≤20 被放行却静默回落 2.0（假开关）；
+    //   HUDDelay  ：dylib 实际 [0.02, 1.0]，0.02–0.05 与 0.5–1.0 是合法值却被误拦，
+    //               用户会遇到「配置完全正常却存不进去」。
+    // 两处都会直接伤到 AppOverrides 逐条校验（见下），故一并改为与引擎一致。
+    SIOCheckRange(problems, cfg, @"Speed",           1.0,   50.0, YES, @"");
+    SIOCheckRange(problems, cfg, @"SlowFactor",      1.0,   10.0, NO,  @"");
+    SIOCheckRange(problems, cfg, @"FloorDuration",   0.005, 0.1,  YES, @"");
+    SIOCheckRange(problems, cfg, @"LayerBoost",      1.0,   10.0, YES, @"");
+    SIOCheckRange(problems, cfg, @"TransitionBoost", 1.0,   3.0,  YES, @"");
+    SIOCheckRange(problems, cfg, @"HUDDelay",        0.02,  1.0,  YES, @"");
     id mv = cfg[@"Mode"];
     if (mv && (![mv isKindOfClass:[NSNumber class]] || [mv intValue] < 0 || [mv intValue] > 2))
         [problems addObject:[NSString stringWithFormat:@"Mode=%@ 非法（合法 0/1/2）", mv]];
@@ -1398,6 +1408,11 @@ static void SIOCheckRange(NSMutableArray *problems, NSDictionary *d, NSString *k
             [problems addObject:[NSString stringWithFormat:@"%@ 类型异常（应为数组）", k]];
     }
     // App 专属覆盖逐条校验（导入路径的非法值主要藏在这里）
+    // v2.4.1（审查修复）：补齐 SlowFactor / Mode / 布尔类型三项 —— 覆盖表里
+    // dylib 会逐键判定（SIOriginal.m L1152–L1195），漏判等于校验有洞：
+    //   SlowFactor 漏判时 11–20 被放行却回落 2.0；Mode 漏判时非法值静默沿用全局；
+    //   布尔键写成 NSArray/NSDictionary 时，dylib 侧 [.. boolValue] 会直接抛异常 ——
+    //   这是注入环境下会让宿主 App 闪退的输入，必须在落盘前拦下。
     id ov = cfg[@"AppOverrides"];
     if (ov && ![ov isKindOfClass:[NSDictionary class]]) {
         [problems addObject:@"AppOverrides 类型异常（应为字典）"];
@@ -1409,11 +1424,22 @@ static void SIOCheckRange(NSMutableArray *problems, NSDictionary *d, NSString *k
                 continue;
             }
             NSString *scope = [NSString stringWithFormat:@"[%@] ", bid];
-            SIOCheckRange(problems, e, @"Speed",           1.0,   50.0, scope);
-            SIOCheckRange(problems, e, @"FloorDuration",   0.005, 0.1,  scope);
-            SIOCheckRange(problems, e, @"LayerBoost",      1.0,   10.0, scope);
-            SIOCheckRange(problems, e, @"TransitionBoost", 1.0,   3.0,  scope);
-            SIOCheckRange(problems, e, @"HUDDelay",        0.05,  0.5,  scope);
+            SIOCheckRange(problems, e, @"Speed",           1.0,   50.0, YES, scope);
+            SIOCheckRange(problems, e, @"SlowFactor",      1.0,   10.0, NO,  scope);
+            SIOCheckRange(problems, e, @"FloorDuration",   0.005, 0.1,  YES, scope);
+            SIOCheckRange(problems, e, @"LayerBoost",      1.0,   10.0, YES, scope);
+            SIOCheckRange(problems, e, @"TransitionBoost", 1.0,   3.0,  YES, scope);
+            SIOCheckRange(problems, e, @"HUDDelay",        0.02,  1.0,  YES, scope);
+            id om = e[@"Mode"];
+            if (om && (![om isKindOfClass:[NSNumber class]] || [om intValue] < 0 || [om intValue] > 2))
+                [problems addObject:[NSString stringWithFormat:@"%@Mode=%@ 非法（合法 0/1/2）", scope, om]];
+            for (NSString *bk in @[ @"Enabled", @"Spring", @"Extra", @"ListAccel", @"ZoomAccel",
+                                    @"FastScroll", @"FastTap", @"InstantTransition", @"HUDFast",
+                                    @"WKFastShow", @"FeelProtected", @"HudProtected" ]) {
+                id bv = e[bk];
+                if (bv && ![bv isKindOfClass:[NSNumber class]])
+                    [problems addObject:[NSString stringWithFormat:@"%@%@ 类型异常（应为布尔）", scope, bk]];
+            }
         }
     }
     if (!problems.count) return nil;
