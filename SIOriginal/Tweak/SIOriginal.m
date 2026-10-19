@@ -1,4 +1,13 @@
-// SIOriginal — 原版重制                                        v2.2.3
+// SIOriginal — 原版重制                                        v2.3.1
+//
+// ===================== v2.3.1 保活打磨（三处，省电 / 可观测）=====================
+// 不碰保活机制本身，只改三件事：
+//   · 低电量模式下看门狗周期 3s → 6s（后台保活本来就耗电）；
+//   · 看门狗连续失败退避：原来 player 起不来就每 3 秒重建、永不停止，
+//     现在连续 3 次失败退避约 30s 再试，恢复时打一条日志；
+//   · 统计状态行显示「保活✓/✗」，不用连 Console 就能确认保活有没有生效。
+// 分享卡片（v2.3.0 试做）已按要求整体移除。
+// =========================================================================
 //
 // ==================== v2.2.3 强制安全模式通道修正（真机反馈）====================
 // 现象：按说明在 plist 里手加 SafeBootForceOnce=YES，切回目标 App 毫无反应。
@@ -1259,6 +1268,10 @@ static NSString *SIO_statsStatusLine(void);
 // v2.1.18：Notify 桶归属保活子系统，需要读 gUseScene。单文件编译，gUseScene 定义在
 // 下方 FUBG 段，这里先做暂定声明（C 允许暂定定义与后文带初始化的定义合并，无冲突）。
 static BOOL gUseScene;
+// v2.3.1：统计状态行要显示保活是否生效。gActive / gUseAudio 定义在下方 FUBG 段，
+// 同样先暂定声明（与 gUseScene 同一套路；C 允许暂定定义与后文带初始化的定义合并）。
+static BOOL gActive;
+static BOOL gUseAudio;
 
 static BOOL SIO_bucketSkipped(int slot) {
     // v2.1.18 真 bug 修复：Notify 由 _fbg_willPresent 计数，其闸门是保活侧 gUseScene
@@ -1518,6 +1531,8 @@ static NSString *SIO_statsStatusLine(void) {
         return [NSString stringWithFormat:@"%@  ⛔ 整体黑名单命中", bid];
     NSMutableString *s = [NSMutableString stringWithString:bid];
     if (gSafeMode) [s appendString:@" · 🛡安全模式"];
+    // v2.3.1：保活有没有生效，不用连 Console 也能看见
+    if (gActive) [s appendString:(gUseScene || gUseAudio) ? @" · 保活✓" : @" · 保活✗"];
     if (gListHardGuarded) [s appendString:@" · 列表⛔硬保护"];
     if (gSelfFeelProtected) [s appendString:@" · 手感⛔跳过"];
     if (gSelfHudProtected) [s appendString:@" · HUD⛔跳过"];
@@ -2761,7 +2776,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.2.5 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
+    NSLog(@"[SIOriginal] v2.3.1 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -3581,19 +3596,43 @@ static void _fbg_watchdogFire(NSTimer *t);   // 前向声明：下面 Start 的 
 
 static void _fbg_watchdogStart(void) {
     if (gWatchdog || !gUseAudio || !gPhysBg) return;
-    gWatchdog = [NSTimer scheduledTimerWithTimeInterval:3.0 repeats:YES
+    // v2.3.1（保活打磨）：低电量模式下把自愈周期从 3s 放到 6s。
+    // 后台保活本身就是耗电项，低电量时最不需要它频繁唤醒主线程。
+    BOOL lowPower = NO;
+    @try { lowPower = [NSProcessInfo processInfo].isLowPowerModeEnabled; } @catch (__unused NSException *e) {}
+    NSTimeInterval step = lowPower ? 6.0 : 3.0;
+    gWatchdog = [NSTimer scheduledTimerWithTimeInterval:step repeats:YES
                                                   block:^(NSTimer *t){ _fbg_watchdogFire(t); }];
+    NSLog(@"[FUBG] watchdog started, interval=%.1fs (lowPower=%d)", step, lowPower);
 }
+
+// v2.3.1（保活打磨）：连续失败就退避。
+// 原来只要 player 不在播就每 3 秒重建一次 —— 若这台机器/这个 App 根本起不来音频
+// （没有 audio 后台模式、或 session 被持续抢占），就会变成永不停止的重建 + 打日志。
+// 现在连续 3 次没救回来就退避 10 个周期（约 30s），恢复时打一条日志。
+static int gWatchdogStrikes = 0;
+static int gWatchdogBackoff = 0;
 
 // 自愈轮询：仅在停摆时重建，兼顾可靠与耗电
 static void _fbg_watchdogFire(__unused NSTimer *t) {
     if (!gUseAudio || !gPhysBg) return;
+    if (gWatchdogBackoff > 0) { gWatchdogBackoff--; return; }
     @try {
         if (!gPlayer || !gPlayer.isPlaying) {
-            NSLog(@"[FUBG] watchdog: player stopped, rebuilding");
+            NSLog(@"[FUBG] watchdog: player stopped, rebuilding (strike %d)", gWatchdogStrikes + 1);
             _fbg_activateSession();
             if (gPlayer) { [gPlayer play]; }
             else { _fbg_buildAndPlay(); }
+            if (gPlayer && gPlayer.isPlaying) {
+                if (gWatchdogStrikes > 0)
+                    NSLog(@"[FUBG] watchdog: recovered after %d failed rebuild(s)", gWatchdogStrikes);
+                gWatchdogStrikes = 0;
+            } else if (++gWatchdogStrikes >= 3) {
+                gWatchdogBackoff = 10;
+                NSLog(@"[FUBG] watchdog: 3 consecutive rebuilds failed, backing off ~30s");
+            }
+        } else {
+            gWatchdogStrikes = 0;
         }
     } @catch (__unused NSException *e) {}
 }
@@ -3723,7 +3762,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.2.5 (SIOriginal v2.2.5) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.3.1 (SIOriginal v2.3.1) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
