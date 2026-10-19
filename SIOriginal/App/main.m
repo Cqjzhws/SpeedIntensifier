@@ -1,4 +1,4 @@
-// SIOriginal — 配置 App v2.2.3（TrollStore 安装）
+// SIOriginal — 配置 App v2.2.4（TrollStore 安装）
 // 重制版配套配置器：写 Managed Preferences plist + 发 Darwin 通知热重载。
 // v2.0.0：Tab 卡片式 UI、一键预设、配置导入/导出、注入环境自检、新引擎参数。
 // v2.1.20：① 出厂默认与 dylib 对齐（原来界面显示 ×15、引擎实际 40×，且一保存就降速）；
@@ -42,7 +42,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.2.3";
+static NSString * const SIO_VERSION = @"v2.2.4";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -1223,55 +1223,31 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
 // v2.1.18 注释订正：旧文「手感三项一律默认关」已过时 —— 闪退真凶（长按 init hook）
 // v2.1.2 已整体移除，预设自 v2.1.2 起把加速项全部默认打开（见下方代码）。
 - (void)applyPreset:(NSInteger)i {
-    // v2.1.20：改为「每个预设把它依赖的四项参数全部写明」，不再先铺一层基准值再局部覆盖。
-    // 旧写法把基准（15× / ×3 / ×2 / 0.01s）藏在 switch 之外，改基准会连带改变
-    // 「极速 / 瞬切」的实际效果，而读代码的人看不出这层耦合。
+    // v2.2.4：预设精简为两个 —— 极速 / 瞬切，且**两者都把参数拉满**。
+    // 删掉「标准 / 保守」：在这套引擎里它们只是"更慢"，留着只会让人怀疑自己选错档。
+    // 唯一区别是模式：
+    //   0 = 加速：保留极短的 delay 与时长曲线；
+    //   2 = 瞬切：delay 归零、转场走 1ms、块动画直接踩下限。
+    // ⚠ 在 50× + 0.005 下限这个组合下，两者观感已经非常接近（都撞下限），
+    //   差别主要在"有没有那一点点延迟"以及关键帧动画的处理 —— 这是参数到顶后的必然结果。
     self.swEnabled.on = YES;
-    self.segMode.selectedSegmentIndex = 0;
+    self.segMode.selectedSegmentIndex = (i == 1) ? 2 : 0;
+    self.slSpeed.value = 50.0f;                 // 顶
+    self.segFloor.selectedSegmentIndex = 0;     // 0.005s（底）
+    self.segLayer.selectedSegmentIndex = 4;     // ×10（顶）
+    self.segTrans.selectedSegmentIndex = 3;     // ×3（顶）
     self.segSlow.selectedSegmentIndex = 0;
     self.swSpring.on = YES;
     self.swExtra.on = YES;
-    // v2.1.2：加速项全部默认开（长按加速已随崩溃 hook 一并移除）
     self.swList.on = YES;
     self.swZoom.on = YES;
     self.swFastScroll.on = YES;
     self.swFastTap.on = YES;
     self.swNotify.on = YES;
-    // v2.1.9：预设沿用瞬时打开三件套的默认（开）
     self.swInstant.on = YES;
     self.swHUDFast.on = YES;
     self.swWKFast.on = YES;
-    // v2.1.12：预设统一把 HUD 延迟压到 0.05s（激进抑制转圈闪现）。
-    // 觉得加载圈消失太快、看不出"在加载"，可在手感页调回 0.15s 或更长。
-    self.segHUDDelay.selectedSegmentIndex = 0;
-
-    switch (i) {
-        case 0: // 极速：与 dylib 出厂档完全一致（40× / 显式 ×5 / 转场 ×3 / 0.005s）
-            self.slSpeed.value = (float)SIO_DefSpeed;
-            self.segFloor.selectedSegmentIndex = 0;  // 0.005s
-            self.segLayer.selectedSegmentIndex = 3;  // ×5
-            self.segTrans.selectedSegmentIndex = 3;  // ×3
-            break;
-        case 2: // 保守：倍率回落、下限抬高
-            self.slSpeed.value = 5.0f;
-            self.segFloor.selectedSegmentIndex = 2;  // 0.02s
-            self.segLayer.selectedSegmentIndex = 0;  // ×1
-            self.segTrans.selectedSegmentIndex = 0;  // ×1
-            break;
-        case 3: // 瞬切：时长直接压到下限
-            self.segMode.selectedSegmentIndex = 2;
-            self.slSpeed.value = 15.0f;
-            self.segFloor.selectedSegmentIndex = 1;  // 0.01s
-            self.segLayer.selectedSegmentIndex = 1;  // ×2
-            self.segTrans.selectedSegmentIndex = 2;  // ×2
-            break;
-        default: // 1 = 标准：温和档（15× / 0.01s / 显式 ×3 / 转场 ×2）
-            self.slSpeed.value = 15.0f;
-            self.segFloor.selectedSegmentIndex = 1;  // 0.01s
-            self.segLayer.selectedSegmentIndex = 2;  // ×3
-            self.segTrans.selectedSegmentIndex = 2;  // ×2
-            break;
-    }
+    self.segHUDDelay.selectedSegmentIndex = 0;  // 0.05s
     [self refreshDynamicLabels];
     [[NSNotificationCenter defaultCenter] postNotificationName:kAppliedNote object:nil];
 }
@@ -1742,27 +1718,19 @@ static BOOL gUIDirty = NO;
     self.header = header;
     [self.stack addArrangedSubview:header];
 
-    // v2.1.0：一键预设改为 2×2 大按钮网格，图标 + 文字，比小胶囊好按
-    // v2.1.20（HIG）：emoji → SF Symbols（随 tintColor / 深色模式 / Dynamic Type 自适应）
+    // v2.2.4：预设只剩两个 —— 极速 / 瞬切，一行两个大按钮。
+    // 两者都把所有参数拉满，区别只在模式（加速 / 瞬切）。
     UIButton *p1 = SIOPresetButton(@"hare.fill", @"极速", [UIColor systemGreenColor]);
-    UIButton *p2 = SIOPresetButton(@"speedometer", @"标准", [UIColor systemBlueColor]);
-    UIButton *p3 = SIOPresetButton(@"tortoise.fill", @"保守", [UIColor systemGrayColor]);
-    UIButton *p4 = SIOPresetButton(@"bolt.fill", @"瞬切", [UIColor systemOrangeColor]);
-    p1.tag = 0; p2.tag = 1; p3.tag = 2; p4.tag = 3;
-    for (UIButton *b in @[p1,p2,p3,p4])
+    UIButton *p2 = SIOPresetButton(@"bolt.fill", @"瞬切", [UIColor systemOrangeColor]);
+    p1.tag = 0; p2.tag = 1;
+    for (UIButton *b in @[p1, p2])
         [b addTarget:self action:@selector(preset:) forControlEvents:UIControlEventTouchUpInside];
-    UIStackView *rowA = [[UIStackView alloc] initWithArrangedSubviews:@[p1, p2]];
-    UIStackView *rowB = [[UIStackView alloc] initWithArrangedSubviews:@[p3, p4]];
-    for (UIStackView *r in @[rowA, rowB]) {
-        r.axis = UILayoutConstraintAxisHorizontal;
-        r.distribution = UIStackViewDistributionFillEqually;
-        r.spacing = 10;
-    }
-    UIStackView *presetGrid = [[UIStackView alloc] initWithArrangedSubviews:@[rowA, rowB]];
-    presetGrid.axis = UILayoutConstraintAxisVertical;
-    presetGrid.spacing = 10;
-    [self.stack addArrangedSubview:SIOSectionTitle(@"一键预设 · 点击立即套用并保存")];
-    [self.stack addArrangedSubview:presetGrid];
+    UIStackView *presetRow = [[UIStackView alloc] initWithArrangedSubviews:@[p1, p2]];
+    presetRow.axis = UILayoutConstraintAxisHorizontal;
+    presetRow.distribution = UIStackViewDistributionFillEqually;
+    presetRow.spacing = 10;
+    [self.stack addArrangedSubview:SIOSectionTitle(@"一键拉满 · 点击立即套用并保存")];
+    [self.stack addArrangedSubview:presetRow];
 
     // 总开关 + 模式
     m.swEnabled = [[UISwitch alloc] init];
@@ -1853,7 +1821,7 @@ static BOOL gUIDirty = NO;
 - (void)preset:(UIButton *)b {
     // v2.1.9：预设按钮的文字画在内部 stack 里，titleForState: 恒为 nil，
     // 弹窗标题会变成「套用预设 （null）？」—— 改按 tag 取名字。
-    NSString *name = (@[ @"极速", @"标准", @"保守", @"瞬切" ])[b.tag];
+    NSString *name = (@[ @"极速", @"瞬切" ])[b.tag];
     if (!name) name = @"预设";
     UIAlertController *a = [UIAlertController
         alertControllerWithTitle:[NSString stringWithFormat:@"套用预设 %@？", name]
