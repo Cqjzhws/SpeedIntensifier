@@ -42,7 +42,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.3.3";
+static NSString * const SIO_VERSION = @"v2.4.0";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -243,6 +243,11 @@ static NSArray *SIOConfigKeys(void) {
                   @"HardGuardExtra", @"FeelProtectedExtra", @"HudProtectedExtra",
                   // v2.2.0：安全启动开关
                   @"SafeBootEnabled",
+                  // v2.4.0：用户预设模板（name→快照）与配置变更历史（最多 10 条）。
+                  // App 自用数据，dylib 不读；登记白名单才能随 WriteConfig 落盘。
+                  // ⚠ 快照/历史条目内禁止再嵌套这两个键（见 save() 的剔除逻辑），
+                  //   否则历史套历史，每保存一次 plist 体积翻倍。
+                  @"UserPresets", @"ConfigHistory",
                   @"AppOverrides" ];
     });
     return keys;
@@ -262,6 +267,36 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
                                              (__bridge CFStringRef)NotifyKey, NULL, NULL, YES);
     }
     return ok;
+}
+
+// ---------------------------------------------------------------------------
+// v2.4.0：配置快照（预设模板 / 历史回溯共用）。
+// 快照键 = 引擎 + 手感 + 瞬时三件套 + HUD 延迟 —— 与内置预设 applyPreset 的影响面一致：
+// 黑名单、三份保护名单、FUBG、安全启动、App 专属覆盖**不进快照**，套用预设不影响它们。
+// ---------------------------------------------------------------------------
+static NSArray *SIOSnapshotKeys(void) {
+    static NSArray *k;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        k = @[ @"Enabled", @"Mode", @"Speed", @"SlowFactor", @"Spring", @"Extra",
+               @"ListAccel", @"ZoomAccel", @"FastScroll", @"FastTap",
+               @"LayerBoost", @"FloorDuration", @"TransitionBoost",
+               @"InAppNotify", @"InstantTransition", @"HUDFast", @"WKFastShow", @"HUDDelay" ];
+    });
+    return k;
+}
+
+// 历史/预设列表用的一行摘要（防御性解析，坏数据不崩）
+static NSString *SIOBriefForConfig(NSDictionary *c) {
+    if (![c isKindOfClass:[NSDictionary class]]) return @"（数据异常）";
+    int mode = [c[@"Mode"] respondsToSelector:@selector(intValue)] ? [c[@"Mode"] intValue] : 0;
+    NSString *head;
+    if (mode == 1)      head = [NSString stringWithFormat:@"慢放 ×%.0f", [c[@"SlowFactor"] doubleValue]];
+    else if (mode == 2) head = @"瞬切";
+    else                head = [NSString stringWithFormat:@"加速 ×%.1f", [c[@"Speed"] doubleValue]];
+    return [NSString stringWithFormat:@"%@ · 下限 %.3f · 显式 ×%.0f · 转场 ×%.1f",
+            head, [c[@"FloorDuration"] doubleValue],
+            [c[@"LayerBoost"] doubleValue], [c[@"TransitionBoost"] doubleValue]];
 }
 
 // v2.1.2 一次性迁移：清掉旧版遗留的「长按手势加速」两个键。
@@ -803,6 +838,9 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
 // v2.1.12（审查 N-6）：导入时若版本与本机不同，写入这里由 doImport 提示。
 // 不阻断导入 —— 否则用户升级后旧配置全部作废，比不校验更糟。
 @property (copy) NSString *importWarning;
+// v2.4.0：save() 落盘前合法性校验未通过时的原因描述（nil = 校验通过 / 未触发）。
+// 由 save() 写入，调用方据此区分「写盘失败」与「校验拦截」，给出不同提示。
+@property (copy) NSString *lastValidationError;
 // v2.1.12：HUD 延迟。dylib 侧实现完整（转圈延后多久才显形）且有范围校验，
 // 但 App 侧从来没有入口 —— 不在 SIOConfigKeys 白名单、save() 不写、无 UI，
 // 于是 gHUDDelay 永远锁死在 0.15s。这个参数对「转圈闪一下」的抑制效果影响很大，
@@ -848,6 +886,15 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
 - (BOOL)resetToFactory;
 // v2.2.0（功能增强）：一键安全模式 —— 只关高风险项，不做破坏性清空
 - (void)applySafeModePreset;
+// v2.4.0：预设模板 / 配置历史（快照语义见 SIOSnapshotKeys 注释）
+- (NSDictionary *)snapshotFromControls;            // 控件当前值 → 18 键快照
+- (void)applySnapshotToControls:(NSDictionary *)snap; // 快照 → 控件（防御性，不落盘）
+- (NSString *)validateConfig:(NSDictionary *)cfg;  // nil = 合法，否则问题清单
+- (NSDictionary *)userPresets;                     // name → @{stamp, config}
+- (BOOL)saveUserPreset:(NSString *)name;           // 当前控件存为预设（同名覆盖）
+- (BOOL)deleteUserPreset:(NSString *)name;
+- (NSArray *)historyEntries;                       // 新在上，@{stamp, config}
+- (BOOL)rollbackToHistoryAt:(NSUInteger)idx;       // 回滚；当前配置先入历史可撤销
 @end
 
 @implementation SIOModel
@@ -1049,6 +1096,12 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
 
 - (BOOL)save {
     NSMutableDictionary *cfg = ReadConfig();
+    // v2.4.0：保存前快照（供历史回溯）。必须在下方逐键覆盖前取；
+    // 剔除自引用键（历史/预设自身），否则历史条目嵌套历史，每保存一次体积翻倍。
+    NSMutableDictionary *beforeTmp = [cfg mutableCopy];
+    [beforeTmp removeObjectForKey:@"ConfigHistory"];
+    [beforeTmp removeObjectForKey:@"UserPresets"];
+    NSDictionary *before = beforeTmp;
     cfg[@"Enabled"] = @(self.swEnabled.on);
     cfg[@"Mode"] = @((int)self.segMode.selectedSegmentIndex);
     // v2.1.20：滑杆是 float，直接转 double 会把 15.3 写成 15.299999237060547。
@@ -1148,6 +1201,36 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     }   // v2.3.2：!importing —— 导入路径不做 UI 回写（见上）
     cfg[@"AppOverrides"] = ovOut;
 
+    // =====================================================================
+    // v2.4.0（功能增强）：落盘前合法性校验。
+    // 非法值主要来自两个路径：手工改 plist、跨版本/外来 JSON 导入的 AppOverrides。
+    // 这些值一旦落盘，dylib 侧会 clamp 或回落默认 —— UI 显示与引擎行为脱节，
+    // 正是本项目反复清理的「假开关」形态。校验不过则拒绝落盘并说明原因。
+    // =====================================================================
+    self.lastValidationError = [self validateConfig:cfg];
+    if (self.lastValidationError) {
+        NSLog(@"[SIO] save blocked by validation: %@", self.lastValidationError);
+        return NO;
+    }
+
+    // =====================================================================
+    // v2.4.0（功能增强）：配置变更历史 —— 把「保存前」的快照并入本次写盘，
+    // 单次 IO、单次热重载通知（避免历史记录自身再触发一次 dylib 重载）。
+    // 配置无实际变化（重复点保存）不推入；上限 10 条，新条目在前。
+    // =====================================================================
+    NSMutableDictionary *afterTmp = [cfg mutableCopy];
+    [afterTmp removeObjectForKey:@"ConfigHistory"];
+    [afterTmp removeObjectForKey:@"UserPresets"];
+    if (![before isEqualToDictionary:afterTmp]) {
+        NSMutableArray *hist = [NSMutableArray array];
+        id oldHist = cfg[@"ConfigHistory"];
+        if ([oldHist isKindOfClass:[NSArray class]]) [hist addObjectsFromArray:oldHist];
+        [hist insertObject:@{ @"stamp": @([[NSDate date] timeIntervalSince1970]),
+                              @"config": before } atIndex:0];
+        while (hist.count > 10) [hist removeLastObject];
+        cfg[@"ConfigHistory"] = hist;
+    }
+
     // v2.3.3（审查 P0）：原来 WriteConfig 失败时 WriteAxBatch / WriteUIKitDrag 仍落盘，
     // 但 save 只返回 WriteConfig 的 ok —— 用户看到「保存失败」，辅助功能三项与
     // UIKit 拖拽系数其实已被改，下次保存还会带着这些"幽灵改动"。
@@ -1213,6 +1296,207 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     self.swInstant.on = NO;
     self.segHUDDelay.selectedSegmentIndex = 2;  // 0.15s
     [self refreshDynamicLabels];
+}
+
+#pragma mark - v2.4.0 快照 / 校验 / 预设模板 / 配置历史
+
+- (NSDictionary *)snapshotFromControls {
+    // 与 save() 的控件→键映射保持同一组值（18 键，见 SIOSnapshotKeys）。
+    // 存预设不走 save()：用户可能只想存个模板、不想让引擎配置立即热重载。
+    NSMutableDictionary *s = [NSMutableDictionary dictionary];
+    s[@"Enabled"]  = @(self.swEnabled.on);
+    s[@"Mode"]     = @((int)self.segMode.selectedSegmentIndex);
+    s[@"Speed"]    = @(round(self.slSpeed.value * 10.0) / 10.0);
+    s[@"SlowFactor"] = @(SlowFactorForIndex((int)self.segSlow.selectedSegmentIndex));
+    s[@"Spring"]   = @(self.swSpring.on);
+    s[@"Extra"]    = @(self.swExtra.on);
+    s[@"ListAccel"] = @(self.swList.on);
+    s[@"ZoomAccel"] = @(self.swZoom.on);
+    s[@"FastScroll"] = @(self.swFastScroll.on);
+    s[@"FastTap"]    = @(self.swFastTap.on);
+    s[@"LayerBoost"] = @(LayerBoostForIndex((int)self.segLayer.selectedSegmentIndex));
+    s[@"FloorDuration"] = @(FloorForIndex((int)self.segFloor.selectedSegmentIndex));
+    s[@"TransitionBoost"] = @(TransForIndex((int)self.segTrans.selectedSegmentIndex));
+    s[@"InAppNotify"] = @(self.swNotify.on);
+    s[@"InstantTransition"] = @(self.swInstant.on);
+    s[@"HUDFast"]  = @(self.swHUDFast.on);
+    s[@"WKFastShow"] = @(self.swWKFast.on);
+    s[@"HUDDelay"] = @(HUDDelayForIndex((int)self.segHUDDelay.selectedSegmentIndex));
+    return s;
+}
+
+- (void)applySnapshotToControls:(NSDictionary *)snap {
+    // 全防御性解析：预设/历史数据可能被手工改过，坏值跳过不崩、不越界。
+    if (![snap isKindOfClass:[NSDictionary class]]) return;
+    id v;
+    v = snap[@"Enabled"];      if ([v isKindOfClass:[NSNumber class]]) self.swEnabled.on = [v boolValue];
+    v = snap[@"Mode"];         if ([v isKindOfClass:[NSNumber class]]) { int m = [v intValue];
+                                   if (m >= 0 && m <= 2) self.segMode.selectedSegmentIndex = m; }
+    v = snap[@"Speed"];        if ([v isKindOfClass:[NSNumber class]]) { double s = [v doubleValue];
+                                   if (s >= 1.0 && s <= 50.0) self.slSpeed.value = (float)s; }
+    v = snap[@"SlowFactor"];   if ([v isKindOfClass:[NSNumber class]])
+                                   self.segSlow.selectedSegmentIndex = SlowIndexForFactor([v doubleValue]);
+    v = snap[@"Spring"];       if ([v isKindOfClass:[NSNumber class]]) self.swSpring.on = [v boolValue];
+    v = snap[@"Extra"];        if ([v isKindOfClass:[NSNumber class]]) self.swExtra.on = [v boolValue];
+    v = snap[@"ListAccel"];    if ([v isKindOfClass:[NSNumber class]]) self.swList.on = [v boolValue];
+    v = snap[@"ZoomAccel"];    if ([v isKindOfClass:[NSNumber class]]) self.swZoom.on = [v boolValue];
+    v = snap[@"FastScroll"];   if ([v isKindOfClass:[NSNumber class]]) self.swFastScroll.on = [v boolValue];
+    v = snap[@"FastTap"];      if ([v isKindOfClass:[NSNumber class]]) self.swFastTap.on = [v boolValue];
+    v = snap[@"LayerBoost"];   if ([v isKindOfClass:[NSNumber class]])
+                                   self.segLayer.selectedSegmentIndex = LayerIndexForBoost([v doubleValue]);
+    v = snap[@"FloorDuration"];if ([v isKindOfClass:[NSNumber class]])
+                                   self.segFloor.selectedSegmentIndex = FloorIndexFor([v doubleValue]);
+    v = snap[@"TransitionBoost"]; if ([v isKindOfClass:[NSNumber class]])
+                                   self.segTrans.selectedSegmentIndex = TransIndexFor([v doubleValue]);
+    v = snap[@"InAppNotify"];  if ([v isKindOfClass:[NSNumber class]]) self.swNotify.on = [v boolValue];
+    v = snap[@"InstantTransition"]; if ([v isKindOfClass:[NSNumber class]]) self.swInstant.on = [v boolValue];
+    v = snap[@"HUDFast"];      if ([v isKindOfClass:[NSNumber class]]) self.swHUDFast.on = [v boolValue];
+    v = snap[@"WKFastShow"];   if ([v isKindOfClass:[NSNumber class]]) self.swWKFast.on = [v boolValue];
+    v = snap[@"HUDDelay"];     if ([v isKindOfClass:[NSNumber class]])
+                                   self.segHUDDelay.selectedSegmentIndex = HUDDelayIndexFor([v doubleValue]);
+    [self refreshDynamicLabels];
+    [[NSNotificationCenter defaultCenter] postNotificationName:kAppliedNote object:nil];
+}
+
+// 数值键范围与 dylib 接受区间逐项一致（越界值在 dylib 侧会被 clamp/回落 → 假开关）。
+static void SIOCheckRange(NSMutableArray *problems, NSDictionary *d, NSString *key,
+                          double lo, double hi, NSString *scope) {
+    id v = d[key];
+    if (v == nil) return;   // 缺键 = 走默认，合法
+    if (![v isKindOfClass:[NSNumber class]]) {
+        [problems addObject:[NSString stringWithFormat:@"%@%@ 类型异常（应为数字）", scope, key]];
+        return;
+    }
+    double x = [v doubleValue];
+    if (x < lo || x > hi)
+        [problems addObject:[NSString stringWithFormat:@"%@%@=%g 越界（合法 %g–%g）", scope, key, x, lo, hi]];
+}
+
+- (NSString *)validateConfig:(NSDictionary *)cfg {
+    NSMutableArray *problems = [NSMutableArray array];
+    SIOCheckRange(problems, cfg, @"Speed",           1.0,   50.0, @"");
+    SIOCheckRange(problems, cfg, @"SlowFactor",      1.0,   20.0, @"");
+    SIOCheckRange(problems, cfg, @"FloorDuration",   0.005, 0.1,  @"");
+    SIOCheckRange(problems, cfg, @"LayerBoost",      1.0,   10.0, @"");
+    SIOCheckRange(problems, cfg, @"TransitionBoost", 1.0,   3.0,  @"");
+    SIOCheckRange(problems, cfg, @"HUDDelay",        0.05,  0.5,  @"");
+    id mv = cfg[@"Mode"];
+    if (mv && (![mv isKindOfClass:[NSNumber class]] || [mv intValue] < 0 || [mv intValue] > 2))
+        [problems addObject:[NSString stringWithFormat:@"Mode=%@ 非法（合法 0/1/2）", mv]];
+    // 布尔键必须是 NSNumber —— 手工改 plist 写成字符串会让 dylib 判读失败
+    for (NSString *k in @[ @"Enabled", @"Spring", @"Extra", @"ListAccel", @"ZoomAccel",
+                           @"FastScroll", @"FastTap", @"InAppNotify",
+                           @"InstantTransition", @"HUDFast", @"WKFastShow", @"SafeBootEnabled",
+                           @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep" ]) {
+        id v = cfg[k];
+        if (v && ![v isKindOfClass:[NSNumber class]])
+            [problems addObject:[NSString stringWithFormat:@"%@ 类型异常（应为布尔）", k]];
+    }
+    for (NSString *k in @[ @"Blacklist", @"HardGuardExtra", @"FeelProtectedExtra", @"HudProtectedExtra" ]) {
+        id v = cfg[k];
+        if (v && ![v isKindOfClass:[NSArray class]])
+            [problems addObject:[NSString stringWithFormat:@"%@ 类型异常（应为数组）", k]];
+    }
+    // App 专属覆盖逐条校验（导入路径的非法值主要藏在这里）
+    id ov = cfg[@"AppOverrides"];
+    if (ov && ![ov isKindOfClass:[NSDictionary class]]) {
+        [problems addObject:@"AppOverrides 类型异常（应为字典）"];
+    } else if ([ov isKindOfClass:[NSDictionary class]]) {
+        for (id bid in ov) {
+            id e = ov[bid];
+            if (![bid isKindOfClass:[NSString class]] || ![e isKindOfClass:[NSDictionary class]]) {
+                [problems addObject:@"AppOverrides 存在结构异常条目"];
+                continue;
+            }
+            NSString *scope = [NSString stringWithFormat:@"[%@] ", bid];
+            SIOCheckRange(problems, e, @"Speed",           1.0,   50.0, scope);
+            SIOCheckRange(problems, e, @"FloorDuration",   0.005, 0.1,  scope);
+            SIOCheckRange(problems, e, @"LayerBoost",      1.0,   10.0, scope);
+            SIOCheckRange(problems, e, @"TransitionBoost", 1.0,   3.0,  scope);
+            SIOCheckRange(problems, e, @"HUDDelay",        0.05,  0.5,  scope);
+        }
+    }
+    if (!problems.count) return nil;
+    // 问题最多列 8 条，避免超长弹窗
+    NSString *joined = [[problems subarrayWithRange:
+        NSMakeRange(0, MIN(problems.count, 8))] componentsJoinedByString:@"\n"];
+    if (problems.count > 8)
+        joined = [NSString stringWithFormat:@"%@\n…共 %lu 项问题", joined, (unsigned long)problems.count];
+    return joined;
+}
+
+- (NSDictionary *)userPresets {
+    id p = [NSDictionary dictionaryWithContentsOfFile:PrefPath][@"UserPresets"];
+    return [p isKindOfClass:[NSDictionary class]] ? p : @{};
+}
+
+- (BOOL)saveUserPreset:(NSString *)name {
+    if (!name.length) return NO;
+    // 局部变量命名 cfg：契约工具（config_contract.py）按 cfg[@"K"]= 抓写入路径，
+    // 换个名字会被误报成「白名单登记但永不写入」的死配置。
+    NSMutableDictionary *cfg = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
+    if (!cfg) cfg = [NSMutableDictionary dictionary];
+    NSMutableDictionary *p = [cfg[@"UserPresets"] isKindOfClass:[NSDictionary class]]
+                             ? [cfg[@"UserPresets"] mutableCopy] : [NSMutableDictionary dictionary];
+    p[name] = @{ @"stamp": @([[NSDate date] timeIntervalSince1970]),
+                 @"config": [self snapshotFromControls] };
+    cfg[@"UserPresets"] = p;
+    // 只动 App 自用的 UserPresets 键，引擎键不变 —— 不需要发热重载通知
+    return [cfg writeToFile:PrefPath atomically:YES];
+}
+
+- (BOOL)deleteUserPreset:(NSString *)name {
+    NSMutableDictionary *cfg = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
+    if (!cfg) return NO;
+    NSMutableDictionary *p = [cfg[@"UserPresets"] isKindOfClass:[NSDictionary class]]
+                             ? [cfg[@"UserPresets"] mutableCopy] : nil;
+    if (!p[name]) return NO;
+    [p removeObjectForKey:name];
+    cfg[@"UserPresets"] = p;
+    return [cfg writeToFile:PrefPath atomically:YES];
+}
+
+- (NSArray *)historyEntries {
+    id h = [NSDictionary dictionaryWithContentsOfFile:PrefPath][@"ConfigHistory"];
+    if (![h isKindOfClass:[NSArray class]]) return @[];
+    NSMutableArray *out = [NSMutableArray array];
+    for (id e in h) {
+        // 防御：缺 config 的坏条目直接丢弃，不显示更不参与回滚
+        if ([e isKindOfClass:[NSDictionary class]] &&
+            [e[@"config"] isKindOfClass:[NSDictionary class]]) [out addObject:e];
+    }
+    return out;
+}
+
+- (BOOL)rollbackToHistoryAt:(NSUInteger)idx {
+    NSArray *hist = [self historyEntries];
+    if (idx >= hist.count) return NO;
+    NSDictionary *snap = hist[idx][@"config"];
+    NSMutableDictionary *cur = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
+    if (!cur) cur = [NSMutableDictionary dictionary];
+    // 回滚前把当前配置推入历史 —— 这次回滚本身可再被回滚（撤销）
+    NSMutableDictionary *beforeTmp = [cur mutableCopy];
+    [beforeTmp removeObjectForKey:@"ConfigHistory"];
+    [beforeTmp removeObjectForKey:@"UserPresets"];
+    NSMutableArray *h = [hist mutableCopy];
+    [h insertObject:@{ @"stamp": @([[NSDate date] timeIntervalSince1970]),
+                       @"config": beforeTmp } atIndex:0];
+    while (h.count > 10) [h removeLastObject];
+    // 全量回溯：快照存的是保存前的完整白名单配置，逐项还原；
+    // 快照里缺的键（如新版才加的）从当前配置摘掉，回到当时语义（dylib 走默认）。
+    for (NSString *k in SIOConfigKeys()) {
+        if ([k isEqualToString:@"ConfigHistory"] || [k isEqualToString:@"UserPresets"]) continue;
+        if (snap[k]) cur[k] = snap[k];
+        else [cur removeObjectForKey:k];
+    }
+    cur[@"ConfigHistory"] = h;
+    BOOL ok = [cur writeToFile:PrefPath atomically:YES];
+    if (ok) {
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                             (__bridge CFStringRef)NotifyKey, NULL, NULL, YES);
+        [self loadControlValues];   // 四个页面控件统一回显
+    }
+    return ok;
 }
 
 - (NSString *)summary {
@@ -1702,9 +1986,13 @@ static BOOL gUIDirty = NO;
         [self presentViewController:a animated:YES completion:nil];
     } else {
         [fg notificationOccurred:UINotificationFeedbackTypeError];
+        // v2.4.0：校验拦截与写盘失败分开提示 —— 前者是配置内容问题，后者是权限问题
+        BOOL blocked = self.model.lastValidationError.length > 0;
         UIAlertController *a = [UIAlertController
-            alertControllerWithTitle:@"❌ 保存失败"
-            message:@"无法写入 com.apple.UIKit.plist，请确认 TrollStore 权限正常。"
+            alertControllerWithTitle:blocked ? @"⚠️ 配置校验未通过" : @"❌ 保存失败"
+            message:blocked
+                ? [NSString stringWithFormat:@"已阻止落盘，请修正以下问题：\n%@", self.model.lastValidationError]
+                : @"无法写入 com.apple.UIKit.plist，请确认 TrollStore 权限正常。"
             preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:a animated:YES completion:nil];
@@ -1744,6 +2032,12 @@ static BOOL gUIDirty = NO;
     presetRow.spacing = 10;
     [self.stack addArrangedSubview:SIOSectionTitle(@"一键拉满 · 点击立即套用并保存")];
     [self.stack addArrangedSubview:presetRow];
+
+    // v2.4.0：场景预设 —— 保存当前参数为模板 / 一键切换 / 删除。
+    // 与内置预设同一交互（套用前确认、套用即保存热重载），操作路径一步到位。
+    UIButton *up = SIOPill(@"📁 我的预设 · 场景一键切换", [UIColor systemPurpleColor], [UIColor whiteColor]);
+    [up addTarget:self action:@selector(userPresetsTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.stack addArrangedSubview:up];
 
     // 总开关 + 模式
     m.swEnabled = [[UISwitch alloc] init];
@@ -1844,14 +2138,138 @@ static BOOL gUIDirty = NO;
     [a addAction:[UIAlertAction actionWithTitle:@"套用并保存" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *x) {
         [self.model applyPreset:b.tag];
         BOOL ok = [self.model save];
+        // v2.4.0：区分校验拦截与写盘失败，提示与事实一致
+        NSString *failMsg = self.model.lastValidationError.length
+            ? [NSString stringWithFormat:@"配置未通过合法性校验，已阻止落盘：\n%@", self.model.lastValidationError]
+            : @"请确认 TrollStore 写权限。";
         UIAlertController *r = [UIAlertController
-            alertControllerWithTitle:ok ? [NSString stringWithFormat:@"✅ %@ 已生效", name] : @"❌ 保存失败"
-            message:ok ? [self.model summary] : @"请确认 TrollStore 写权限。"
+            alertControllerWithTitle:ok ? [NSString stringWithFormat:@"✅ %@ 已生效", name]
+                                        : (self.model.lastValidationError.length ? @"⚠️ 校验未通过" : @"❌ 保存失败")
+            message:ok ? [self.model summary] : failMsg
             preferredStyle:UIAlertControllerStyleAlert];
         [r addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:r animated:YES completion:nil];
     }]];
     [self presentViewController:a animated:YES completion:nil];
+}
+
+#pragma mark - v2.4.0 场景预设（用户模板）
+
+- (void)userPresetsTapped {
+    NSDictionary *presets = [self.model userPresets];
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:@"我的预设"
+        message:presets.count
+            ? @"点预设名 = 套用并保存（黑名单与 App 专属覆盖不受影响）。"
+            : @"还没有预设。\n先把参数调好，再点下方「保存当前为预设」。"
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    for (NSString *name in [presets.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+        id p = presets[name];
+        NSString *title = name;
+        if ([p isKindOfClass:[NSDictionary class]])
+            title = [NSString stringWithFormat:@"%@ — %@", name, SIOBriefForConfig(p[@"config"])];
+        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault
+            handler:^(__unused UIAlertAction *x) { [self confirmApplyUserPreset:name]; }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"💾 保存当前为预设" style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *x) { [self saveCurrentAsPreset]; }]];
+    if (presets.count) {
+        [sheet addAction:[UIAlertAction actionWithTitle:@"🗑 删除预设…" style:UIAlertActionStyleDestructive
+            handler:^(__unused UIAlertAction *x) { [self deletePresetFlow]; }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    // iPad 下 action sheet 必须挂锚点，否则直接崩
+    sheet.popoverPresentationController.sourceView = self.view;
+    sheet.popoverPresentationController.sourceRect =
+        CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 0, 0);
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)confirmApplyUserPreset:(NSString *)name {
+    id p = [self.model userPresets][name];
+    NSDictionary *snap = [p isKindOfClass:[NSDictionary class]] ? p[@"config"] : nil;
+    if (![snap isKindOfClass:[NSDictionary class]]) {
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:@"预设数据异常"
+            message:@"该预设内容已损坏，请删除后重新保存。"
+            preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:[NSString stringWithFormat:@"套用预设「%@」？", name]
+        message:[NSString stringWithFormat:@"%@\n\n会覆盖当前引擎/手感参数并立即保存热重载；"
+                 "黑名单与 App 专属覆盖不受影响。", SIOBriefForConfig(snap)]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"套用并保存" style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *x) {
+            [self.model applySnapshotToControls:snap];
+            BOOL ok = [self.model save];
+            if (ok) [self refreshHeader];
+            NSString *failMsg = self.model.lastValidationError.length
+                ? [NSString stringWithFormat:@"配置未通过合法性校验，已阻止落盘：\n%@", self.model.lastValidationError]
+                : @"请确认 TrollStore 写权限。";
+            UIAlertController *r = [UIAlertController
+                alertControllerWithTitle:ok ? [NSString stringWithFormat:@"✅ 「%@」已生效", name]
+                                            : (self.model.lastValidationError.length ? @"⚠️ 校验未通过" : @"❌ 保存失败")
+                message:ok ? [self.model summary] : failMsg
+                preferredStyle:UIAlertControllerStyleAlert];
+            [r addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:r animated:YES completion:nil];
+        }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)saveCurrentAsPreset {
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"保存当前为预设"
+        message:@"把当前引擎/手感参数存成场景预设（不含黑名单与 App 专属覆盖）；同名会覆盖。存预设本身不改变正在生效的配置。"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"例如：游戏 / 刷视频 / 省电";
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *x) {
+            NSString *name = [a.textFields.firstObject.text
+                stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (!name.length) name = @"未命名预设";
+            if (name.length > 20) name = [name substringToIndex:20];
+            BOOL ok = [self.model saveUserPreset:name];
+            UIAlertController *r = [UIAlertController
+                alertControllerWithTitle:ok ? [NSString stringWithFormat:@"✅ 已保存预设「%@」", name] : @"❌ 保存失败"
+                message:ok ? @"之后在这里一键切换；套用时会先确认再保存。" : @"无法写入 plist，请确认 TrollStore 权限。"
+                preferredStyle:UIAlertControllerStyleAlert];
+            [r addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:r animated:YES completion:nil];
+        }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)deletePresetFlow {
+    NSDictionary *presets = [self.model userPresets];
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:@"删除预设" message:@"选择要删除的预设（不影响当前生效配置）。"
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    for (NSString *name in [presets.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+        [sheet addAction:[UIAlertAction actionWithTitle:name style:UIAlertActionStyleDestructive
+            handler:^(__unused UIAlertAction *x) {
+                BOOL ok = [self.model deleteUserPreset:name];
+                UIAlertController *r = [UIAlertController
+                    alertControllerWithTitle:ok ? [NSString stringWithFormat:@"已删除「%@」", name] : @"删除失败"
+                    message:nil preferredStyle:UIAlertControllerStyleAlert];
+                [r addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                [self presentViewController:r animated:YES completion:nil];
+            }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    sheet.popoverPresentationController.sourceView = self.view;
+    sheet.popoverPresentationController.sourceRect =
+        CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 0, 0);
+    [self presentViewController:sheet animated:YES completion:nil];
 }
 
 @end
@@ -2025,6 +2443,7 @@ static BOOL gUIDirty = NO;
 @interface SIOAdvancedVC : SIOPageVC <UITextFieldDelegate>
 @property (strong) UITextView *reportView;
 @property (strong) UIButton  *checkPill;   // v2.1.9：保留引用以便点击后改标题给反馈
+@property (strong) UIButton  *clonePill;   // v2.4.0：克隆按钮点击反馈同款
 // v2.1.12（F-A）：请求目标 App 上报 hook 命中统计
 - (void)doRequestStats;
 @end
@@ -2086,6 +2505,7 @@ static BOOL gUIDirty = NO;
     UIButton *cloneBtn = SIOPill(@"从当前全局配置复制", [UIColor systemIndigoColor], [UIColor whiteColor]);
     [cloneBtn addTarget:self action:@selector(cloneGlobalToOverride)
          forControlEvents:UIControlEventTouchUpInside];
+    self.clonePill = cloneBtn;   // v2.4.0：点击反馈改标题用
 
     [self.stack addArrangedSubview:SIOCard(@[
         m.ovBundle,
@@ -2129,6 +2549,17 @@ static BOOL gUIDirty = NO;
     // 原来写死 38 会与子按钮的 >=44 直接冲突（Auto Layout 会断一条约束并打日志）。
     [ioRow.heightAnchor constraintGreaterThanOrEqualToConstant:44].active = YES;
     [self.stack addArrangedSubview:ioRow];
+
+    // ---- v2.4.0：配置历史（回溯 / 一键回滚）----
+    // 每次保存时自动记录「保存前」的配置（无变化不记），上限 10 条；
+    // 回滚前会把当前配置也压入历史 —— 回滚本身可再被回滚，等于自带撤销。
+    [self.stack addArrangedSubview:SIOSectionTitle(@"配置历史（最近 10 次变更）")];
+    UIButton *histBtn = SIOPill(@"🕘 查看历史 / 一键回滚", [UIColor systemBrownColor], [UIColor whiteColor]);
+    [histBtn addTarget:self action:@selector(showHistory) forControlEvents:UIControlEventTouchUpInside];
+    UILabel *histHint = SIOLabel(
+        @"每次保存自动记录变更前的配置；回滚会先把当前配置存入历史，可再次回滚撤销。",
+        12, [UIColor secondaryLabelColor]);
+    [self.stack addArrangedSubview:SIOCard(@[ histBtn, histHint ], 10)];
 
     // ---- 自检 ----
     // v2.1.9：按钮点击加可感知反馈（标题变化 + 震动 + 报告加时间戳），
@@ -2265,6 +2696,19 @@ static BOOL gUIDirty = NO;
     [self ovSpeedChanged];
     [self.model refreshDynamicLabels];
     [self ovToggled];
+    // v2.4.0：结果反馈 —— 震动 + 按钮标题短暂变化（与「重新检测」同一反馈模式），
+    // 明确告知复制了多少项、还差哪一步（保存）才生效。
+    UIImpactFeedbackGenerator *fb = [[UIImpactFeedbackGenerator alloc]
+                                     initWithStyle:UIImpactFeedbackStyleLight];
+    [fb impactOccurred];
+    if (self.clonePill) {
+        [self.clonePill setTitle:@"✅ 已复制 15 项 · 点右上角「保存」生效"
+                        forState:UIControlStateNormal];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [self.clonePill setTitle:@"从当前全局配置复制" forState:UIControlStateNormal];
+        });
+    }
 }
 - (void)ovToggled {
     SIOModel *m = self.model;
@@ -2291,6 +2735,69 @@ static BOOL gUIDirty = NO;
         m.ovGuard.text = [NSString stringWithFormat:@"保存后将删除 %@ 的专属配置，回到全局配置。", scope];
         m.ovGuard.textColor = [UIColor secondaryLabelColor];
     }
+}
+
+#pragma mark - v2.4.0 配置历史（回溯 / 一键回滚）
+
+- (void)showHistory {
+    NSArray *hist = [self.model historyEntries];
+    if (!hist.count) {
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:@"暂无历史"
+            message:@"保存一次配置后自动开始记录（无实际变化的保存不记录）。"
+            preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:@"配置历史（新在上）"
+        message:@"选择一条回滚到当时的配置；当前配置会自动存入历史，可再次回滚撤销。"
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    static NSDateFormatter *fmt = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"MM-dd HH:mm";
+    });
+    for (NSUInteger i = 0; i < hist.count; i++) {
+        NSDictionary *e = hist[i];
+        double ts = [e[@"stamp"] doubleValue];
+        NSString *when = ts > 0 ? [fmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:ts]] : @"未知时间";
+        NSString *title = [NSString stringWithFormat:@"%@ · %@", when, SIOBriefForConfig(e[@"config"])];
+        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault
+            handler:^(__unused UIAlertAction *x) { [self confirmRollback:i]; }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    sheet.popoverPresentationController.sourceView = self.view;
+    sheet.popoverPresentationController.sourceRect =
+        CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 0, 0);
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)confirmRollback:(NSUInteger)idx {
+    NSArray *hist = [self.model historyEntries];
+    if (idx >= hist.count) return;
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"确认回滚？"
+        message:[NSString stringWithFormat:@"将还原为：\n%@\n\n当前配置会先存入历史，可再次回滚撤销。",
+                 SIOBriefForConfig(hist[idx][@"config"])]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"回滚" style:UIAlertActionStyleDestructive
+        handler:^(__unused UIAlertAction *x) {
+            BOOL ok = [self.model rollbackToHistoryAt:idx];
+            [self.model refreshOverrides];
+            [self doCheck];
+            [[NSNotificationCenter defaultCenter] postNotificationName:kAppliedNote object:nil];
+            UIAlertController *r = [UIAlertController
+                alertControllerWithTitle:ok ? @"✅ 已回滚并热重载" : @"❌ 回滚失败"
+                message:ok ? [self.model summary] : @"无法写入 com.apple.UIKit.plist，请确认 TrollStore 权限。"
+                preferredStyle:UIAlertControllerStyleAlert];
+            [r addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:r animated:YES completion:nil];
+        }]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (void)doExport {
@@ -2330,11 +2837,23 @@ static BOOL gUIDirty = NO;
     [self.model refreshOverrides];
     [self doCheck];
     // v2.1.12（N-6）：跨版本导入的警告拼在成功消息后面，不阻断
-    NSString *msg = ok ? [self.model summary] : @"控件已更新，但 plist 写入失败，请检查权限。";
-    if (ok && self.model.importWarning.length)
-        msg = [NSString stringWithFormat:@"%@\n\n%@", self.model.importWarning, [self.model summary]];
+    // v2.4.0：失败时区分「导入内容校验未过」（内容问题）与「写盘失败」（权限问题）
+    NSString *msg;
+    NSString *title;
+    if (ok) {
+        msg = [self.model summary];
+        title = @"✅ 导入成功并已保存";
+        if (self.model.importWarning.length)
+            msg = [NSString stringWithFormat:@"%@\n\n%@", self.model.importWarning, [self.model summary]];
+    } else if (self.model.lastValidationError.length) {
+        title = @"⚠️ 导入内容未通过校验";
+        msg = [NSString stringWithFormat:@"已阻止落盘，导入内容存在以下问题：\n%@", self.model.lastValidationError];
+    } else {
+        title = @"⚠️ 已导入但保存失败";
+        msg = @"控件已更新，但 plist 写入失败，请检查权限。";
+    }
     UIAlertController *a = [UIAlertController
-        alertControllerWithTitle:ok ? @"✅ 导入成功并已保存" : @"⚠️ 已导入但保存失败"
+        alertControllerWithTitle:title
         message:msg
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
