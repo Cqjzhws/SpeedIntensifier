@@ -1,4 +1,4 @@
-// SIOriginal — 原版重制                                        v2.3.1
+// SIOriginal — 原版重制                                        v2.3.2
 //
 // ===================== v2.3.1 保活打磨（三处，省电 / 可观测）=====================
 // 不碰保活机制本身，只改三件事：
@@ -555,6 +555,9 @@ static BOOL     gSelfFeelProtected = NO;
 // 状态全部落在一个进程内标记文件（目标 App 自己的 Caches 目录，无需任何权限）。
 // ---------------------------------------------------------------------------
 static BOOL     gSafeBootEnabled = YES;   // plist 键 SafeBootEnabled，默认开
+// v2.3.2（外部审查 P1-1）：上一次成功吞掉 backgrounding scene diff 的时刻，
+// 用于统计状态行判断「场景伪装现在是否真的在工作」（而不是只看配置位）。
+static NSTimeInterval gSceneSwallowAt = 0;
 static BOOL     gSafeMode        = NO;    // 本次启动是否已进入安全模式
 static BOOL     gSafeArmed       = NO;    // 标记已写、尚未确认「健康」
 static int      gSafeCrashCount  = 0;     // 连续「未走到健康点」的启动次数
@@ -984,14 +987,20 @@ static void SIO_applySafeMode(void) {
 // 从关改开不再需要重启目标 App —— 但已经挂在屏幕上的滚动视图要有人去摸一遍，
 // 否则要等它下次入窗。这里在「手感由关变开」的那一次 reload 里扫一遍前台视图树。
 // 上限 800 节点：只会在改配置时跑一次，不在任何热路径上。
-static void SIO_feelSweep(void) {
-    if (!gFastScroll && !gFastTap) return;
-    if (gBlockedFast || gSelfFeelProtected) return;
+// v2.3.2（外部审查 §2.1）：改为返回「是否真的扫到了前台场景」。
+// 原来返回 void，reload 里无条件把 gFeelApplied 置 YES —— 如果当时目标 App 还在后台
+// （connectedScenes 里没有 foregroundActive），这一趟等于白扫，然后再也不会重试，
+// 用户看到的就是「开了滑行加速没反应」。现在扫不到就保持 NO，回前台时补扫。
+static BOOL SIO_feelSweep(void) {
+    if (!gFastScroll && !gFastTap) return NO;
+    if (gBlockedFast || gSelfFeelProtected) return NO;
+    BOOL scanned = NO;
     @try {
         for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
             if (![sc isKindOfClass:[UIWindowScene class]]) continue;
             UIWindowScene *ws = (UIWindowScene *)sc;
             if (ws.activationState != UISceneActivationStateForegroundActive) continue;
+            scanned = YES;
             for (UIWindow *w in ws.windows) {
                 NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
                 NSUInteger visited = 0;
@@ -1012,6 +1021,7 @@ static void SIO_feelSweep(void) {
             }
         }
     } @catch (__unused NSException *e) {}
+    return scanned;
 }
 
 static void SIO_reload(void) {
@@ -1199,8 +1209,13 @@ static void SIO_reload(void) {
     // 这是把 feel 钩子改成常装 + 运行时闸门之后必须补的一步，否则用户仍会觉得
     // 「开了没反应，要重启 App」——只不过原因从「钩子没装」变成了「旧视图没被扫到」。
     BOOL feelOn = (!gBlockedFast && !gSelfFeelProtected && (gFastScroll || gFastTap));
-    if (feelOn && !gFeelApplied) dispatch_async(dispatch_get_main_queue(), ^{ SIO_feelSweep(); });
-    gFeelApplied = feelOn;
+    // v2.3.2：只有「真的扫到前台场景」才算已施加；扫不到（App 在后台）就留 NO，
+    // 等 SIO_onDidBecomeActive 补扫 —— 否则会永久卡在「开了没反应」。
+    if (feelOn && !gFeelApplied) {
+        dispatch_async(dispatch_get_main_queue(), ^{ gFeelApplied = SIO_feelSweep(); });
+    } else if (!feelOn) {
+        gFeelApplied = NO;
+    }
 }
 
 static void SIO_installiOS16Extras(void); // forward declaration
@@ -1237,7 +1252,7 @@ static NSString *SIO_modeSummary(void) {
     // 只在非默认值时附加额外档位，提示尽量短
     NSMutableString *s = [NSMutableString stringWithFormat:@"SIOriginal · %@", m];
     // v2.2.0：安全模式必须在提示里可见，否则用户会以为"加速怎么变弱了"
-    if (gSafeMode) [s insertString:@"🛡安全模式 · " atIndex:0];
+    if (gSafeMode && gSafeBootEnabled) [s insertString:@"🛡安全模式 · " atIndex:0];
     if (gLayerBoost > 1.0001) [s appendFormat:@" · 显式×%.0f", gLayerBoost];
     if (gTransBoost > 1.0001) [s appendFormat:@" · 转场×%.1f", gTransBoost];
     if (fabs(gFloorDuration - 0.01) > 0.0001)
@@ -1268,10 +1283,11 @@ static NSString *SIO_statsStatusLine(void);
 // v2.1.18：Notify 桶归属保活子系统，需要读 gUseScene。单文件编译，gUseScene 定义在
 // 下方 FUBG 段，这里先做暂定声明（C 允许暂定定义与后文带初始化的定义合并，无冲突）。
 static BOOL gUseScene;
-// v2.3.1：统计状态行要显示保活是否生效。gActive / gUseAudio 定义在下方 FUBG 段，
-// 同样先暂定声明（与 gUseScene 同一套路；C 允许暂定定义与后文带初始化的定义合并）。
+// v2.3.1：统计状态行要显示保活是否生效。gActive / gUseAudio / gPlayer 定义在下方
+// FUBG 段，同样先暂定声明（与 gUseScene 同一套路；C 允许暂定定义与后文带初始化的定义合并）。
 static BOOL gActive;
 static BOOL gUseAudio;
+static AVAudioPlayer *gPlayer;
 
 static BOOL SIO_bucketSkipped(int slot) {
     // v2.1.18 真 bug 修复：Notify 由 _fbg_willPresent 计数，其闸门是保活侧 gUseScene
@@ -1530,9 +1546,24 @@ static NSString *SIO_statsStatusLine(void) {
     if (gSelfBlacklisted)
         return [NSString stringWithFormat:@"%@  ⛔ 整体黑名单命中", bid];
     NSMutableString *s = [NSMutableString stringWithString:bid];
-    if (gSafeMode) [s appendString:@" · 🛡安全模式"];
-    // v2.3.1：保活有没有生效，不用连 Console 也能看见
-    if (gActive) [s appendString:(gUseScene || gUseAudio) ? @" · 保活✓" : @" · 保活✗"];
+    // v2.3.2（外部审查 P2-1）：显示与施加必须同一个判定。
+    // SafeBootEnabled=NO 时 SIO_applySafeMode 会直接返回、不施加任何约束，
+    // 但 gSafeMode 仍是 YES —— 原来会显示「🛡安全模式」却什么也没做，纯误导排障。
+    if (gSafeMode && gSafeBootEnabled) [s appendString:@" · 🛡安全模式"];
+    // v2.3.2（外部审查 P1-1）：原来的 ✓/✗ 只反映配置位（gUseScene / gUseAudio）。
+    // 音频连续重建失败进入退避、或 scene diff 匹配随系统版本失效时，面板仍显示 ✓，
+    // 用户不连 Console 依然不知道保活已经挂了 —— 可观测性只达成一半。
+    // 现在：后台态判真实健康，前台态显示「待命」（前台本来就不播、不吞 diff，不能据此判死）。
+    if (gActive) {
+        if (!gPhysBg) {
+            [s appendString:@" · 保活待命"];
+        } else {
+            BOOL audioOK = (gUseAudio && gPlayer && gPlayer.isPlaying);
+            BOOL sceneOK = (gUseScene && gSceneSwallowAt > 0 &&
+                            (CACurrentMediaTime() - gSceneSwallowAt) < 600.0);
+            [s appendString:(audioOK || sceneOK) ? @" · 保活✓" : @" · 保活✗"];
+        }
+    }
     if (gListHardGuarded) [s appendString:@" · 列表⛔硬保护"];
     if (gSelfFeelProtected) [s appendString:@" · 手感⛔跳过"];
     if (gSelfHudProtected) [s appendString:@" · HUD⛔跳过"];
@@ -1658,6 +1689,13 @@ static void SIO_onDidBecomeActive(NSNotification *note) {
     (void)note;
     // v2.2.5：「强制安全模式」测试通道已删除（无实际价值、且需要额外一次 plist 解析）。
     // 安全模式只由自动熔断（连续 3 次启动未达健康点）触发。
+
+    // v2.3.2（外部审查 §2.1）：手感开关是在 App 后台时改的，那次 reload 里的扫描扫不到
+    // 前台场景，gFeelApplied 会保持 NO —— 这里回到前台补扫一次，直到扫成功为止。
+    if (!gFeelApplied && !gBlockedFast && !gSelfFeelProtected && (gFastScroll || gFastTap)) {
+        dispatch_async(dispatch_get_main_queue(), ^{ gFeelApplied = SIO_feelSweep(); });
+    }
+
     if (!sioStatsArmed) return;
     sioStatsArmed = NO;
     SIO_showStatsSoon();
@@ -1716,6 +1754,9 @@ static BOOL SIO_wechatZoomPreviewActive(void) {
     gZoomProbeAt = now;
     // 视图树只能在主线程碰；非主线程直接沿用上一次结果（最多滞后 0.25s）
     if (![NSThread isMainThread]) return gZoomPreviewCached;
+    // v2.3.2（外部审查 P1-4）：滚动中（UITrackingRunLoopMode）不做全树探测。
+    // 这是唯一会掉帧的时刻，而放大态在滚动过程中不会变化 —— 沿用上一次结果即可。
+    if ([NSRunLoop currentRunLoop].currentMode == UITrackingRunLoopMode) return gZoomPreviewCached;
 
     BOOL found = NO;
     @autoreleasepool {
@@ -2776,7 +2817,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.3.1 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
+    NSLog(@"[SIOriginal] v2.3.2 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -2797,7 +2838,9 @@ static void SIOriginalInit(void) {
     // v2.2.2：安全模式必须在**启动时**就看得见。以前只有"配置热重载"才弹提示，
     // 于是用户只会觉得"加速怎么变慢了"，完全不知道原因（真机反馈就是这么来的）。
     // 这里强制弹一次（不受「保存后弹生效提示」开关约束）。
-    if (gSafeMode) {
+    // v2.3.2（外部审查 P2-1）：SafeBootEnabled=NO 时不显示（此时并未施加任何约束，
+    // 显示盾牌只会误导排障）。
+    if (gSafeMode && gSafeBootEnabled) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ SIO_showToastEx(YES); });
     }
@@ -3345,6 +3388,9 @@ static void _fbg_sceneUpdate(id self, SEL _cmd, id arg1, id arg2, id arg3, id ar
     if (gUseScene) {
         @try {
             if (_fbg_isBackgroundingDiff([arg2 description])) {
+                // v2.3.2（外部审查 P1-1）：记下「最近一次真的拦住后台化」的时刻，
+                // 统计状态行据此判断场景伪装是否在工作，而不是只看配置位。
+                gSceneSwallowAt = CACurrentMediaTime();
                 NSLog(@"[FUBG] swallowed backgrounding scene diff");
                 return;
             }
@@ -3594,6 +3640,11 @@ static void _fbg_watchdogStop(void) {
 
 static void _fbg_watchdogFire(NSTimer *t);   // 前向声明：下面 Start 的 block 里要引用
 
+// v2.3.1（保活打磨）+ v2.3.2：看门狗失败计数 / 退避 / 周期。
+// 声明必须在 _fbg_watchdogStart 之前（Start 里会写 gWatchdogStep）。
+static int gWatchdogStrikes = 0;
+static int gWatchdogBackoff = 0;
+static NSTimeInterval gWatchdogStep = 3.0;
 static void _fbg_watchdogStart(void) {
     if (gWatchdog || !gUseAudio || !gPhysBg) return;
     // v2.3.1（保活打磨）：低电量模式下把自愈周期从 3s 放到 6s。
@@ -3601,6 +3652,7 @@ static void _fbg_watchdogStart(void) {
     BOOL lowPower = NO;
     @try { lowPower = [NSProcessInfo processInfo].isLowPowerModeEnabled; } @catch (__unused NSException *e) {}
     NSTimeInterval step = lowPower ? 6.0 : 3.0;
+    gWatchdogStep = step;   // v2.3.2：退避按「秒」换算，不再假设固定 3s
     gWatchdog = [NSTimer scheduledTimerWithTimeInterval:step repeats:YES
                                                   block:^(NSTimer *t){ _fbg_watchdogFire(t); }];
     NSLog(@"[FUBG] watchdog started, interval=%.1fs (lowPower=%d)", step, lowPower);
@@ -3610,8 +3662,6 @@ static void _fbg_watchdogStart(void) {
 // 原来只要 player 不在播就每 3 秒重建一次 —— 若这台机器/这个 App 根本起不来音频
 // （没有 audio 后台模式、或 session 被持续抢占），就会变成永不停止的重建 + 打日志。
 // 现在连续 3 次没救回来就退避 10 个周期（约 30s），恢复时打一条日志。
-static int gWatchdogStrikes = 0;
-static int gWatchdogBackoff = 0;
 
 // 自愈轮询：仅在停摆时重建，兼顾可靠与耗电
 static void _fbg_watchdogFire(__unused NSTimer *t) {
@@ -3628,8 +3678,13 @@ static void _fbg_watchdogFire(__unused NSTimer *t) {
                     NSLog(@"[FUBG] watchdog: recovered after %d failed rebuild(s)", gWatchdogStrikes);
                 gWatchdogStrikes = 0;
             } else if (++gWatchdogStrikes >= 3) {
-                gWatchdogBackoff = 10;
-                NSLog(@"[FUBG] watchdog: 3 consecutive rebuilds failed, backing off ~30s");
+                // v2.3.2（外部审查 P1-2）：原来写死 10 个周期并注释「约 30s」，
+                // 但低电量模式下周期是 6s —— 实际退避 60s，注释与行为不符。
+                // 现在按秒换算，两种模式下都真的退避约 30s。
+                double step = (gWatchdogStep > 0.5) ? gWatchdogStep : 3.0;
+                gWatchdogBackoff = (int)MAX(1.0, round(30.0 / step));
+                NSLog(@"[FUBG] watchdog: 3 consecutive rebuilds failed, backing off %.0fs (%d ticks @ %.1fs)",
+                      30.0, gWatchdogBackoff, step);
             }
         } else {
             gWatchdogStrikes = 0;
@@ -3762,7 +3817,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.3.1 (SIOriginal v2.3.1) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.3.2 (SIOriginal v2.3.2) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");

@@ -1,4 +1,4 @@
-// SIOriginal — 配置 App v2.3.1（TrollStore 安装）
+// SIOriginal — 配置 App v2.3.2（TrollStore 安装）
 // 重制版配套配置器：写 Managed Preferences plist + 发 Darwin 通知热重载。
 // v2.0.0：Tab 卡片式 UI、一键预设、配置导入/导出、注入环境自检、新引擎参数。
 // v2.1.20：① 出厂默认与 dylib 对齐（原来界面显示 ×15、引擎实际 40×，且一保存就降速）；
@@ -42,7 +42,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.3.1";
+static NSString * const SIO_VERSION = @"v2.3.2";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -1084,10 +1084,22 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     NSMutableDictionary *ovOut = [ovAllRaw isKindOfClass:[NSDictionary class]]
                                  ? [ovAllRaw mutableCopy] : [NSMutableDictionary dictionary];
     // v2.1.18（审查 P1-8）：先并入导入带回的覆盖项，再让 UI 当前编辑（下方循环）覆盖同名 bid
-    if (self.importedOverrides.count) {
+    BOOL importing = (self.importedOverrides.count > 0);   // v2.3.2
+    if (importing) {
         [ovOut addEntriesFromDictionary:self.importedOverrides];
         self.importedOverrides = nil;
     }
+    // =====================================================================
+    // v2.3.2 P0 修复（外部审查 P0-1 实锤，v2.2.0 起就有的回归）：
+    // 导入时**绝不能**用当前控件值回写覆盖表。原因：
+    //   importConfig 只把导入的第一个 bundle 填进输入框，没有更新 ovOn/ovSpeed 等控件；
+    //   而 ovIDs 此刻已经把那个 bundle 包含进来了。于是下面的循环会拿「上一个 App 的
+    //   旧控件值」整体覆写它（ovOn=YES），或者直接 removeObjectForKey 把它删掉（ovOn=NO）。
+    //   两种情况都是静默数据损坏，且只坏字典序第一个 bundle —— 极难被发现。
+    // 语义上也说不通：导入是「以导入内容为准」，用户在这一刻并没有编辑覆盖控件。
+    // 因此：导入路径跳过 UI 回写，只保留合并结果；用户随后真正编辑再保存时会正常回写。
+    // =====================================================================
+    if (!importing) {
     for (NSString *ovBid in ovIDs) {
         if (self.ovOn.on) {
             BOOL guarded = [HardGuardBundles() containsObject:ovBid];
@@ -1125,6 +1137,7 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
             [ovOut removeObjectForKey:ovBid];
         }
     }
+    }   // v2.3.2：!importing —— 导入路径不做 UI 回写（见上）
     cfg[@"AppOverrides"] = ovOut;
 
     BOOL ok = WriteConfig(cfg);
@@ -1172,7 +1185,9 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
 - (void)applySafeModePreset {
     self.swEnabled.on = YES;
     self.segMode.selectedSegmentIndex = 0;
-    self.slSpeed.value = 5.0f;
+    // v2.3.2（外部审查 P2-3）：与 dylib 自动熔断的参数对齐（×10 / 0.02s），
+    // 两套「安全模式」用不同数字只会让人困惑。
+    self.slSpeed.value = 10.0f;
     self.segFloor.selectedSegmentIndex = 2;   // 0.02s
     self.segLayer.selectedSegmentIndex = 0;   // ×1
     self.segTrans.selectedSegmentIndex = 1;   // ×1.5
@@ -2379,7 +2394,7 @@ static BOOL gUIDirty = NO;
     UIAlertController *a = [UIAlertController
         alertControllerWithTitle:@"套用安全模式？"
         message:@"会关闭列表加速、缩放加速、滑行惯性、点击零延迟、HUD 加速、"
-                 "网页提前显形、瞬时打开，倍率降到 ×5、下限抬到 0.02s。\n\n"
+                 "网页提前显形、瞬时打开，倍率降到 ×10、下限抬到 0.02s（与自动熔断同一组参数）。\n\n"
                  "不碰黑名单与 App 专属覆盖。这是「某个 App 出问题了」时的快速排障开关。"
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
