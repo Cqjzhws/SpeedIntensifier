@@ -1063,7 +1063,9 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     cfg[@"InstantTransition"] = @(self.swInstant.on);
     cfg[@"HUDFast"] = @(self.swHUDFast.on);
     cfg[@"WKFastShow"] = @(self.swWKFast.on);
-    cfg[@"SafeBootEnabled"] = @(self.swSafeBoot.on);   // v2.2.0
+    // v2.2.0：安全开关必须 fail-safe —— 控件万一还没创建（例如将来改成懒加载 Tab），
+    // 不能因为 self.swSafeBoot 为 nil 就写进一个 NO，把自愈静默关掉。
+    cfg[@"SafeBootEnabled"] = @(self.swSafeBoot ? self.swSafeBoot.on : YES);
     cfg[@"HUDDelay"] = @(HUDDelayForIndex((int)self.segHUDDelay.selectedSegmentIndex));
     cfg[@"Blacklist"] = [self blacklistFromView];
     // v2.1.19：三份额外名单写入
