@@ -1,4 +1,4 @@
-// SIOriginal — 配置 App v2.2.5（TrollStore 安装）
+// SIOriginal — 配置 App v2.3.0（TrollStore 安装）
 // 重制版配套配置器：写 Managed Preferences plist + 发 Darwin 通知热重载。
 // v2.0.0：Tab 卡片式 UI、一键预设、配置导入/导出、注入环境自检、新引擎参数。
 // v2.1.20：① 出厂默认与 dylib 对齐（原来界面显示 ×15、引擎实际 40×，且一保存就降速）；
@@ -41,8 +41,11 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // v2.1.12（F-A）：请求前台 App 弹出 hook 命中统计浮层。
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
+// v2.3.0：请求把统计渲染成图片放进剪贴板（分享卡片）。
+// 必须与 dylib 侧 kNotifyCard 完全一致。
+static NSString * const NotifyCardKey  = @"com.local.sioriginal.requestcard";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.2.5";
+static NSString * const SIO_VERSION = @"v2.3.0";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -2147,7 +2150,21 @@ static BOOL gUIDirty = NO;
          "每次保存配置后计数清零，所以看到的都是当前参数下的分布。",
         12, [UIColor secondaryLabelColor]);
     hsNote.numberOfLines = 0;
-    [self.stack addArrangedSubview:SIOCard(@[ hs, hsNote ], 10)];
+
+    // v2.3.0：分享卡片 —— 把统计渲染成一张图放进剪贴板，微信/QQ 直接粘贴
+    UIButton *cardBtn = SIOPill(@"生成统计卡片（复制到剪贴板）",
+                                [UIColor whiteColor], [UIColor systemIndigoColor]);
+    cardBtn.layer.borderWidth = 1;
+    cardBtn.layer.borderColor = [UIColor systemIndigoColor].CGColor;
+    [cardBtn addTarget:self action:@selector(doRequestCard)
+      forControlEvents:UIControlEventTouchUpInside];
+    UILabel *cardNote = SIOLabel(
+        @"点完切回目标 App，等约 3 秒 —— 屏幕顶部会提示「统计卡片已复制」，"
+        "然后去微信聊天框「粘贴」，直接发图。\n"
+        "不用存相册（注入的 dylib 没有相册写入权限，走剪贴板才安全）。",
+        12, [UIColor secondaryLabelColor]);
+    cardNote.numberOfLines = 0;
+    [self.stack addArrangedSubview:SIOCard(@[ hs, hsNote, cardBtn, cardNote ], 10)];
 
     // ---- v2.2.0：安全与自愈 ----
     [self.stack addArrangedSubview:SIOSectionTitle(@"安全与自愈")];
@@ -2398,6 +2415,23 @@ static BOOL gUIDirty = NO;
             [r addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:r animated:YES completion:nil];
         }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+// v2.3.0：广播「生成统计卡片」请求。dylib 在目标 App 内渲染成图 → 放进剪贴板。
+- (void)doRequestCard {
+    CFNotificationCenterPostNotification(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        (__bridge CFStringRef)NotifyCardKey, NULL, NULL, YES);
+    UIImpactFeedbackGenerator *fb = [[UIImpactFeedbackGenerator alloc]
+        initWithStyle:UIImpactFeedbackStyleMedium];
+    [fb impactOccurred];
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"已广播：生成统计卡片"
+        message:@"现在切回目标 App，等约 3 秒（要先采一段样，否则卡片上全是 0）。\n\n"
+                 "顶部出现「统计卡片已复制」后，去微信聊天框粘贴即可发图。"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
 }
 

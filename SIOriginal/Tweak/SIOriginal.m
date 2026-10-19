@@ -1,4 +1,19 @@
-// SIOriginal — 原版重制                                        v2.2.3
+// SIOriginal — 原版重制                                        v2.3.0
+//
+// ======================== v2.3.0 分享卡片 + 保活打磨 ========================
+// 两个"能用得上"的新东西，都不碰加速语义：
+// [1] 分享卡片：把命中统计渲染成一张 390pt 宽的深色卡片，放进**系统剪贴板**。
+//     为什么不是相册：dylib 跑在目标 App 沙盒里，写相册需要目标 App 声明
+//     NSPhotoLibraryAddUsageDescription —— 我们控制不了微信/顺丰的 Info.plist，
+//     缺这个键去写相册会被系统直接杀进程。剪贴板是跨进程共享的，微信/QQ 都能
+//     直接"粘贴图片"，零权限零风险。
+//     卡片复用统计面板的文本（含"窗口 Ns"），同样走 2.5s 采样窗口，避免 0 命中。
+// [2] 保活打磨（三处，都是省电/可观测，不改保活机制本身）：
+//     · 低电量模式下自愈周期 3s → 6s（后台保活本来就耗电，别再频繁唤醒主线程）；
+//     · 看门狗连续失败退避：原来 player 起不来就每 3 秒重建一次，永不停止；
+//       现在连续 3 次失败退避约 30s 再试，并在恢复时打一条日志；
+//     · 统计状态行显示「保活✓/✗」，不用连 Console 就能确认保活有没有生效。
+// =========================================================================
 //
 // ==================== v2.2.3 强制安全模式通道修正（真机反馈）====================
 // 现象：按说明在 plist 里手加 SafeBootForceOnce=YES，切回目标 App 毫无反应。
@@ -484,6 +499,9 @@
 // v2.1.12（F-A）：配置 App 发这个通知，请求 dylib 在当前前台 App 内弹出命中统计浮层。
 // 名字必须与配置 App 侧 NotifyStatsKey 完全一致，否则按钮按了没反应。
 #define kNotifyStats @"com.local.sioriginal.requeststats"
+// v2.3.0：配置 App 发这个通知，请求把当前统计渲染成图片放进系统剪贴板。
+// 必须与 App 侧 NotifyCardKey 完全一致。
+#define kNotifyCard  @"com.local.sioriginal.requestcard"
 
 // ---------- 配置 ----------
 // v2.1.11 注释订正（行为不变，只改注释）：
@@ -1259,6 +1277,8 @@ static NSString *SIO_statsStatusLine(void);
 // v2.1.18：Notify 桶归属保活子系统，需要读 gUseScene。单文件编译，gUseScene 定义在
 // 下方 FUBG 段，这里先做暂定声明（C 允许暂定定义与后文带初始化的定义合并，无冲突）。
 static BOOL gUseScene;
+// v2.3.0：统计状态行要显示保活是否生效，gActive 定义在下方 FUBG 段，同样先暂定声明。
+static BOOL gActive;
 
 static BOOL SIO_bucketSkipped(int slot) {
     // v2.1.18 真 bug 修复：Notify 由 _fbg_willPresent 计数，其闸门是保活侧 gUseScene
@@ -1398,12 +1418,12 @@ static void SIO_dismissToastIfCurrent(uint32_t gen) {
     SIO_dismissToast();
 }
 
-// v2.2.2：加一个 force 参数 —— 安全模式告知属于「安全信息」，不应该被
-// 「保存后弹生效提示」这个纯偏好开关关掉（用户关掉它只是为了不被每次保存打扰）。
-static void SIO_showToastEx(BOOL force);
-static void SIO_showToast(void) { SIO_showToastEx(NO); }
+// v2.3.0：toast 支持自定义文案（分享卡片要用），force 用于安全模式告知。
+static void SIO_showToastText(NSString *override, BOOL force);
+static void SIO_showToast(void)        { SIO_showToastText(nil, NO); }
+static void SIO_showToastEx(BOOL force){ SIO_showToastText(nil, force); }
 
-static void SIO_showToastEx(BOOL force) {
+static void SIO_showToastText(NSString *override, BOOL force) {
     if (!gInAppNotify && !force) return;
     // 只在目标 App 自己处于前台激活态时提示；SpringBoard/后台不打扰
     UIApplication *app = [UIApplication sharedApplication];
@@ -1448,7 +1468,8 @@ static void SIO_showToastEx(BOOL force) {
 
             UILabel *label = [[UILabel alloc] initWithFrame:card.bounds];
             label.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            label.text = gEnabled ? SIO_modeSummary() : @"SIOriginal · 已暂停";
+            label.text = override.length ? override
+                       : (gEnabled ? SIO_modeSummary() : @"SIOriginal · 已暂停");
             label.textColor = [UIColor colorWithRed:0.49 green:0.91 blue:0.58 alpha:1.0];
             label.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
             label.textAlignment = NSTextAlignmentCenter;
@@ -1518,6 +1539,7 @@ static NSString *SIO_statsStatusLine(void) {
         return [NSString stringWithFormat:@"%@  ⛔ 整体黑名单命中", bid];
     NSMutableString *s = [NSMutableString stringWithString:bid];
     if (gSafeMode) [s appendString:@" · 🛡安全模式"];
+    if (gActive) [s appendString:(gUseScene || gUseAudio) ? @" · 保活✓" : @" · 保活✗"];
     if (gListHardGuarded) [s appendString:@" · 列表⛔硬保护"];
     if (gSelfFeelProtected) [s appendString:@" · 手感⛔跳过"];
     if (gSelfHudProtected) [s appendString:@" · HUD⛔跳过"];
@@ -1619,6 +1641,84 @@ static void SIO_showStatsSoon(void) {
 // v2.1.12（F-A）：收到配置 App 的统计请求 → 在当前前台 App 内弹浮层。
 // 同样遵守 v2.1.10 的竞态约定：Darwin 回调在通知线程，UI 操作必须回主线程。
 // v2.1.15：不再无脑 SIO_showStats()。后台态先挂起请求，回到前台再弹（见 sioStatsArmed 注释）。
+// =========================================================================
+// v2.3.0 分享卡片：把统计面板渲染成一张图，放进系统剪贴板
+// -------------------------------------------------------------------------
+// 为什么走剪贴板而不是相册：
+//   dylib 跑在目标 App 的沙盒里，写相册需要目标 App 声明 NSPhotoLibraryAddUsageDescription。
+//   我们控制不了 WeChat/顺丰的 Info.plist，缺这个键去写相册会被系统直接杀进程。
+//   而 UIPasteboard 是跨进程共享的，微信/QQ 都能直接"粘贴图片"发出去 —— 零权限、零风险。
+// 渲染用 UIGraphicsImageRenderer（不可见离屏），失败就静默放弃，绝不弹异常。
+// =========================================================================
+static UIImage *SIO_statsCardImage(void) {
+    UIImage *img = nil;
+    @try {
+        NSString *body = SIO_statsPanelText();
+        if (!body.length) return nil;
+        CGFloat width = 390, pad = 20, footH = 26;
+        UIFont *bodyFont = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
+        UIFont *footFont = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+        NSMutableParagraphStyle *ps = [[NSMutableParagraphStyle alloc] init];
+        ps.lineSpacing = 4.0;
+        NSDictionary *bodyAttr = @{
+            NSFontAttributeName: bodyFont,
+            NSForegroundColorAttributeName: [UIColor colorWithRed:0.80 green:0.93 blue:1.0 alpha:1.0],
+            NSParagraphStyleAttributeName: ps,
+        };
+        CGRect box = [body boundingRectWithSize:CGSizeMake(width - pad * 2, CGFLOAT_MAX)
+                                        options:NSStringDrawingUsesLineFragmentOrigin
+                                     attributes:bodyAttr
+                                        context:nil];
+        CGFloat height = box.size.height + pad * 2 + footH;
+        UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc]
+                                      initWithSize:CGSizeMake(width, height)];
+        img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+            (void)ctx;
+            UIBezierPath *bg = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, width, height)
+                                                             cornerRadius:18];
+            [[UIColor colorWithRed:0.06 green:0.07 blue:0.10 alpha:1.0] setFill];
+            [bg fill];
+            // 顶部品牌色细条
+            [[UIColor colorWithRed:0.13 green:0.77 blue:0.55 alpha:1.0] setFill];
+            [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, width, 4) cornerRadius:2] fill];
+            [body drawInRect:CGRectMake(pad, pad, width - pad * 2, box.size.height)
+              withAttributes:bodyAttr];
+            NSString *foot = @"SIOriginal · 动画加速引擎";
+            [foot drawAtPoint:CGPointMake(pad, height - footH + 4)
+               withAttributes:@{
+                   NSFontAttributeName: footFont,
+                   NSForegroundColorAttributeName: [UIColor colorWithWhite:1.0 alpha:0.45],
+               }];
+        }];
+    } @catch (__unused NSException *e) { img = nil; }
+    return img;
+}
+
+static void SIO_onCardRequest(CFNotificationCenterRef center, void *observer,
+                              CFNotificationName name, const void *object,
+                              CFDictionaryRef userInfo) {
+    (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+            // v2.3.0：与统计浮层同一套「采样窗口」逻辑 —— 立刻渲染大概率是 0 命中
+            // （刚回到前台、计数可能刚被清零），卡片上写 0 就彻底废了。等 2.5s 再采样。
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @try {
+                    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+                    UIImage *img = SIO_statsCardImage();
+                    if (!img) { NSLog(@"[SIOriginal] stats card render failed"); return; }
+                    [UIPasteboard generalPasteboard].image = img;
+                    NSLog(@"[SIOriginal] stats card copied to pasteboard (%.0fx%.0f)",
+                          img.size.width, img.size.height);
+                    SIO_showToastText(@"统计卡片已复制 · 去微信粘贴即可", YES);
+                } @catch (__unused NSException *e) {}
+            });
+        } @catch (__unused NSException *e) {}
+    });
+}
+
 static void SIO_onStatsRequest(CFNotificationCenterRef center, void *observer,
                                CFNotificationName name, const void *object,
                                CFDictionaryRef userInfo) {
@@ -2568,6 +2668,11 @@ static void SIOriginalInit(void) {
                                     SIO_onStatsRequest,
                                     (__bridge CFStringRef)kNotifyStats, NULL,
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
+    // v2.3.0：请求把统计渲染成图片放进剪贴板（分享卡片）
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                    SIO_onCardRequest,
+                                    (__bridge CFStringRef)kNotifyCard, NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);
     // v2.1.15：常驻后台的 App 收到请求时不是 Active，浮层会被 active 检查挡掉。
     // 这里挂一个回到前台的观察者，把挂起的请求补弹出来。令牌必须持有，
     // 否则 block 观察者随返回值释放、立即自动注销（与 v2.1.10 的 AVAudioSession 同坑）。
@@ -2761,7 +2866,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.2.5 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
+    NSLog(@"[SIOriginal] v2.3.0 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -3581,19 +3686,43 @@ static void _fbg_watchdogFire(NSTimer *t);   // 前向声明：下面 Start 的 
 
 static void _fbg_watchdogStart(void) {
     if (gWatchdog || !gUseAudio || !gPhysBg) return;
-    gWatchdog = [NSTimer scheduledTimerWithTimeInterval:3.0 repeats:YES
+    // v2.3.0（保活打磨）：低电量模式下把自愈周期从 3s 放到 6s。
+    // 后台保活本身就是耗电项，用户在低电量模式下最不需要它频繁唤醒主线程。
+    BOOL lowPower = NO;
+    @try { lowPower = [NSProcessInfo processInfo].isLowPowerModeEnabled; } @catch (__unused NSException *e) {}
+    NSTimeInterval step = lowPower ? 6.0 : 3.0;
+    gWatchdog = [NSTimer scheduledTimerWithTimeInterval:step repeats:YES
                                                   block:^(NSTimer *t){ _fbg_watchdogFire(t); }];
+    NSLog(@"[FUBG] watchdog started, interval=%.1fs (lowPower=%d)", step, lowPower);
 }
+
+// v2.3.0（保活打磨）：连续失败就退避。
+// 原来只要 player 不在播就每 3 秒重建一次 —— 如果这台机器/这个 App 根本起不来音频
+// （例如没有 audio 后台模式、或 session 被持续抢占），就会变成永不停止的重建 + 打日志，
+// 白白耗电。现在连续 3 次没救回来就退避 10 个周期（约 30s）再试。
+static int gWatchdogStrikes = 0;
+static int gWatchdogBackoff = 0;
 
 // 自愈轮询：仅在停摆时重建，兼顾可靠与耗电
 static void _fbg_watchdogFire(__unused NSTimer *t) {
     if (!gUseAudio || !gPhysBg) return;
+    if (gWatchdogBackoff > 0) { gWatchdogBackoff--; return; }
     @try {
         if (!gPlayer || !gPlayer.isPlaying) {
-            NSLog(@"[FUBG] watchdog: player stopped, rebuilding");
+            NSLog(@"[FUBG] watchdog: player stopped, rebuilding (strike %d)", gWatchdogStrikes + 1);
             _fbg_activateSession();
             if (gPlayer) { [gPlayer play]; }
             else { _fbg_buildAndPlay(); }
+            if (gPlayer && gPlayer.isPlaying) {
+                if (gWatchdogStrikes > 0)
+                    NSLog(@"[FUBG] watchdog: recovered after %d failed rebuild(s)", gWatchdogStrikes);
+                gWatchdogStrikes = 0;
+            } else if (++gWatchdogStrikes >= 3) {
+                gWatchdogBackoff = 10;
+                NSLog(@"[FUBG] watchdog: 3 consecutive rebuilds failed, backing off ~30s");
+            }
+        } else {
+            gWatchdogStrikes = 0;
         }
     } @catch (__unused NSException *e) {}
 }
@@ -3723,7 +3852,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.2.5 (SIOriginal v2.2.5) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.3.0 (SIOriginal v2.3.0) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
