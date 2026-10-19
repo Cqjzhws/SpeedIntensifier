@@ -1,4 +1,4 @@
-// SIOriginal — 配置 App v2.1.20（TrollStore 安装）
+// SIOriginal — 配置 App v2.2.0（TrollStore 安装）
 // 重制版配套配置器：写 Managed Preferences plist + 发 Darwin 通知热重载。
 // v2.0.0：Tab 卡片式 UI、一键预设、配置导入/导出、注入环境自检、新引擎参数。
 // v2.1.20：① 出厂默认与 dylib 对齐（原来界面显示 ×15、引擎实际 40×，且一保存就降速）；
@@ -42,7 +42,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.1.20";
+static NSString * const SIO_VERSION = @"v2.2.0";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -207,6 +207,9 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"InstantTransition"]) d[@"InstantTransition"] = @YES;
     if (!d[@"HUDFast"])           d[@"HUDFast"]           = @YES;
     if (!d[@"WKFastShow"])        d[@"WKFastShow"]        = @YES;
+    // v2.2.0：安全启动（自动熔断）。缺键默认开 —— 安全项必须 fail-safe，
+    // 不能因为"用户没配过"就等于关掉。
+    if (!d[@"SafeBootEnabled"])   d[@"SafeBootEnabled"]   = @YES;
     if (!d[@"Blacklist"])  d[@"Blacklist"]  = @[ @"com.tencent.wework" ];
     if (!d[@"HardGuardExtra"])     d[@"HardGuardExtra"]     = @[];   // v2.1.19 名单外置
     if (!d[@"FeelProtectedExtra"]) d[@"FeelProtectedExtra"] = @[];
@@ -238,6 +241,8 @@ static NSArray *SIOConfigKeys(void) {
                   @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
                   // v2.1.19：三份额外名单键（名单外置，登记白名单才能写进 plist）
                   @"HardGuardExtra", @"FeelProtectedExtra", @"HudProtectedExtra",
+                  // v2.2.0：安全启动开关
+                  @"SafeBootEnabled",
                   @"AppOverrides" ];
     });
     return keys;
@@ -790,6 +795,8 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
 @property (strong) UISwitch *swNotify;
 // v2.1.9：瞬时打开三件套（dylib 侧三个键缺键即默认开，这里给它们补上可视化开关）
 @property (strong) UISwitch *swInstant, *swHUDFast, *swWKFast;
+// v2.2.0：安全启动（自动熔断）总开关
+@property (strong) UISwitch *swSafeBoot;
 // v2.1.12（审查 N-6）：导入时若版本与本机不同，写入这里由 doImport 提示。
 // 不阻断导入 —— 否则用户升级后旧配置全部作废，比不校验更糟。
 @property (copy) NSString *importWarning;
@@ -836,6 +843,8 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
 - (void)refreshOverrides;
 // v2.1.20（功能增强）：恢复出厂设置（语义 = 把 SIOriginal 自己的键从 plist 摘掉）
 - (BOOL)resetToFactory;
+// v2.2.0（功能增强）：一键安全模式 —— 只关高风险项，不做破坏性清空
+- (void)applySafeModePreset;
 @end
 
 @implementation SIOModel
@@ -864,6 +873,8 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     self.swInstant.on = c[@"InstantTransition"] ? [c[@"InstantTransition"] boolValue] : YES;
     self.swHUDFast.on = c[@"HUDFast"] ? [c[@"HUDFast"] boolValue] : YES;
     self.swWKFast.on  = c[@"WKFastShow"]  ? [c[@"WKFastShow"]  boolValue] : YES;
+    // v2.2.0：安全启动，缺键 = 开（与 dylib 同语义）
+    self.swSafeBoot.on = c[@"SafeBootEnabled"] ? [c[@"SafeBootEnabled"] boolValue] : YES;
     // v2.1.12：HUD 延迟（0.05 / 0.10 / 0.15 / 0.30 / 0.50），缺键 0.15
     self.segHUDDelay.selectedSegmentIndex =
         HUDDelayIndexFor(c[@"HUDDelay"] ? [c[@"HUDDelay"] doubleValue] : 0.15);
@@ -1052,6 +1063,7 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     cfg[@"InstantTransition"] = @(self.swInstant.on);
     cfg[@"HUDFast"] = @(self.swHUDFast.on);
     cfg[@"WKFastShow"] = @(self.swWKFast.on);
+    cfg[@"SafeBootEnabled"] = @(self.swSafeBoot.on);   // v2.2.0
     cfg[@"HUDDelay"] = @(HUDDelayForIndex((int)self.segHUDDelay.selectedSegmentIndex));
     cfg[@"Blacklist"] = [self blacklistFromView];
     // v2.1.19：三份额外名单写入
@@ -1150,6 +1162,29 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                          (__bridge CFStringRef)NotifyKey, NULL, NULL, YES);
     return YES;
+}
+
+// v2.2.0（功能增强）：一键安全模式。
+// 与 dylib 侧「自动熔断」不同 —— 这里是**用户主动**把高风险项关掉，用于某个 App
+// 出问题时的快速排障；不碰黑名单、不碰专属覆盖、不清任何配置。
+- (void)applySafeModePreset {
+    self.swEnabled.on = YES;
+    self.segMode.selectedSegmentIndex = 0;
+    self.slSpeed.value = 5.0f;
+    self.segFloor.selectedSegmentIndex = 2;   // 0.02s
+    self.segLayer.selectedSegmentIndex = 0;   // ×1
+    self.segTrans.selectedSegmentIndex = 1;   // ×1.5
+    self.swSpring.on = YES;
+    self.swExtra.on = YES;
+    self.swList.on = NO;
+    self.swZoom.on = NO;
+    self.swFastScroll.on = NO;
+    self.swFastTap.on = NO;
+    self.swHUDFast.on = NO;
+    self.swWKFast.on = NO;
+    self.swInstant.on = NO;
+    self.segHUDDelay.selectedSegmentIndex = 2;  // 0.15s
+    [self refreshDynamicLabels];
 }
 
 - (NSString *)summary {
@@ -1282,6 +1317,7 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     NSArray *boolKeys = @[ @"Enabled", @"Spring", @"Extra", @"ListAccel", @"ZoomAccel",
                            @"FastScroll", @"FastTap", @"InAppNotify",
                             @"InstantTransition", @"HUDFast", @"WKFastShow",
+                            @"SafeBootEnabled",
                             @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep" ];
     for (NSString *k in boolKeys) {
         if (d[k]) {
@@ -1355,6 +1391,7 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     if ([k isEqualToString:@"InstantTransition"]) return self.swInstant;
     if ([k isEqualToString:@"HUDFast"]) return self.swHUDFast;
     if ([k isEqualToString:@"WKFastShow"]) return self.swWKFast;
+    if ([k isEqualToString:@"SafeBootEnabled"]) return self.swSafeBoot;   // v2.2.0
     if ([k isEqualToString:@"FUBGEnabled"]) return self.swFUBG;
     if ([k isEqualToString:@"FUBGSceneFake"]) return self.swFUBGScene;
     if ([k isEqualToString:@"FUBGAudioKeep"]) return self.swFUBGAudio;
@@ -2114,6 +2151,27 @@ static BOOL gUIDirty = NO;
     hsNote.numberOfLines = 0;
     [self.stack addArrangedSubview:SIOCard(@[ hs, hsNote ], 10)];
 
+    // ---- v2.2.0：安全与自愈 ----
+    [self.stack addArrangedSubview:SIOSectionTitle(@"安全与自愈")];
+    m.swSafeBoot = [[UISwitch alloc] init];
+    UIButton *safeBtn = SIOPill(@"一键安全模式（只关高风险项）", [UIColor whiteColor],
+                                [UIColor systemOrangeColor]);
+    safeBtn.layer.borderWidth = 1;
+    safeBtn.layer.borderColor = [UIColor systemOrangeColor].CGColor;
+    [safeBtn addTarget:self action:@selector(doSafeMode)
+      forControlEvents:UIControlEventTouchUpInside];
+    UILabel *safeNote = SIOLabel(
+        @"dylib 侧自愈：目标 App 连续 3 次启动没活过 6 秒（且没进过后台），会自动进入"
+        @"安全模式 —— 只保留纯时长缩放，关掉列表/缩放/手感/HUD/网页提前显形/瞬时转场，"
+        @"倍率钳到 10×、下限抬到 0.02s，并在提示里标「🛡安全模式」。"
+        @"活过一次后自动恢复正常配置。关掉这个开关等于完全禁用自愈（不推荐）。",
+        12, [UIColor secondaryLabelColor]);
+    [self.stack addArrangedSubview:SIOCard(@[
+        SIORowSub(@"安全启动（自动熔断）", @"连续崩 3 次自动降级，避免「配错就开不了 App」", m.swSafeBoot),
+        safeBtn,
+        safeNote,
+    ], 10)];
+
     // ---- 电源 ----
     [self.stack addArrangedSubview:SIOSectionTitle(@"电源操作（会先自动保存）")];
     UIButton *rs = SIOPill(@"注销 SpringBoard", [UIColor whiteColor], [UIColor systemBlueColor]);
@@ -2311,6 +2369,33 @@ static BOOL gUIDirty = NO;
                 message:ok ? @"已清空 SIOriginal 的全部配置键，并广播热重载；"
                              "目标 App 会在下次读取配置时回到出厂档（40× / ×5 / ×3 / 0.005s）。"
                            : @"无法写入 com.apple.UIKit.plist，请确认 TrollStore 权限正常。"
+                preferredStyle:UIAlertControllerStyleAlert];
+            [r addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:r animated:YES completion:nil];
+        }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+// v2.2.0：一键安全模式（用户主动版；dylib 侧还有自动熔断版）
+- (void)doSafeMode {
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"套用安全模式？"
+        message:@"会关闭列表加速、缩放加速、滑行惯性、点击零延迟、HUD 加速、"
+                 "网页提前显形、瞬时打开，倍率降到 ×5、下限抬到 0.02s。\n\n"
+                 "不碰黑名单与 App 专属覆盖。这是「某个 App 出问题了」时的快速排障开关。"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"套用并保存" style:UIAlertActionStyleDestructive
+        handler:^(__unused UIAlertAction *x) {
+            [self.model applySafeModePreset];
+            BOOL ok = [self.model save];
+            [self clearDirty];
+            [self doCheck];
+            UIAlertController *r = [UIAlertController
+                alertControllerWithTitle:ok ? @"已套用安全模式" : @"套用后保存失败"
+                message:ok ? @"高风险加速项已全部关闭，倍率 ×5、下限 0.02s。"
+                             "确认某个 App 恢复正常后，再逐项打开定位。"
+                           : @"配置已改，但 plist 写入失败，请检查 TrollStore 权限。"
                 preferredStyle:UIAlertControllerStyleAlert];
             [r addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:r animated:YES completion:nil];

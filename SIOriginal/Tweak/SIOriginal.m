@@ -1,4 +1,29 @@
-// SIOriginal — 原版重制                                        v2.1.20
+// SIOriginal — 原版重制                                        v2.2.0
+//
+// ========================= v2.2.0 安全启动 + 运行时闸门 =========================
+// 本项目第一次「加能力」而不是「修缺陷」。三件事：
+//
+// [1] 安全启动 / 自动熔断（本版最要紧的一项）
+//     目标 App 启动时在**自己的 Caches 目录**写标记（unfinished=YES）；启动后 6 秒
+//     仍在跑、或正常进入后台，就把标记写成「健康」。连续 3 次没走到健康点 →
+//     本次启动进入安全模式：关掉所有碰状态机的钩子（列表 / 缩放 / 手感 / HUD /
+//     WK 提前显形 / 瞬时转场），倍率钳到 10×、下限抬到 0.02s，只保留纯时长缩放。
+//     意义：配置写坏时不再需要「找作者 / Filza 删 plist」，App 会自己把下一次启动救回来。
+//     开关：plist 键 SafeBootEnabled（缺键 = 开 —— 安全项 fail-safe）。
+//     实现只依赖目标 App 自己的沙盒，不需要任何额外权限，也不跨进程。
+//     已知取舍：Caches 被系统清理 → 退化为「不记得上次崩过」（fail-open，方向正确）；
+//     「打开就切走」不会被误判（进后台即为健康点）。
+// [2] 手感钩子改为「常装 + 运行时闸门」
+//     v2.1.7 起 FastScroll / FastTap 的 3 个钩子按启动时状态安装，因此
+//     「从关改开要重启目标 App」被写进了文档。现在常装、钩子第一行查开关；
+//     再加 SIO_feelSweep()，在「由关变开」的那次 reload 里把已在屏幕上的
+//     滚动视图补扫一遍 —— 开关真正实时生效，不再有"开了没反应"。
+// [3] 熔断状态可见
+//     生效提示与命中统计浮层的状态行都会显示「🛡安全模式」，启动/重载日志带
+//     safeMode 与 crashCount，排障时不用猜。
+//
+// 不涉及任何倍率数值、保护名单语义的变化；v2.1.20 的修复全部保留。
+// =========================================================================
 //
 // ======================== v2.1.20 审查修复 + 性能优化（行为不变）========================
 // 本轮全部为「修缺陷 / 降开销 / 对齐 HIG」，不动任何加速倍率与保护名单语义。
@@ -462,6 +487,17 @@ static BOOL gPhysBg = NO;   // 物理上是否处于后台（由真实生命周�
 static BOOL     gSelfHudProtected  = NO;
 static BOOL     gSelfFeelProtected = NO;
 
+// ---------------------------------------------------------------------------
+// v2.2.0 安全启动 / 自动熔断（本版最重要的新增能力，详见文件头）
+// 目标：配置写坏时不再需要「找作者 / 拿 Filza 删 plist」，目标 App 自己把自己救回来。
+// 状态全部落在一个进程内标记文件（目标 App 自己的 Caches 目录，无需任何权限）。
+// ---------------------------------------------------------------------------
+static BOOL     gSafeBootEnabled = YES;   // plist 键 SafeBootEnabled，默认开
+static BOOL     gSafeMode        = NO;    // 本次启动是否已进入安全模式
+static BOOL     gSafeArmed       = NO;    // 标记已写、尚未确认「健康」
+static int      gSafeCrashCount  = 0;     // 连续「未走到健康点」的启动次数
+static BOOL     gFeelApplied     = NO;    // 上次 reload 时手感是否已生效（用于按需扫树）
+
 static pthread_key_t gInUIViewAnimKey;
 static pthread_key_t gInPAInitKey;   // v1.8.12：UIViewPropertyAnimator 初始化重入保护
 
@@ -787,11 +823,127 @@ static void SIO_resetDefaults(void) {
     gHUDFast       = YES;
     gHUDDelay      = 0.15;
     gWKFastShow    = YES;
+    gSafeBootEnabled = YES;   // v2.2.0：安全启动复位为开
     gSelfBlacklisted = NO;
     gHasAppOverride  = NO;
     gHardGuardExtra = @[];   // v2.1.19：额外名单复位（删 plist 恢复默认时一并清空）
     gFeelExtra      = @[];
     gHudExtra       = @[];
+}
+
+#pragma mark - v2.2.0 安全启动 / 自动熔断
+
+// 标记文件：目标 App 自己的 Caches 目录。选 Caches 而不是 Documents 的理由：
+// 它一定存在、一定可写、不会被 iCloud 备份；被系统清理时最多退化成「不记得上次崩过」，
+// 也就是 fail-open 回到正常启动 —— 这是安全方向的正确降级。
+static NSString *SIO_bootMarkerPath(void) {
+    static NSString *p = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        @try {
+            NSString *dir = NSSearchPathForDirectoriesInDomains(
+                NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+            if (!dir.length) dir = NSTemporaryDirectory();
+            if (dir.length) p = [dir stringByAppendingPathComponent:@"com.sioriginal.boot.plist"];
+        } @catch (__unused NSException *e) {}
+    });
+    return p;
+}
+
+// 启动第一步：读上次标记。上次「没走到健康点」就说明那次启动没活过 6 秒；
+// 连续 3 次 → 进入安全模式，并把计数清零（安全模式活下来后下一次自动恢复正常配置）。
+static void SIO_safeBootBegin(void) {
+    @try {
+        NSString *p = SIO_bootMarkerPath();
+        if (!p.length) return;
+        NSDictionary *old = [NSDictionary dictionaryWithContentsOfFile:p];
+        BOOL unfinished = [old[@"unfinished"] boolValue];
+        int count = old[@"crashCount"] ? [old[@"crashCount"] intValue] : 0;
+        count = unfinished ? (count + 1) : 0;
+        if (count >= 3) { gSafeMode = YES; count = 0; }
+        gSafeCrashCount = count;
+        gSafeArmed = YES;
+        NSDictionary *now = @{
+            @"unfinished": @YES,
+            @"crashCount": @(count),
+            @"stamp": @((double)[[NSDate date] timeIntervalSince1970]),
+            @"ver": @"2.2.0",
+        };
+        [now writeToFile:p atomically:YES];
+        if (gSafeMode) {
+            NSLog(@"[SIOriginal] SAFE MODE engaged after 3 consecutive unfinished launches "
+                  @"(risky hooks disabled for this launch)");
+        }
+    } @catch (__unused NSException *e) {}
+}
+
+// 两个「健康点」都会调它：启动后 6 秒仍在跑，或 App 正常进入后台（说明没在启动阶段崩）。
+// 只写一次，避免反复落盘。
+static void SIO_safeBootMarkHealthy(void) {
+    if (!gSafeArmed) return;
+    gSafeArmed = NO;
+    @try {
+        NSString *p = SIO_bootMarkerPath();
+        if (!p.length) return;
+        NSDictionary *now = @{
+            @"unfinished": @NO,
+            @"crashCount": @0,
+            @"stamp": @((double)[[NSDate date] timeIntervalSince1970]),
+            @"ver": @"2.2.0",
+        };
+        [now writeToFile:p atomically:YES];
+    } @catch (__unused NSException *e) {}
+}
+
+// 安全模式下只保留「纯时长缩放」这一族（CAAnimation / CATransaction / UIView 块动画），
+// 把一切碰状态机的钩子关掉：列表、缩放、手感、HUD、WK 提前显形、瞬时转场。
+// 同时把倍率与下限收回到保守值 —— 目标不是「还能加速」，是「先能打开」。
+static void SIO_applySafeMode(void) {
+    if (!gSafeMode || !gSafeBootEnabled) return;
+    gListAccel        = NO;
+    gZoomAccel        = NO;
+    gFastScroll       = NO;
+    gFastTap          = NO;
+    gHUDFast          = NO;
+    gWKFastShow       = NO;
+    gInstantTransition = NO;
+    if (gSpeed > 10.0) gSpeed = 10.0;
+    if (gFloorDuration < 0.02) gFloorDuration = 0.02;
+    SIO_recalc();
+}
+
+// v2.2.0：手感钩子从「启动时按开关安装」改为「常装 + 运行时闸门」之后，
+// 从关改开不再需要重启目标 App —— 但已经挂在屏幕上的滚动视图要有人去摸一遍，
+// 否则要等它下次入窗。这里在「手感由关变开」的那一次 reload 里扫一遍前台视图树。
+// 上限 800 节点：只会在改配置时跑一次，不在任何热路径上。
+static void SIO_feelSweep(void) {
+    if (!gFastScroll && !gFastTap) return;
+    if (gBlockedFast || gSelfFeelProtected) return;
+    @try {
+        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)sc;
+            if (ws.activationState != UISceneActivationStateForegroundActive) continue;
+            for (UIWindow *w in ws.windows) {
+                NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
+                NSUInteger visited = 0;
+                while (stack.count && visited < 800) {
+                    visited++;
+                    UIView *v = stack.lastObject;
+                    [stack removeLastObject];
+                    if ([v isKindOfClass:[UIScrollView class]]) {
+                        UIScrollView *sv = (UIScrollView *)v;
+                        if (gFastScroll && sv.decelerationRate != UIScrollViewDecelerationRateFast)
+                            sv.decelerationRate = UIScrollViewDecelerationRateFast;
+                        if (gFastTap && sv.delaysContentTouches)
+                            sv.delaysContentTouches = NO;
+                    }
+                    NSArray *subs = v.subviews;
+                    if (subs.count) [stack addObjectsFromArray:subs];
+                }
+            }
+        }
+    } @catch (__unused NSException *e) {}
 }
 
 static void SIO_reload(void) {
@@ -808,6 +960,7 @@ static void SIO_reload(void) {
         gListHardGuarded = SIO_listHardBlocked();
         if (gListHardGuarded) gListAccel = NO;
         SIO_recalc();
+        SIO_applySafeMode();   // v2.2.0：缺配置也要施加安全模式约束
         return;
     }
     // v2.1.18 真 bug 修复：原来裸 boolValue 无缺键守卫 —— 键缺失 ⇒ nil ⇒ NO ⇒ 引擎
@@ -861,6 +1014,8 @@ static void SIO_reload(void) {
     double hd = d[@"HUDDelay"] ? [d[@"HUDDelay"] doubleValue] : 0.15;
     gHUDDelay          = (hd >= 0.02 && hd <= 1.0) ? hd : 0.15;
     gWKFastShow        = d[@"WKFastShow"]        ? [d[@"WKFastShow"]        boolValue] : YES;
+    // v2.2.0：安全启动总开关（缺键默认开 —— 安全项 fail-safe）
+    gSafeBootEnabled   = d[@"SafeBootEnabled"]   ? [d[@"SafeBootEnabled"]   boolValue] : YES;
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     gSelfBlacklisted = NO;
@@ -966,6 +1121,17 @@ static void SIO_reload(void) {
     }
 
     SIO_recalc();   // v2.1.0：最后统一刷新派生量
+
+    // v2.2.0：安全模式在每次 reload 之后重新施加 —— 否则热重载会把 plist 里的激进参数
+    // 又读回来，安全模式只挡第一次启动，等于没挡。
+    SIO_applySafeMode();
+
+    // v2.2.0：手感从「关」变「开」时，把已经挂在屏幕上的滚动视图也摸一遍。
+    // 这是把 feel 钩子改成常装 + 运行时闸门之后必须补的一步，否则用户仍会觉得
+    // 「开了没反应，要重启 App」——只不过原因从「钩子没装」变成了「旧视图没被扫到」。
+    BOOL feelOn = (!gBlockedFast && !gSelfFeelProtected && (gFastScroll || gFastTap));
+    if (feelOn && !gFeelApplied) dispatch_async(dispatch_get_main_queue(), ^{ SIO_feelSweep(); });
+    gFeelApplied = feelOn;
 }
 
 static void SIO_installiOS16Extras(void); // forward declaration
@@ -1001,6 +1167,8 @@ static NSString *SIO_modeSummary(void) {
     }
     // 只在非默认值时附加额外档位，提示尽量短
     NSMutableString *s = [NSMutableString stringWithFormat:@"SIOriginal · %@", m];
+    // v2.2.0：安全模式必须在提示里可见，否则用户会以为"加速怎么变弱了"
+    if (gSafeMode) [s insertString:@"🛡安全模式 · " atIndex:0];
     if (gLayerBoost > 1.0001) [s appendFormat:@" · 显式×%.0f", gLayerBoost];
     if (gTransBoost > 1.0001) [s appendFormat:@" · 转场×%.1f", gTransBoost];
     if (fabs(gFloorDuration - 0.01) > 0.0001)
@@ -1248,6 +1416,7 @@ static NSString *SIO_statsStatusLine(void) {
     if (gSelfBlacklisted)
         return [NSString stringWithFormat:@"%@  ⛔ 整体黑名单命中", bid];
     NSMutableString *s = [NSMutableString stringWithString:bid];
+    if (gSafeMode) [s appendString:@" · 🛡安全模式"];
     if (gListHardGuarded) [s appendString:@" · 列表⛔硬保护"];
     if (gSelfFeelProtected) [s appendString:@" · 手感⛔跳过"];
     if (gSelfHudProtected) [s appendString:@" · HUD⛔跳过"];
@@ -2256,6 +2425,8 @@ __attribute__((constructor))
 static void SIOriginalInit(void) {
     // v1.8.12：安装全程 @try 包裹。任何一步异常只丢功能，绝不影响目标 App 启动（红线规则 #2）。
     @try {
+    // v2.2.0：安全启动必须发生在读配置之前 —— 它决定「这次要不要把激进钩子关掉」。
+    SIO_safeBootBegin();
     pthread_key_create(&gInUIViewAnimKey, NULL);
     pthread_key_create(&gInPAInitKey, NULL);
     gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
@@ -2468,18 +2639,23 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.1.20 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d)",
+    NSLog(@"[SIOriginal] v2.2.0 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
           gInstantTransition, gHUDFast, gHUDDelay, gWKFastShow,
-          gHasAppOverride, gListHardGuarded, gSelfHudProtected, gSelfFeelProtected);
+          gHasAppOverride, gListHardGuarded, gSelfHudProtected, gSelfFeelProtected,
+          gSafeMode, gSafeCrashCount);
     if (SIO_fbgBuiltinExcluded()) {
         NSLog(@"[SIOriginal] %@ is a built-in keep-alive exclusion: audio-assertion/scene-fake engine stays OFF", gSelfBundle);
     }
     if (gListHardGuarded) {
         NSLog(@"[SIOriginal] %@ is on the list-hook hard-guard list: ListAccel is forced OFF (safety)", gSelfBundle);
     }
+    // v2.2.0：6 秒后进程仍活着 → 判定这次启动健康，清掉启动标记。
+    // 另一个健康点是「进入后台」（见 _fbg_onEnterBackground），两者取先到者。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ SIO_safeBootMarkHealthy(); });
     } @catch (NSException *e) {
         NSLog(@"[SIOriginal] hook install failed (feature degraded, app unaffected): %@", e);
     }
@@ -2827,18 +3003,18 @@ static void SIO_installiOS16Extras(void) {
         SIO_swizzleInstance(sv, @selector(zoomToRect:animated:),
                             (IMP)sio_SV_zoomToRect, (IMP *)&o_sv_zoomToRect);
         // v1.8.16 新增：交互手感（滑行惯性 / 点击延迟）
-        // v2.1.7：改为「按启动时开关状态安装」—— 不开就完全不挂钩子，
-        // 与 v1.8.17（已验证稳定）的引擎形态保持一致。代价：运行中把开关从关
-        // 改开需要重启目标 App 才会装上（热重载装不了新 hook）。
-        if (gFastScroll || gFastTap) {
-            SIO_swizzleInstance(sv, @selector(didMoveToWindow),
-                                (IMP)sio_SV_didMoveToWindow, (IMP *)&o_sv_didMoveToWindow);
-            // setter 层强黏，App 后续改值也钳回
-            SIO_swizzleInstance(sv, @selector(setDecelerationRate:),
-                                (IMP)sio_SV_setDecelRate, (IMP *)&o_sv_setDecelRate);
-            SIO_swizzleInstance(sv, @selector(setDelaysContentTouches:),
-                                (IMP)sio_SV_setDelaysTouches, (IMP *)&o_sv_setDelaysTouches);
-        }
+        // v2.2.0：改为**常装 + 运行时闸门**。v2.1.7 起这三条按启动时开关状态安装，
+        // 代价是「从关改开必须重启目标 App」。常装之后：钩子第一行查
+        // gFastScroll / gFastTap，关着时等价于原实现（多 2 条指令），打开时立刻生效；
+        // 配合 reload 里的 SIO_feelSweep() 连已存在的滚动视图一起补上。
+        // 安全性：这三个钩子只「读一个值 / 钳一个值」，不参与列表状态机。
+        SIO_swizzleInstance(sv, @selector(didMoveToWindow),
+                            (IMP)sio_SV_didMoveToWindow, (IMP *)&o_sv_didMoveToWindow);
+        // setter 层强黏，App 后续改值也钳回
+        SIO_swizzleInstance(sv, @selector(setDecelerationRate:),
+                            (IMP)sio_SV_setDecelRate, (IMP *)&o_sv_setDecelRate);
+        SIO_swizzleInstance(sv, @selector(setDelaysContentTouches:),
+                            (IMP)sio_SV_setDelaysTouches, (IMP *)&o_sv_setDelaysTouches);
     }
 
     // v2.0.0：长按手势加速 —— v2.1.7 整体移除。
@@ -3297,6 +3473,9 @@ static void _fbg_onInterruption(NSNotification *note) {
 
 static void _fbg_onEnterBackground(NSNotification *note) {
     gPhysBg = YES;
+    // v2.2.0：能走到「进入后台」就说明这次启动没在 hook 阶段崩 —— 当作健康点，
+    // 清掉安全启动标记。否则「打开就切走」的用户会被误判成连续崩溃。
+    SIO_safeBootMarkHealthy();
     _fbg_startAudio();
     _fbg_watchdogStart();   // v2.1.11：只在真后台时装看门狗，前台不再空转
 }
@@ -3389,7 +3568,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.1.20 (SIOriginal v2.1.20) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.2.0 (SIOriginal v2.2.0) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
