@@ -1,4 +1,18 @@
-// SIOriginal — 原版重制                                        v2.2.2
+// SIOriginal — 原版重制                                        v2.2.3
+//
+// ==================== v2.2.3 强制安全模式通道修正（真机反馈）====================
+// 现象：按说明在 plist 里手加 SafeBootForceOnce=YES，切回目标 App 毫无反应。
+// 两个原因，都是设计问题，不是操作问题：
+// [1] force 只在 SIO_reload 里读，而「切回前台」不触发 reload（只有保存配置或重启才会）
+//     → 用户以为"改了就生效"，实际要等下一次 reload。
+//     现在 SIO_onDidBecomeActive 里也检查一次（一次小文件解析，仅激活时发生），
+//     改完切回来就生效。
+// [2] 这个开关本来就不该让人手改 XML：plist 里有 AppOverrides 嵌套字典，
+//     键一旦写进子字典，dylib 读顶层就永远读不到（真机就是这么踩的）。
+//     现在配置 App「安全与自愈」里有「强制安全模式（测试用）」开关，由 App 写到
+//     正确层级；自检报告还会回读，并对"放错层"的 App 给出明示。
+// 另外：强制通道不再受 SafeBootEnabled 约束（否则关掉总开关连测试也做不了）。
+// =========================================================================
 //
 // ================== v2.2.2 钩子来源修正 + 安全模式可观测（真机数据驱动）==================
 // 触发这版的是两张真机统计截图，不是我的猜测：
@@ -949,11 +963,16 @@ static void SIO_applySafeMode(void) {
     // 下次启动无条件进安全模式。存在的理由很具体：自愈的判定依赖「启动 6 秒内没进后台」，
     // 而"强制退出"这个动作本身就会让 App 先进后台，所以用划掉卡片的方式**测不出来**。
     // 这个开关不改判定逻辑，只提供一个能被验证的入口。
+    // v2.2.3：自动熔断受 SafeBootEnabled 约束；**强制测试通道不受** ——
+    // 否则用户把「安全启动」关掉之后连测试通道也一起失效，又是一个"改了没反应"。
+    BOOL forced = NO;
     if (gSafeForceOnce && !gSafeMode) {
         gSafeMode = YES;
+        forced = YES;
         NSLog(@"[SIOriginal] SAFE MODE forced by SafeBootForceOnce (test switch)");
     }
-    if (!gSafeMode || !gSafeBootEnabled) return;
+    if (!gSafeMode) return;
+    if (!gSafeBootEnabled && !forced) return;
     gListAccel        = NO;
     gZoomAccel        = NO;
     gFastScroll       = NO;
@@ -1637,6 +1656,25 @@ static void SIO_onStatsRequest(CFNotificationCenterRef center, void *observer,
 // v2.2.1：不再立刻弹，而是进入 2.5s 采样窗口（否则刚回到前台必然 0 命中）。
 static void SIO_onDidBecomeActive(NSNotification *note) {
     (void)note;
+
+    // v2.2.3：回到前台时补一次「强制安全模式」检查。
+    // 起因：真机上把 SafeBootForceOnce 加进 plist 后切回 App 毫无反应 ——
+    // 因为 force 只写在 SIO_reload 里，而"切回前台"不触发 reload（只有保存配置或重启
+    // 才会）。于是形成"我明明改了，为什么没用"的死循环。
+    // 现在每次激活做一次很轻的检查（一次小文件解析，约 1ms，仅在激活时发生）：
+    // 命中就直接进安全模式并弹提示，不保存、不重启也能生效。
+    if (!gSafeMode) {
+        @try {
+            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
+            if ([d[@"SafeBootForceOnce"] boolValue]) {
+                gSafeForceOnce = YES;
+                SIO_applySafeMode();
+                NSLog(@"[SIOriginal] SAFE MODE force detected on activation (no reload needed)");
+                SIO_showToastEx(YES);
+            }
+        } @catch (__unused NSException *e) {}
+    }
+
     if (!sioStatsArmed) return;
     sioStatsArmed = NO;
     SIO_showStatsSoon();
@@ -2755,7 +2793,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.2.2 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
+    NSLog(@"[SIOriginal] v2.2.3 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -3717,7 +3755,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.2.2 (SIOriginal v2.2.2) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.2.3 (SIOriginal v2.2.3) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");

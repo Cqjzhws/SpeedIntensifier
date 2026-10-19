@@ -1,4 +1,4 @@
-// SIOriginal — 配置 App v2.2.2（TrollStore 安装）
+// SIOriginal — 配置 App v2.2.3（TrollStore 安装）
 // 重制版配套配置器：写 Managed Preferences plist + 发 Darwin 通知热重载。
 // v2.0.0：Tab 卡片式 UI、一键预设、配置导入/导出、注入环境自检、新引擎参数。
 // v2.1.20：① 出厂默认与 dylib 对齐（原来界面显示 ×15、引擎实际 40×，且一保存就降速）；
@@ -42,7 +42,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.2.2";
+static NSString * const SIO_VERSION = @"v2.2.3";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -800,6 +800,8 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
 @property (strong) UISwitch *swInstant, *swHUDFast, *swWKFast;
 // v2.2.0：安全启动（自动熔断）总开关
 @property (strong) UISwitch *swSafeBoot;
+// v2.2.3：强制安全模式（测试通道）。以前只能 Filza 手改 plist，实测很容易写错层级。
+@property (strong) UISwitch *swSafeForce;
 // v2.1.12（审查 N-6）：导入时若版本与本机不同，写入这里由 doImport 提示。
 // 不阻断导入 —— 否则用户升级后旧配置全部作废，比不校验更糟。
 @property (copy) NSString *importWarning;
@@ -878,6 +880,8 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     self.swWKFast.on  = c[@"WKFastShow"]  ? [c[@"WKFastShow"]  boolValue] : YES;
     // v2.2.0：安全启动，缺键 = 开（与 dylib 同语义）
     self.swSafeBoot.on = c[@"SafeBootEnabled"] ? [c[@"SafeBootEnabled"] boolValue] : YES;
+    // v2.2.3：强制安全模式（缺键 = 关）
+    self.swSafeForce.on = c[@"SafeBootForceOnce"] ? [c[@"SafeBootForceOnce"] boolValue] : NO;
     // v2.1.12：HUD 延迟（0.05 / 0.10 / 0.15 / 0.30 / 0.50），缺键 0.15
     self.segHUDDelay.selectedSegmentIndex =
         HUDDelayIndexFor(c[@"HUDDelay"] ? [c[@"HUDDelay"] doubleValue] : 0.15);
@@ -1069,9 +1073,8 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     // v2.2.0：安全开关必须 fail-safe —— 控件万一还没创建（例如将来改成懒加载 Tab），
     // 不能因为 self.swSafeBoot 为 nil 就写进一个 NO，把自愈静默关掉。
     cfg[@"SafeBootEnabled"] = @(self.swSafeBoot ? self.swSafeBoot.on : YES);
-    // v2.2.2：测试开关原样透传（没有 UI，也不写默认值 —— 只有用户手改过才存在）
-    if (cfg[@"SafeBootForceOnce"])
-        cfg[@"SafeBootForceOnce"] = @([cfg[@"SafeBootForceOnce"] boolValue]);
+    // v2.2.3：改成界面开关（以前只能 Filza 手改，实测很容易写错层级）
+    cfg[@"SafeBootForceOnce"] = @(self.swSafeForce ? self.swSafeForce.on : NO);
     cfg[@"HUDDelay"] = @(HUDDelayForIndex((int)self.segHUDDelay.selectedSegmentIndex));
     cfg[@"Blacklist"] = [self blacklistFromView];
     // v2.1.19：三份额外名单写入
@@ -1427,7 +1430,40 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     BOOL plistExists = [[NSFileManager defaultManager] fileExistsAtPath:PrefPath];
     [r appendFormat:@"UIKit.plist 存在：%@\n", plistExists ? @"✅" : @"➖ 尚未保存过"];
     BOOL axWritable = access("/var/mobile/Library/Preferences", W_OK) == 0;
-    [r appendFormat:@"辅助功能目录可写：%@\n\n", axWritable ? @"✅" : @"❌"];
+    [r appendFormat:@"辅助功能目录可写：%@\n", axWritable ? @"✅" : @"❌"];
+
+    // v2.2.3：安全启动相关键的回读 —— 一眼看出"我改的那一行到底在不在 dylib 读的那一层"。
+    // 真机踩过：手改 plist 加 SafeBootForceOnce 后毫无反应，最后发现键被写进了
+    // AppOverrides 的子字典里（dylib 只读顶层 d[@"SafeBootForceOnce"]）。
+    NSDictionary *pd = [NSDictionary dictionaryWithContentsOfFile:PrefPath];
+    if ([pd isKindOfClass:[NSDictionary class]]) {
+        id sbv = pd[@"SafeBootEnabled"];
+        id sfv = pd[@"SafeBootForceOnce"];
+        NSString *sbTxt = sbv ? ([sbv boolValue] ? @"开" : @"关") : @"缺键（视为开）";
+        NSString *sfTxt = sfv ? ([sfv boolValue] ? @"开（下次激活/启动进安全模式）" : @"关")
+                              : @"未设置";
+        [r appendFormat:@"安全启动 SafeBootEnabled：%@\n", sbTxt];
+        [r appendFormat:@"强制安全模式 SafeBootForceOnce：%@\n", sfTxt];
+        id ov = pd[@"AppOverrides"];
+        if ([ov isKindOfClass:[NSDictionary class]]) {
+            NSMutableArray *nested = [NSMutableArray array];
+            for (id bid in ov) {
+                id sub = ov[bid];
+                if ([sub isKindOfClass:[NSDictionary class]] &&
+                    (sub[@"SafeBootForceOnce"] || sub[@"SafeBootEnabled"])) {
+                    [nested addObject:[bid description]];
+                }
+            }
+            if (nested.count) {
+                [r appendFormat:@"⚠️ 以下 App 的专属覆盖里出现了安全键（dylib 不读，属于放错层）：%@\n",
+                               [nested componentsJoinedByString:@"、"]];
+            }
+        }
+        NSDictionary *fa = [[NSFileManager defaultManager] attributesOfItemAtPath:PrefPath error:nil];
+        NSDate *mt = fa[NSFileModificationDate];
+        if (mt) [r appendFormat:@"plist 修改时间：%@\n", [fmt stringFromDate:mt]];
+    }
+    [r appendString:@"\n"];
 
     [r appendString:@"【当前引擎配置】\n"];
     [r appendFormat:@"%@\n\n", [self summary]];
@@ -2162,6 +2198,8 @@ static BOOL gUIDirty = NO;
     // ---- v2.2.0：安全与自愈 ----
     [self.stack addArrangedSubview:SIOSectionTitle(@"安全与自愈")];
     m.swSafeBoot = [[UISwitch alloc] init];
+    // v2.2.3：强制安全模式开关（测试通道）—— 直接写顶层键，避免手改 XML 写错层级
+    m.swSafeForce = [[UISwitch alloc] init];
     UIButton *safeBtn = SIOPill(@"一键安全模式（只关高风险项）", [UIColor whiteColor],
                                 [UIColor systemOrangeColor]);
     safeBtn.layer.borderWidth = 1;
@@ -2176,6 +2214,7 @@ static BOOL gUIDirty = NO;
         12, [UIColor secondaryLabelColor]);
     [self.stack addArrangedSubview:SIOCard(@[
         SIORowSub(@"安全启动（自动熔断）", @"连续崩 3 次自动降级，避免「配错就开不了 App」", m.swSafeBoot),
+        SIORowSub(@"强制安全模式（测试用）", @"置开后切回目标 App 即生效，不用重启；测完请关掉", m.swSafeForce),
         safeBtn,
         safeNote,
     ], 10)];
