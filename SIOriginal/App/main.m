@@ -2263,7 +2263,7 @@ static BOOL gUIDirty = NO;
     m.ovWKFast.on     = g[@"WKFastShow"]        ? [g[@"WKFastShow"] boolValue]        : YES;
     m.ovHUDDelay.selectedSegmentIndex = g[@"HUDDelay"] ? HUDDelayIndexFor([g[@"HUDDelay"] doubleValue]) : 2;
     [self ovSpeedChanged];
-    [self refreshDynamicLabels];
+    [self.model refreshDynamicLabels];
     [self ovToggled];
 }
 - (void)ovToggled {
