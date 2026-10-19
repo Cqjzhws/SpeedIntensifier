@@ -1,4 +1,4 @@
-// SIOriginal — 配置 App v2.2.1（TrollStore 安装）
+// SIOriginal — 配置 App v2.2.2（TrollStore 安装）
 // 重制版配套配置器：写 Managed Preferences plist + 发 Darwin 通知热重载。
 // v2.0.0：Tab 卡片式 UI、一键预设、配置导入/导出、注入环境自检、新引擎参数。
 // v2.1.20：① 出厂默认与 dylib 对齐（原来界面显示 ×15、引擎实际 40×，且一保存就降速）；
@@ -42,7 +42,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.2.1";
+static NSString * const SIO_VERSION = @"v2.2.2";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -243,6 +243,9 @@ static NSArray *SIOConfigKeys(void) {
                   @"HardGuardExtra", @"FeelProtectedExtra", @"HudProtectedExtra",
                   // v2.2.0：安全启动开关
                   @"SafeBootEnabled",
+                  // v2.2.2：强制安全模式（测试/排障用，Filza 手改；UI 不暴露，
+                  // 但必须登记白名单，否则 save() 会把它丢掉）
+                  @"SafeBootForceOnce",
                   @"AppOverrides" ];
     });
     return keys;
@@ -1066,6 +1069,9 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     // v2.2.0：安全开关必须 fail-safe —— 控件万一还没创建（例如将来改成懒加载 Tab），
     // 不能因为 self.swSafeBoot 为 nil 就写进一个 NO，把自愈静默关掉。
     cfg[@"SafeBootEnabled"] = @(self.swSafeBoot ? self.swSafeBoot.on : YES);
+    // v2.2.2：测试开关原样透传（没有 UI，也不写默认值 —— 只有用户手改过才存在）
+    if (cfg[@"SafeBootForceOnce"])
+        cfg[@"SafeBootForceOnce"] = @([cfg[@"SafeBootForceOnce"] boolValue]);
     cfg[@"HUDDelay"] = @(HUDDelayForIndex((int)self.segHUDDelay.selectedSegmentIndex));
     cfg[@"Blacklist"] = [self blacklistFromView];
     // v2.1.19：三份额外名单写入

@@ -1,4 +1,25 @@
-// SIOriginal — 原版重制                                        v2.2.1
+// SIOriginal — 原版重制                                        v2.2.2
+//
+// ================== v2.2.2 钩子来源修正 + 安全模式可观测（真机数据驱动）==================
+// 触发这版的是两张真机统计截图，不是我的猜测：
+//   微信（46s 窗口）：调用 11761 / 生效 1575，Feel 10186 全部按名单跳过；
+//   顺丰（46s 窗口）：调用 25544 / 生效 25544，其中 Feel 24320 —— 占 95%，≈529 次/秒。
+// 一个"暂无订单"的静态页面不可能每秒挂载 529 个滚动视图。结论：
+// [1] didMoveToWindow 的钩子实际挂在 **UIView** 上（UIScrollView 没覆写该方法，
+//     class_getInstanceMethod 返回的是 UIView 的实现，method_setImplementation
+//     就把所有视图一起改了）。v2.1.20 加的 isKindOfClass 守卫只让它"安全返回"，
+//     没解决"根本不该进来"。本版按 WKWebView setHidden: 的既有做法修正：
+//     先 class_addMethod 把父类 IMP 拷到 UIScrollView 自己身上，再改子类这份。
+//     修正后 FeelMove 计数应掉到个位/十位数级别 —— 这本身就是修复的验收指标。
+// [2] Feel 桶拆成 FeelMove / FeelDecel / FeelDelay 三个槽。三个钩子的调用频率差了
+//     几个数量级，合在一起只能得到一个"很大但不知道为什么大"的数字。
+// [3] 安全模式必须在启动时就看得见：以前只有热重载才弹提示，用户只会觉得"变慢了"。
+//     现在启动 1.2s 后强制弹一次（不受「保存后弹生效提示」开关约束）。
+// [4] 新增 SafeBootForceOnce（测试通道）。必需，因为自愈的判定是「启动 6 秒内没进后台」，
+//     而"强制退出"这个动作本身会先让 App 进后台 —— 用划掉卡片的方式永远测不出来。
+//     置 YES 后下次启动强制进安全模式；Filza 手改，UI 不暴露。
+// 不改变任何加速倍率与保护名单语义。
+// =========================================================================
 //
 // ==================== v2.2.1 命中统计可解释性（真机截图取证）====================
 // 现象（用户截图）：微信里请求命中统计 → 浮层显示
@@ -511,6 +532,7 @@ static BOOL     gSelfFeelProtected = NO;
 // 状态全部落在一个进程内标记文件（目标 App 自己的 Caches 目录，无需任何权限）。
 // ---------------------------------------------------------------------------
 static BOOL     gSafeBootEnabled = YES;   // plist 键 SafeBootEnabled，默认开
+static BOOL     gSafeForceOnce   = NO;    // v2.2.2：plist 键 SafeBootForceOnce（测试开关）
 static BOOL     gSafeMode        = NO;    // 本次启动是否已进入安全模式
 static BOOL     gSafeArmed       = NO;    // 标记已写、尚未确认「健康」
 static int      gSafeCrashCount  = 0;     // 连续「未走到健康点」的启动次数
@@ -567,7 +589,12 @@ enum {
     SIO_HIT_PA,           // UIViewPropertyAnimator 系列（7 个）
     SIO_HIT_SV_SCROLL,    // UIScrollView setContentOffset:/scrollRectToVisible:
     SIO_HIT_SV_ZOOM,      // UIScrollView setZoomScale:/zoomToRect:
-    SIO_HIT_FEEL,         // 手感：didMoveToWindow / decelerationRate / delaysContentTouches
+    SIO_HIT_FEEL,         // 手感：didMoveToWindow（入窗施加）
+    // v2.2.2：把「手感」拆成三个槽。真机数据（顺丰 46s / Feel 24320 次，占全部调用 95%）
+    // 证明三件事必须分开看：入窗、改减速、改点击延迟，各自的调用频率差了几个数量级，
+    // 合在一起只会得到一个"很大但不知道为什么大"的数字。
+    SIO_HIT_FEEL_DECEL,   // 手感：setDecelerationRate:
+    SIO_HIT_FEEL_DELAY,   // 手感：setDelaysContentTouches:
     SIO_HIT_HUD_AI,       // UIActivityIndicatorView startAnimating
     SIO_HIT_HUD_SV,       // SVProgressHUD dismissWithDelay:
     SIO_HIT_HUD_MB,       // MBProgressHUD hide:
@@ -580,7 +607,8 @@ static _Atomic uint32_t gHitCounts[SIO_HIT__COUNT];
 static const char * const kSIOHitNames[SIO_HIT__COUNT] = {
     "CAAnim", "CATx", "CASpring", "LayerAdd", "UIViewBlock", "Keyframe",
     "SysAnim", "OldStyle", "Nav", "Present", "Tab", "ListTV", "ListCV",
-    "PA", "SVScroll", "SVZoom", "Feel", "HUD_AI", "HUD_SV", "HUD_MB",
+    "PA", "SVScroll", "SVZoom", "FeelMove", "FeelDecel", "FeelDelay",
+    "HUD_AI", "HUD_SV", "HUD_MB",
     "WK", "Notify"
 };
 #define SIO_HIT(slot) \
@@ -917,6 +945,14 @@ static void SIO_safeBootMarkHealthy(void) {
 // 把一切碰状态机的钩子关掉：列表、缩放、手感、HUD、WK 提前显形、瞬时转场。
 // 同时把倍率与下限收回到保守值 —— 目标不是「还能加速」，是「先能打开」。
 static void SIO_applySafeMode(void) {
+    // v2.2.2：测试 / 排障通道 —— 配置 App（或 Filza）写 SafeBootForceOnce=YES，
+    // 下次启动无条件进安全模式。存在的理由很具体：自愈的判定依赖「启动 6 秒内没进后台」，
+    // 而"强制退出"这个动作本身就会让 App 先进后台，所以用划掉卡片的方式**测不出来**。
+    // 这个开关不改判定逻辑，只提供一个能被验证的入口。
+    if (gSafeForceOnce && !gSafeMode) {
+        gSafeMode = YES;
+        NSLog(@"[SIOriginal] SAFE MODE forced by SafeBootForceOnce (test switch)");
+    }
     if (!gSafeMode || !gSafeBootEnabled) return;
     gListAccel        = NO;
     gZoomAccel        = NO;
@@ -1034,6 +1070,8 @@ static void SIO_reload(void) {
     gWKFastShow        = d[@"WKFastShow"]        ? [d[@"WKFastShow"]        boolValue] : YES;
     // v2.2.0：安全启动总开关（缺键默认开 —— 安全项 fail-safe）
     gSafeBootEnabled   = d[@"SafeBootEnabled"]   ? [d[@"SafeBootEnabled"]   boolValue] : YES;
+    // v2.2.2：测试开关（缺键 = 关，不影响任何人）
+    gSafeForceOnce     = d[@"SafeBootForceOnce"] ? [d[@"SafeBootForceOnce"] boolValue] : NO;
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     gSelfBlacklisted = NO;
@@ -1235,6 +1273,11 @@ static BOOL SIO_bucketSkipped(int slot) {
             return !gListAccel;                                  // 列表加速关
         case SIO_HIT_FEEL:
             return gSelfFeelProtected || (!gFastScroll && !gFastTap);
+        // v2.2.2：拆分后按各自开关判定，比合在一起更准确（以前只要有一个开着就都算"生效"）
+        case SIO_HIT_FEEL_DECEL:
+            return gSelfFeelProtected || !gFastScroll;
+        case SIO_HIT_FEEL_DELAY:
+            return gSelfFeelProtected || !gFastTap;
         case SIO_HIT_HUD_AI:
         case SIO_HIT_HUD_SV:
         case SIO_HIT_HUD_MB:
@@ -1351,8 +1394,13 @@ static void SIO_dismissToastIfCurrent(uint32_t gen) {
     SIO_dismissToast();
 }
 
-static void SIO_showToast(void) {
-    if (!gInAppNotify) return;
+// v2.2.2：加一个 force 参数 —— 安全模式告知属于「安全信息」，不应该被
+// 「保存后弹生效提示」这个纯偏好开关关掉（用户关掉它只是为了不被每次保存打扰）。
+static void SIO_showToastEx(BOOL force);
+static void SIO_showToast(void) { SIO_showToastEx(NO); }
+
+static void SIO_showToastEx(BOOL force) {
+    if (!gInAppNotify && !force) return;
     // 只在目标 App 自己处于前台激活态时提示；SpringBoard/后台不打扰
     UIApplication *app = [UIApplication sharedApplication];
     if (app.applicationState != UIApplicationStateActive) return;
@@ -2707,7 +2755,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.2.1 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
+    NSLog(@"[SIOriginal] v2.2.2 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -2724,6 +2772,14 @@ static void SIOriginalInit(void) {
     // 另一个健康点是「进入后台」（见 _fbg_onEnterBackground），两者取先到者。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ SIO_safeBootMarkHealthy(); });
+
+    // v2.2.2：安全模式必须在**启动时**就看得见。以前只有"配置热重载"才弹提示，
+    // 于是用户只会觉得"加速怎么变慢了"，完全不知道原因（真机反馈就是这么来的）。
+    // 这里强制弹一次（不受「保存后弹生效提示」开关约束）。
+    if (gSafeMode) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ SIO_showToastEx(YES); });
+    }
     } @catch (NSException *e) {
         NSLog(@"[SIOriginal] hook install failed (feature degraded, app unaffected): %@", e);
     }
@@ -2981,14 +3037,14 @@ static void sio_SV_didMoveToWindow(id self, SEL _cmd) {
 // （例如某个列表页 viewDidAppear）再把 decelerationRate / delaysContentTouches
 // 改回去，旧版就"时灵时不灵"。setter 层钳回，开关真正全程生效。
 static void sio_SV_setDecelRate(id self, SEL _cmd, CGFloat rate) {
-    SIO_HIT(SIO_HIT_FEEL);
+    SIO_HIT(SIO_HIT_FEEL_DECEL);
     SIO_REQUIRE_ORIG(o_sv_setDecelRate);
     if (!SIO_blocked() && gFastScroll && !gSelfFeelProtected) rate = UIScrollViewDecelerationRateFast;
     o_sv_setDecelRate(self, _cmd, rate);
 }
 
 static void sio_SV_setDelaysTouches(id self, SEL _cmd, BOOL b) {
-    SIO_HIT(SIO_HIT_FEEL);
+    SIO_HIT(SIO_HIT_FEEL_DELAY);
     SIO_REQUIRE_ORIG(o_sv_setDelaysTouches);
     if (!SIO_blocked() && gFastTap && !gSelfFeelProtected) b = NO;
     o_sv_setDelaysTouches(self, _cmd, b);
@@ -3076,8 +3132,33 @@ static void SIO_installiOS16Extras(void) {
         // gFastScroll / gFastTap，关着时等价于原实现（多 2 条指令），打开时立刻生效；
         // 配合 reload 里的 SIO_feelSweep() 连已存在的滚动视图一起补上。
         // 安全性：这三个钩子只「读一个值 / 钳一个值」，不参与列表状态机。
-        SIO_swizzleInstance(sv, @selector(didMoveToWindow),
-                            (IMP)sio_SV_didMoveToWindow, (IMP *)&o_sv_didMoveToWindow);
+        // v2.2.2（真机数据取证）：下面这三条里，didMoveToWindow **必须**先把父类实现
+        // 拷到 UIScrollView 自己身上，否则改的是 UIView 的实现。
+        // 证据：顺丰同城骑士 46 秒内 Feel 桶 24320 次调用（≈529 次/秒），
+        // 同期 LayerAdd 只有 398 次 —— 一个"暂无订单"的静态页面不可能每秒挂载
+        // 529 个滚动视图，唯一解释是钩子挂在了所有视图上。
+        // v2.1.20 加的 isKindOfClass 守卫只是让非滚动视图安全返回（否则每次入窗
+        // 都会抛 unrecognized selector）；这一版把来源也限定掉，钩子只对滚动视图生效。
+        // 做法与 WKWebView setHidden: 完全一致（那里早就踩过同一个坑）。
+        {
+            SEL dwSel = @selector(didMoveToWindow);
+            Method dwM = class_getInstanceMethod(sv, dwSel);
+            if (dwM) {
+                IMP parentImp = method_getImplementation(dwM);
+                if (class_addMethod(sv, dwSel, parentImp, method_getTypeEncoding(dwM))) {
+                    // UIScrollView 自己没有覆写 -> 已为子类加了一份，现在只换子类这份
+                    Method ownM = class_getInstanceMethod(sv, dwSel);
+                    o_sv_didMoveToWindow = (void (*)(id, SEL))method_getImplementation(ownM);
+                    method_setImplementation(ownM, (IMP)sio_SV_didMoveToWindow);
+                    NSLog(@"[SIOriginal] feel: didMoveToWindow was inherited from UIView — "
+                          @"installed a UIScrollView-local copy (hook is now scroll-view only)");
+                } else {
+                    // 已有自己的实现 -> 常规 swizzle
+                    SIO_swizzleInstance(sv, dwSel,
+                                        (IMP)sio_SV_didMoveToWindow, (IMP *)&o_sv_didMoveToWindow);
+                }
+            }
+        }
         // setter 层强黏，App 后续改值也钳回
         SIO_swizzleInstance(sv, @selector(setDecelerationRate:),
                             (IMP)sio_SV_setDecelRate, (IMP *)&o_sv_setDecelRate);
@@ -3636,7 +3717,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.2.1 (SIOriginal v2.2.1) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.2.2 (SIOriginal v2.2.2) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
