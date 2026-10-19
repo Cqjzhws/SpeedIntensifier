@@ -546,7 +546,6 @@ static BOOL     gSelfFeelProtected = NO;
 // 状态全部落在一个进程内标记文件（目标 App 自己的 Caches 目录，无需任何权限）。
 // ---------------------------------------------------------------------------
 static BOOL     gSafeBootEnabled = YES;   // plist 键 SafeBootEnabled，默认开
-static BOOL     gSafeForceOnce   = NO;    // v2.2.2：plist 键 SafeBootForceOnce（测试开关）
 static BOOL     gSafeMode        = NO;    // 本次启动是否已进入安全模式
 static BOOL     gSafeArmed       = NO;    // 标记已写、尚未确认「健康」
 static int      gSafeCrashCount  = 0;     // 连续「未走到健康点」的启动次数
@@ -959,20 +958,7 @@ static void SIO_safeBootMarkHealthy(void) {
 // 把一切碰状态机的钩子关掉：列表、缩放、手感、HUD、WK 提前显形、瞬时转场。
 // 同时把倍率与下限收回到保守值 —— 目标不是「还能加速」，是「先能打开」。
 static void SIO_applySafeMode(void) {
-    // v2.2.2：测试 / 排障通道 —— 配置 App（或 Filza）写 SafeBootForceOnce=YES，
-    // 下次启动无条件进安全模式。存在的理由很具体：自愈的判定依赖「启动 6 秒内没进后台」，
-    // 而"强制退出"这个动作本身就会让 App 先进后台，所以用划掉卡片的方式**测不出来**。
-    // 这个开关不改判定逻辑，只提供一个能被验证的入口。
-    // v2.2.3：自动熔断受 SafeBootEnabled 约束；**强制测试通道不受** ——
-    // 否则用户把「安全启动」关掉之后连测试通道也一起失效，又是一个"改了没反应"。
-    BOOL forced = NO;
-    if (gSafeForceOnce && !gSafeMode) {
-        gSafeMode = YES;
-        forced = YES;
-        NSLog(@"[SIOriginal] SAFE MODE forced by SafeBootForceOnce (test switch)");
-    }
-    if (!gSafeMode) return;
-    if (!gSafeBootEnabled && !forced) return;
+    if (!gSafeMode || !gSafeBootEnabled) return;
     gListAccel        = NO;
     gZoomAccel        = NO;
     gFastScroll       = NO;
@@ -1089,8 +1075,7 @@ static void SIO_reload(void) {
     gWKFastShow        = d[@"WKFastShow"]        ? [d[@"WKFastShow"]        boolValue] : YES;
     // v2.2.0：安全启动总开关（缺键默认开 —— 安全项 fail-safe）
     gSafeBootEnabled   = d[@"SafeBootEnabled"]   ? [d[@"SafeBootEnabled"]   boolValue] : YES;
-    // v2.2.2：测试开关（缺键 = 关，不影响任何人）
-    gSafeForceOnce     = d[@"SafeBootForceOnce"] ? [d[@"SafeBootForceOnce"] boolValue] : NO;
+    // v2.2.5：SafeBootForceOnce 已移除（测试通道无价值，详见文件头）
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     gSelfBlacklisted = NO;
@@ -1656,25 +1641,8 @@ static void SIO_onStatsRequest(CFNotificationCenterRef center, void *observer,
 // v2.2.1：不再立刻弹，而是进入 2.5s 采样窗口（否则刚回到前台必然 0 命中）。
 static void SIO_onDidBecomeActive(NSNotification *note) {
     (void)note;
-
-    // v2.2.3：回到前台时补一次「强制安全模式」检查。
-    // 起因：真机上把 SafeBootForceOnce 加进 plist 后切回 App 毫无反应 ——
-    // 因为 force 只写在 SIO_reload 里，而"切回前台"不触发 reload（只有保存配置或重启
-    // 才会）。于是形成"我明明改了，为什么没用"的死循环。
-    // 现在每次激活做一次很轻的检查（一次小文件解析，约 1ms，仅在激活时发生）：
-    // 命中就直接进安全模式并弹提示，不保存、不重启也能生效。
-    if (!gSafeMode) {
-        @try {
-            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
-            if ([d[@"SafeBootForceOnce"] boolValue]) {
-                gSafeForceOnce = YES;
-                SIO_applySafeMode();
-                NSLog(@"[SIOriginal] SAFE MODE force detected on activation (no reload needed)");
-                SIO_showToastEx(YES);
-            }
-        } @catch (__unused NSException *e) {}
-    }
-
+    // v2.2.5：「强制安全模式」测试通道已删除（无实际价值、且需要额外一次 plist 解析）。
+    // 安全模式只由自动熔断（连续 3 次启动未达健康点）触发。
     if (!sioStatsArmed) return;
     sioStatsArmed = NO;
     SIO_showStatsSoon();
@@ -2793,7 +2761,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.2.4 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
+    NSLog(@"[SIOriginal] v2.2.5 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -3755,7 +3723,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.2.4 (SIOriginal v2.2.4) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.2.5 (SIOriginal v2.2.5) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
