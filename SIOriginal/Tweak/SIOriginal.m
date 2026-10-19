@@ -1,4 +1,22 @@
-// SIOriginal — 原版重制                                        v2.2.0
+// SIOriginal — 原版重制                                        v2.2.1
+//
+// ==================== v2.2.1 命中统计可解释性（真机截图取证）====================
+// 现象（用户截图）：微信里请求命中统计 → 浮层显示
+//     «com.tencent.xin · 手感⛔跳过 · HUD⛔跳过»
+//     «0 命中 —— 本 App 所有 hook 路径均被跳过»
+// 两句话互相矛盾：手感/HUD 被跳过 ≠ 所有路径被跳过，动画钩子明明是开着的。
+// 根因两条，都是产品逻辑问题、不是加速逻辑问题：
+// [1] 采样窗口为 0：浮层在「收到请求 / 刚回到前台」那一刻就渲染了。而此时
+//     a) 计数可能刚被 SIO_statsReset() 清零（保存配置就会清零）；
+//     b) App 还没跑过任何动画（用户刚从配置器切回来）。
+//     两者叠加 → 面板必然 0。修法：延迟 2.5s 渲染，采一段真实使用的样；
+//     代际号防止连续请求叠层。
+// [2] 0 命中时无条件断言「所有路径被跳过」—— 断了一个它不知道的原因。
+//     修法：只有「所有桶都被闸门拦掉」时才说那句话；否则明说「这段时间没有 hook
+//     被调用」，并给出统计窗口秒数与下一步动作。
+// 附带：面板头部现在带「窗口 Ns」，0 命中不再是没上下文的数字。
+// 不涉及任何加速行为。
+// =========================================================================
 //
 // ========================= v2.2.0 安全启动 + 运行时闸门 =========================
 // 本项目第一次「加能力」而不是「修缺陷」。三件事：
@@ -1228,8 +1246,17 @@ static BOOL SIO_bucketSkipped(int slot) {
     }
 }
 
+// v2.2.1（真机截图取证后新增）：统计窗口起点。
+// 只在「清零」时更新，所以面板上的「窗口 Ns」就是「自上次重载/启动以来累计了多久」。
+// 有它之后，「0 命中」不再是一个没有上下文的数字。
+static NSTimeInterval gStatsSince = 0;
+static double SIO_statsWindow(void) {
+    if (gStatsSince <= 0) return 0;
+    double d = CACurrentMediaTime() - gStatsSince;
+    return d > 0 ? d : 0;
+}
+
 // 浮层版：只列非零项（22 项全列在手机上读不完），按调用数降序，最多 8 行。
-// 全为 0 时给一句明确的诊断提示 —— 这正是 F-A 想暴露的「走了未覆盖路径」信号。
 static NSString *SIO_statsPanelText(void) {
     NSMutableArray *rows = [NSMutableArray array];
     uint32_t totalCalled = 0, totalApplied = 0;
@@ -1245,16 +1272,37 @@ static NSString *SIO_statsPanelText(void) {
     }
     // v2.1.13：状态行必须在最上面。过去只给数字，用户在被保护的 App 上看到一片 0
     // 会误判成「没生效」，实际是三道闸门把它拦住了（顺丰骑士就是这种情况）。
+    // v2.2.1 真 bug 修复：原来 0 命中时**无条件**断言「本 App 所有 hook 路径均被跳过」。
+    // 但 0 命中还有两个更常见的成因：
+    //   ① 刚保存配置 —— SIO_statsReset() 把计数清零了；
+    //   ② 面板渲染得太早 —— 之前在「回到前台那一刻」就渲染，App 还没来得及跑动画。
+    // 真机截图：微信里请求统计 → 显示「0 命中 / 所有路径被跳过」，
+    // 而状态行同时显示「手感⛔跳过 · HUD⛔跳过」= 动画钩子其实是开着的。
+    // 两句话互相矛盾，用户只能得出「这东西没生效」的结论。
+    // 现在：只有「所有桶都被闸门拦掉」时才说那句话；否则明确告诉用户"这段时间没调用过"，
+    // 并给出窗口秒数与下一步动作。
     if (!rows.count) {
+        BOOL anyLiveBucket = NO;
+        for (int i = 0; i < SIO_HIT__COUNT; i++) {
+            if (!SIO_bucketSkipped(i)) { anyLiveBucket = YES; break; }
+        }
+        if (!anyLiveBucket) {
+            return [NSString stringWithFormat:
+                @"SIOriginal 命中统计（窗口 %.0fs）\n%@\n0 命中 —— 本 App 所有 hook 路径均被跳过",
+                SIO_statsWindow(), SIO_statsStatusLine()];
+        }
         return [NSString stringWithFormat:
-            @"SIOriginal 命中统计\n%@\n0 命中 —— 本 App 所有 hook 路径均被跳过",
-            SIO_statsStatusLine()];
+            @"SIOriginal 命中统计（窗口 %.0fs）\n%@\n"
+            @"0 命中 —— 这段时间内没有 hook 被调用\n"
+            @"（保存配置会清零计数。先在本 App 里滑动/翻页 2 秒，再回配置器请求一次）",
+            SIO_statsWindow(), SIO_statsStatusLine()];
     }
     [rows sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
         return [b[0] compare:a[0]];
     }];
     NSMutableString *s = [NSMutableString stringWithFormat:
-        @"SIOriginal 命中统计（调用 %u / 生效 %u）\n%@", totalCalled, totalApplied, SIO_statsStatusLine()];
+        @"SIOriginal 命中统计（调用 %u / 生效 %u · 窗口 %.0fs）\n%@",
+        totalCalled, totalApplied, SIO_statsWindow(), SIO_statsStatusLine()];
     NSUInteger n = MIN(rows.count, (NSUInteger)8);
     for (NSUInteger i = 0; i < n; i++) {
         NSArray *r = rows[i];
@@ -1276,6 +1324,7 @@ static NSString *SIO_statsPanelText(void) {
 static void SIO_statsReset(void) {
     for (int i = 0; i < SIO_HIT__COUNT; i++)
         atomic_store_explicit(&gHitCounts[i], 0u, memory_order_relaxed);
+    gStatsSince = CACurrentMediaTime();   // v2.2.1：重置统计窗口起点
 }
 
 // v2.1.20 真 bug 修复：toast 代际号。
@@ -1498,6 +1547,23 @@ static void SIO_showStats(void) {
     });
 }
 
+// v2.2.1（真机截图取证）：延迟 2.5s 再渲染，给目标 App 一个**采样窗口**。
+// 原来「收到请求 / 刚回到前台」就立刻渲染，那一刻：
+//   ① 计数可能刚被 SIO_statsReset() 清零（保存配置就会清零）；
+//   ② App 还没跑过任何动画（你刚从配置器切回来）。
+// 两者叠加 → 面板永远是「0 命中 / 所有路径被跳过」，用户只能得出「没生效」。
+// 现在多等 2.5s，让它在真实使用中采一段样。代际号防止连续请求叠多层。
+static uint32_t gStatsShowGen = 0;
+static void SIO_showStatsSoon(void) {
+    uint32_t gen = ++gStatsShowGen;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (gen != gStatsShowGen) return;
+        if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+        SIO_showStats();
+    });
+}
+
 // v2.1.12（F-A）：收到配置 App 的统计请求 → 在当前前台 App 内弹浮层。
 // 同样遵守 v2.1.10 的竞态约定：Darwin 回调在通知线程，UI 操作必须回主线程。
 // v2.1.15：不再无脑 SIO_showStats()。后台态先挂起请求，回到前台再弹（见 sioStatsArmed 注释）。
@@ -1510,8 +1576,8 @@ static void SIO_onStatsRequest(CFNotificationCenterRef center, void *observer,
             NSLog(@"%@", SIO_statsLogLine());   // 有 Mac 的话 Console 里也留一份
             sioStatsArmed = YES;
             if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
-                sioStatsArmed = NO;             // 已在前台，直接弹
-                SIO_showStats();
+                sioStatsArmed = NO;             // 已在前台，直接进入采样窗口
+                SIO_showStatsSoon();
             }
             // 否则保持 armed，等 SIO_onDidBecomeActive 把它弹出来
         } @catch (__unused NSException *e) {}
@@ -1520,11 +1586,12 @@ static void SIO_onStatsRequest(CFNotificationCenterRef center, void *observer,
 
 // v2.1.15：App 回到前台时，如果之前挂着一笔统计请求，就现在弹。
 // 这解决了「常驻后台的 App 收到请求时不是 Active、浮层永不出现」的问题。
+// v2.2.1：不再立刻弹，而是进入 2.5s 采样窗口（否则刚回到前台必然 0 命中）。
 static void SIO_onDidBecomeActive(NSNotification *note) {
     (void)note;
     if (!sioStatsArmed) return;
     sioStatsArmed = NO;
-    SIO_showStats();
+    SIO_showStatsSoon();
 }
 
 static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
@@ -2427,6 +2494,7 @@ static void SIOriginalInit(void) {
     @try {
     // v2.2.0：安全启动必须发生在读配置之前 —— 它决定「这次要不要把激进钩子关掉」。
     SIO_safeBootBegin();
+    gStatsSince = CACurrentMediaTime();   // v2.2.1：统计窗口从进程起来开始算
     pthread_key_create(&gInUIViewAnimKey, NULL);
     pthread_key_create(&gInPAInitKey, NULL);
     gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
@@ -2639,7 +2707,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.2.0 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
+    NSLog(@"[SIOriginal] v2.2.1 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -3568,7 +3636,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.2.0 (SIOriginal v2.2.0) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.2.1 (SIOriginal v2.2.1) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
