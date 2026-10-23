@@ -1,0 +1,92 @@
+name: Build SIOriginalBG (dylib + IPA)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'sioriginalbg-v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build SIOriginalBG dylib + IPA
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      # ① dylib — 只保留 FUBG 真后台保活（纯 runtime，无 Substrate）
+      - name: Build dylib (pure clang)
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          mkdir -p artifacts
+          clang -arch arm64 -dynamiclib -O2 \
+            -install_name @rpath/SIOriginalBG.dylib \
+            -isysroot "$SDK" \
+            -ISIOriginal-BG/Tweak \
+            -miphoneos-version-min=14.0 \
+            -undefined dynamic_lookup -fobjc-arc \
+            -framework Foundation -framework UIKit -framework AVFoundation -framework UserNotifications \
+            -o artifacts/SIOriginalBG.dylib SIOriginal-BG/Tweak/SIOriginalBG.m
+          codesign --force --sign - artifacts/SIOriginalBG.dylib
+          lipo -info artifacts/SIOriginalBG.dylib
+          file artifacts/SIOriginalBG.dylib
+          echo "dylib size: $(du -h artifacts/SIOriginalBG.dylib | cut -f1)"
+
+      # ② 配置 App IPA
+      - name: Build app & IPA
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          APP="build/SIOriginalBG.app"
+          rm -rf build
+          mkdir -p "$APP"
+
+          clang -arch arm64 -O2 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -framework Foundation -framework UIKit \
+            -o "$APP/SIOriginalBG" SIOriginal-BG/App/main.m
+
+          cp SIOriginal-BG/App/Info.plist "$APP/Info.plist"
+          cp SIOriginal-BG/App/AppIcon.png "$APP/AppIcon.png"
+          for f in SIOriginal-BG/App/Icon-*.png; do cp "$f" "$APP/$(basename $f)"; done
+          codesign --force --sign - --entitlements SIOriginal-BG/entitlements.plist "$APP"
+
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/SIOriginalBG.app
+          ( cd build && zip -qry ../artifacts/SIOriginalBG.ipa Payload -x "*.DS_Store" )
+          echo "IPA size: $(du -h artifacts/SIOriginalBG.ipa | cut -f1)"
+
+      - name: Verify artifacts
+        run: |
+          set -e
+          ls -lh artifacts/
+          file artifacts/SIOriginalBG.dylib
+          unzip -l artifacts/SIOriginalBG.ipa
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SIOriginalBG-artifacts
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/sioriginalbg-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: SIOriginalBG ${{ github.ref_name }}
+          files: |
+            artifacts/SIOriginalBG.dylib
+            artifacts/SIOriginalBG.ipa
+          generate_release_notes: true

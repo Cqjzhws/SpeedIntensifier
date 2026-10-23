@@ -1,0 +1,588 @@
+// SIOriginalBG — 真后台保活（v3.0.0-BG）
+//
+// SIOriginal v2.4.1 精简版：按「只保留真后台，其他功能全部删除」重制。
+// 已整体删除（代码级移除，不是关闭开关）：
+//   · 动画加速（CAAnimation / CATransaction / UIView 块动画 / UISpring /
+//     UIViewPropertyAnimator / 转场 / 导航模态 Tab / LayerBoost / TransitionBoost）
+//   · 手感（UIScrollView decelerationRate / delaysContentTouches / setZoomScale）
+//   · HUD 快速显示（WKWebView / SVProgressHUD / MBProgressHUD / UIActivityIndicatorView）
+//   · 命中统计浮层、生效 toast、安全启动自愈、安全模式、配置快照/预设/历史
+//   · 微信图片预览放大态旁路探测器
+// 保留：FUBG 真后台保活双引擎（含 v2.3.x 全部修正）
+//   引擎一 场景伪装 SceneFake —— 拦截 FrontBoard 下发的后台化 scene diff
+//   引擎二 音频断言 AudioKeep —— 静音白噪 + AVAudioSession 断言防挂起
+//
+// 配置：/var/Managed Preferences/mobile/com.local.sioriginalbg.plist
+//   Enabled      总开关（缺键 = 开）
+//   SceneFake    场景伪装（缺键 = 开）
+//   AudioKeep    音频断言（缺键 = 开）
+//   Blacklist    排除名单，NSArray；精确匹配，条目结尾写 * 表示前缀匹配
+//   AppOverrides App 级覆盖：{ "bundle id" = { Enabled/SceneFake/AudioKeep = 0/1; }; }
+// 热重载：Darwin 通知 com.local.sioriginalbg.settingschanged
+
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <AVFoundation/AVFoundation.h>
+#import <UserNotifications/UserNotifications.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import <string.h>     // strstr：_fbg_appState 热路径上的 C 字符串判定（零分配）
+#import <dlfcn.h>
+#import "FUBGNoiseData.h"
+
+#define kPrefPath   @"/var/Managed Preferences/mobile/com.local.sioriginalbg.plist"
+#define kNotifyName @"com.local.sioriginalbg.settingschanged"
+#define SIOBG_VERSION @"v3.0.0-BG"
+
+// ---------- 全局状态 ----------
+static NSString *gSelfBundle = nil;
+
+static BOOL    gFUBGEnabled = YES;   // 总开关
+static BOOL    gSceneFake   = YES;   // 引擎一：场景伪装
+static BOOL    gAudioKeep   = YES;   // 引擎二：音频断言
+static NSArray *gExclude    = nil;   // 排除名单（黑名单）
+
+static BOOL gActive   = NO;   // 本 App 最终是否参与保活（总开关 ∧ 排除名单）
+static BOOL gUseScene = NO;   // 本 App 是否启用场景伪装
+static BOOL gUseAudio = NO;   // 本 App 是否启用音频断言
+static BOOL gPhysBg   = NO;   // 物理上是否处于后台（由真实生命周期通知维护）
+
+static BOOL gHasAudioMode   = NO;   // 宿主 App 是否声明 UIBackgroundModes=audio
+static BOOL gHasAppOverride = NO;   // 是否命中 App 级覆盖（仅用于日志）
+
+// ---------- 基础工具 ----------
+
+static NSString *SIOBG_bundleID(void) {
+    if (!gSelfBundle) gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    return gSelfBundle;
+}
+
+// AppOverrides 结构：
+//   AppOverrides = { "com.tencent.xin" = { Enabled = 1; SceneFake = 0; AudioKeep = 1; }; }
+// 命中当前进程则返回该字典，否则 nil。优先级：App 覆盖 > 全局。
+static NSDictionary *SIOBG_appOverride(NSDictionary *root) {
+    if (![root isKindOfClass:[NSDictionary class]]) return nil;
+    id ov = root[@"AppOverrides"];
+    if (![ov isKindOfClass:[NSDictionary class]]) return nil;
+    NSString *bid = SIOBG_bundleID();
+    if (!bid.length) return nil;
+    id mine = ((NSDictionary *)ov)[bid];
+    return [mine isKindOfClass:[NSDictionary class]] ? (NSDictionary *)mine : nil;
+}
+
+// 内置排除名单：桌面进程本身就是场景宿主，在它内部吞掉 scene 更新会影响全局所有 App。
+static BOOL SIOBG_builtinExcluded(void) {
+    static NSArray *list = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ list = @[ @"com.apple.springboard" ]; });
+    NSString *bid = SIOBG_bundleID();
+    return bid.length && [list containsObject:bid];
+}
+
+// ---------- 配置 ----------
+
+static void SIOBG_resetDefaults(void) {
+    gFUBGEnabled = YES;
+    gSceneFake   = YES;
+    gAudioKeep   = YES;
+    gExclude     = @[];
+}
+
+static BOOL SIOBG_isExcluded(void) {
+    if (SIOBG_builtinExcluded()) return YES;   // 内置排除优先级最高，配置无法打开
+    NSString *bid = SIOBG_bundleID();
+    for (NSString *b in gExclude) {
+        if (![b isKindOfClass:[NSString class]] || !b.length) continue;
+        if ([b hasSuffix:@"*"]) {
+            if (b.length > 1 && [bid hasPrefix:[b substringToIndex:b.length - 1]]) return YES;
+        } else if ([bid isEqualToString:b]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static void SIOBG_recalc(void) {
+    gActive   = gFUBGEnabled && !SIOBG_isExcluded();
+    gUseScene = gActive && gSceneFake;
+    gUseAudio = gActive && gAudioKeep;
+}
+
+static void SIOBG_loadPref(void) {
+    @try {
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
+        if (!d) {
+            // 缺文件即回出厂默认，并留痕 —— 「删 plist 恢复默认」这条排障契约必须成立。
+            SIOBG_resetDefaults();
+            NSLog(@"[SIOBG] prefs file missing/unreadable at %@ — reset to factory defaults", kPrefPath);
+        } else {
+            if (d[@"Enabled"])   gFUBGEnabled = [d[@"Enabled"] boolValue];
+            if (d[@"SceneFake"]) gSceneFake   = [d[@"SceneFake"] boolValue];
+            if (d[@"AudioKeep"]) gAudioKeep   = [d[@"AudioKeep"] boolValue];
+
+            // 排除名单：兼容 NSArray / 逗号分隔字符串两种写法；
+            // 清洗非字符串元素（plist 手工编辑很容易混进 NSNumber，不洗会 unrecognized selector）。
+            NSMutableArray *clean = [NSMutableArray array];
+            id bl = d[@"Blacklist"];
+            if ([bl isKindOfClass:[NSArray class]]) {
+                for (id it in (NSArray *)bl) {
+                    if (![it isKindOfClass:[NSString class]]) continue;
+                    NSString *s = [(NSString *)it stringByTrimmingCharactersInSet:
+                                   [NSCharacterSet whitespaceCharacterSet]];
+                    if (s.length) [clean addObject:s];
+                }
+            } else if ([bl isKindOfClass:[NSString class]] && [(NSString *)bl length]) {
+                for (NSString *it in [(NSString *)bl componentsSeparatedByString:@","]) {
+                    NSString *s = [it stringByTrimmingCharactersInSet:
+                                   [NSCharacterSet whitespaceCharacterSet]];
+                    if (s.length) [clean addObject:s];
+                }
+            }
+            gExclude = clean;
+
+            NSDictionary *ovr = SIOBG_appOverride(d);
+            gHasAppOverride = (ovr != nil);
+            if (ovr) {
+                if (ovr[@"Enabled"])   gFUBGEnabled = [ovr[@"Enabled"] boolValue];
+                if (ovr[@"SceneFake"]) gSceneFake   = [ovr[@"SceneFake"] boolValue];
+                if (ovr[@"AudioKeep"]) gAudioKeep   = [ovr[@"AudioKeep"] boolValue];
+            }
+        }
+    } @catch (__unused NSException *e) {}
+    if (!gExclude) gExclude = @[];
+
+    NSArray *modes = [[NSBundle mainBundle] infoDictionary][@"UIBackgroundModes"];
+    gHasAudioMode = [modes isKindOfClass:[NSArray class]] && [modes containsObject:@"audio"];
+
+    SIOBG_recalc();
+}
+
+// ---------- 引擎一：场景伪装 ----------
+// 移植/修改自 ImmortalizerJailed main.m（GPLv3, Serge Alagon），致谢 @khanhduytran0
+
+static void (*gOrigSceneUpdate)(id, SEL, id, id, id, id);
+
+// 由后台化 diff 的描述特征判断这是否是一条"让 App 退到后台"的场景更新
+static BOOL SIOBG_isBackgroundingDiff(NSString *desc) {
+    if (!desc) return NO;
+    if ([desc containsString:@"foreground = NotSet"] ||
+        [desc containsString:@"foreground = No"] ||
+        [desc containsString:@"foreground = BSSettingFlagNo"] ||
+        [desc containsString:@"foreground = NO"]) {
+        return YES;
+    }
+    // 后台切换器快照相关更新同样吞掉，避免快照暴露/状态推进
+    if ([desc containsString:@"hostContextIdentifierForSnapshotting = 0"] ||
+        [desc containsString:@"scenePresenterRenderIdentifierForSnapshotting = 0"] ||
+        [desc containsString:@"targetOfEventDeferringEnvironments = (empty)"] ||
+        [desc containsString:@"FBSceneSnapshotAction:"]) {
+        return YES;
+    }
+    return NO;
+}
+
+static void SIOBG_sceneUpdate(id self, SEL _cmd, id arg1, id arg2, id arg3, id arg4) {
+    if (gUseScene) {
+        @try {
+            if (SIOBG_isBackgroundingDiff([arg2 description])) {
+                NSLog(@"[SIOBG] swallowed backgrounding scene diff");
+                return;
+            }
+        } @catch (__unused NSException *e) {}
+    }
+    gOrigSceneUpdate(self, _cmd, arg1, arg2, arg3, arg4);
+}
+
+// ---- applicationState 伪装 ----
+// 物理在后台时对绝大多数调用方返回 Active；但推送/通知框架需要真实答案
+// （前台态时它们不会建立后台接收通道），用 dladdr 识别调用者如实返回。
+
+static UIApplicationState (*gOrigAppState)(id, SEL);
+static void *gAsLastRet = NULL;      // 调用点缓存：同址重复调用退化为两次指针比较
+static BOOL  gAsLastBg  = NO;
+
+static UIApplicationState SIOBG_appState(id self, SEL _cmd) {
+    if (gUseScene && gPhysBg) {
+        void *ret = __builtin_extract_return_addr(__builtin_return_address(0));
+        BOOL bg;
+        if (ret != NULL && ret == gAsLastRet) {
+            bg = gAsLastBg;
+        } else {
+            bg = NO;
+            Dl_info info;
+            if (dladdr(ret, &info) && info.dli_fname) {
+                if (strstr(info.dli_fname, "UserNotifications") ||
+                    strstr(info.dli_fname, "PushKit")) {
+                    bg = YES;
+                }
+            }
+            gAsLastRet = ret;
+            gAsLastBg  = bg;
+        }
+        return bg ? UIApplicationStateBackground : UIApplicationStateActive;
+    }
+    return gOrigAppState ? gOrigAppState(self, _cmd) : UIApplicationStateActive;
+}
+
+// ---- 通知横幅伪装 ----
+// App 自以为在前台，系统默认不弹横幅；物理在后台时强制弹。
+// orig 按类存储：App 先后设置两个 delegate 时，全局单例会记错 IMP（self 与 IMP 不匹配）。
+
+typedef void (*SIOBG_WillPresentIMP)(id, SEL, UNUserNotificationCenter *, UNNotification *,
+                                     void (^)(UNNotificationPresentationOptions));
+static NSMapTable *gOrigWillPresentMap = nil;
+
+static void SIOBG_setOrigWillPresent(Class c, IMP imp) {
+    if (!c || !imp) return;
+    if (!gOrigWillPresentMap)
+        gOrigWillPresentMap = [NSMapTable mapTableWithKeyOptions:NSMapTableStrongMemory
+                                                   valueOptions:NSMapTableStrongMemory];
+    [gOrigWillPresentMap setObject:[NSValue valueWithPointer:(void *)imp] forKey:(id)c];
+}
+
+static SIOBG_WillPresentIMP SIOBG_origWillPresentFor(Class c) {
+    if (!gOrigWillPresentMap) return NULL;
+    for (Class k = c; k; k = class_getSuperclass(k)) {
+        NSValue *v = [gOrigWillPresentMap objectForKey:k];
+        if (v) return (SIOBG_WillPresentIMP)[v pointerValue];
+    }
+    return NULL;
+}
+
+static void SIOBG_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center,
+                              UNNotification *note,
+                              void (^handler)(UNNotificationPresentationOptions)) {
+    if (gUseScene && gPhysBg) {
+        handler(UNNotificationPresentationOptionBanner |
+                UNNotificationPresentationOptionSound |
+                UNNotificationPresentationOptionBadge);
+        return;
+    }
+    SIOBG_WillPresentIMP orig = SIOBG_origWillPresentFor([self class]);
+    if (orig) {
+        orig(self, _cmd, center, note, handler);
+    } else {
+        // UNUserNotificationCenterDelegate 契约要求 completionHandler 必须恰好调用一次，
+        // 不调用会让该条通知的呈现被挂起。按 fail-safe 哲学：绝不吞掉 handler。
+        handler(UNNotificationPresentationOptionBanner |
+                UNNotificationPresentationOptionSound |
+                UNNotificationPresentationOptionBadge);
+    }
+}
+
+static void (*gOrigUNSetDelegate)(id, SEL, id);
+
+static void SIOBG_unSetDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDelegate> delegate) {
+    if (gOrigUNSetDelegate) gOrigUNSetDelegate(self, _cmd, delegate);
+    if (delegate) {
+        Class dc = [delegate class];
+        SEL sel = @selector(userNotificationCenter:willPresentNotification:withCompletionHandler:);
+        Method m = class_getInstanceMethod(dc, sel);
+        if (m) {
+            IMP cur = method_getImplementation(m);
+            if (cur != (IMP)SIOBG_willPresent) {
+                // class_getInstanceMethod 可能返回父类的 Method；先尝试 class_addMethod
+                // 新增子类覆写，失败（本类已有实现）才 method_setImplementation。
+                if (!class_addMethod(dc, sel, (IMP)SIOBG_willPresent, method_getTypeEncoding(m))) {
+                    method_setImplementation(m, (IMP)SIOBG_willPresent);
+                }
+                SIOBG_setOrigWillPresent(dc, cur);
+            }
+        }
+    }
+}
+
+static void SIOBG_installSceneHooks(void) {
+    Class wsClass = objc_getClass("FBSWorkspaceScenesClient");
+    Method sceneM = wsClass ? class_getInstanceMethod(
+        wsClass, @selector(sceneID:updateWithSettingsDiff:transitionContext:completion:)) : NULL;
+    if (sceneM) {
+        IMP cur = method_getImplementation(sceneM);
+        if (cur != (IMP)SIOBG_sceneUpdate) {
+            gOrigSceneUpdate = (void (*)(id, SEL, id, id, id, id))cur;
+            method_setImplementation(sceneM, (IMP)SIOBG_sceneUpdate);
+            NSLog(@"[SIOBG] scene hook installed");
+        } else {
+            NSLog(@"[SIOBG] scene hook already installed (skip duplicate)");
+        }
+    } else {
+        NSLog(@"[SIOBG] FBSWorkspaceScenesClient method not found, scene engine disabled");
+    }
+
+    Method stateM = class_getInstanceMethod([UIApplication class], @selector(applicationState));
+    if (stateM) {
+        IMP cur = method_getImplementation(stateM);
+        if (cur != (IMP)SIOBG_appState) {
+            gOrigAppState = (UIApplicationState (*)(id, SEL))cur;
+            method_setImplementation(stateM, (IMP)SIOBG_appState);
+        }
+    }
+
+    Class unClass = [UNUserNotificationCenter class];
+    Method delM = class_getInstanceMethod(unClass, @selector(setDelegate:));
+    if (delM) {
+        IMP cur = method_getImplementation(delM);
+        if (cur != (IMP)SIOBG_unSetDelegate) {
+            gOrigUNSetDelegate = (void (*)(id, SEL, id))cur;
+            method_setImplementation(delM, (IMP)SIOBG_unSetDelegate);
+        }
+    }
+}
+
+// ---------- 引擎二：音频断言 ----------
+
+static AVAudioPlayer *gPlayer = nil;
+static UIBackgroundTaskIdentifier gTask = 0;   // 0 = 无桥接任务
+static NSTimer *gWatchdog = nil;
+static NSMutableArray *gObs = nil;             // 强引用 block 观察者 token，释放即注销
+
+static BOOL SIOBG_activateSession(void) {
+    NSError *e = nil;
+    AVAudioSession *s = [AVAudioSession sharedInstance];
+    if (![s setCategory:AVAudioSessionCategoryPlayback
+            withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&e] || e) {
+        NSLog(@"[SIOBG] setCategory failed: %@", e); return NO;
+    }
+    e = nil;
+    if (![s setActive:YES error:&e]) {
+        NSLog(@"[SIOBG] setActive failed: %@", e); return NO;
+    }
+    return YES;
+}
+
+// 白噪是编译期常量，解码一次缓存复用。
+static NSData *SIOBG_noiseData(void) {
+    static NSData *d;
+    static dispatch_once_t t;
+    dispatch_once(&t, ^{
+        d = [[NSData alloc] initWithBase64EncodedString:kFBGNoiseB64
+                                               options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    });
+    return d;
+}
+
+static void SIOBG_buildAndPlay(void) {
+    @try {
+        NSData *data = SIOBG_noiseData();
+        if (!data.length) return;
+        AVAudioPlayer *p = [[AVAudioPlayer alloc] initWithData:data error:nil];
+        if (!p) return;
+        p.numberOfLoops = -1;
+        p.volume = 0.0f;
+        [p prepareToPlay];
+        [p play];
+        gPlayer = p;
+    } @catch (__unused NSException *e) {}
+}
+
+static void SIOBG_startAudio(void) {
+    if (!gUseAudio) return;
+    @try {
+        UIApplication *app = [UIApplication sharedApplication];
+        if (gTask == 0) {
+            gTask = [app beginBackgroundTaskWithName:@"sibg-bridge" expirationHandler:^{
+                NSLog(@"[SIOBG] bridge task expired");
+                if (gTask != 0) { [app endBackgroundTask:gTask]; gTask = 0; }
+            }];
+        }
+        if (SIOBG_activateSession() && (!gPlayer || !gPlayer.isPlaying)) {
+            if (gPlayer) { [gPlayer play]; }
+            else { SIOBG_buildAndPlay(); }
+        }
+        NSLog(@"[SIOBG] audio keep-alive started (audioMode=%d)", gHasAudioMode);
+    } @catch (__unused NSException *e) {}
+}
+
+static void SIOBG_stopAudio(BOOL releaseSession) {
+    @try {
+        if (gPlayer.isPlaying) [gPlayer pause];
+        // mix 模式下保持 session 激活、不主动 setActive:NO，避免与目标 App 自身音频会话
+        // 打架造成的卡顿；仅彻底关闭时通知他人恢复。
+        if (releaseSession) {
+            [[AVAudioSession sharedInstance] setActive:NO
+                                          withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+                                                error:nil];
+        }
+        UIApplication *app = [UIApplication sharedApplication];
+        if (gTask != 0) { [app endBackgroundTask:gTask]; gTask = 0; }
+    } @catch (__unused NSException *e) {}
+}
+
+// 看门狗按需装卸：只在真正进入后台时安装（后台无滚动，NSDefaultRunLoopMode 足够），
+// 回前台即卸载；prefs 里关掉音频保活时同样卸载。周期 3s，低电量 6s。
+static void SIOBG_watchdogStop(void) {
+    if (gWatchdog) { [gWatchdog invalidate]; gWatchdog = nil; }
+}
+
+static void SIOBG_watchdogFire(NSTimer *t);
+
+static int gWatchdogStrikes = 0;
+static int gWatchdogBackoff = 0;
+static NSTimeInterval gWatchdogStep = 3.0;
+
+static void SIOBG_watchdogStart(void) {
+    if (gWatchdog || !gUseAudio || !gPhysBg) return;
+    BOOL lowPower = NO;
+    @try { lowPower = [NSProcessInfo processInfo].isLowPowerModeEnabled; } @catch (__unused NSException *e) {}
+    NSTimeInterval step = lowPower ? 6.0 : 3.0;
+    gWatchdogStep = step;   // 退避按「秒」换算，不假设固定周期
+    gWatchdog = [NSTimer scheduledTimerWithTimeInterval:step repeats:YES
+                                                  block:^(NSTimer *t){ SIOBG_watchdogFire(t); }];
+    NSLog(@"[SIOBG] watchdog started, interval=%.1fs (lowPower=%d)", step, lowPower);
+}
+
+// 自愈轮询：仅在停摆时重建。连续 3 次失败退避约 30s（按实际周期换算），恢复时打日志。
+static void SIOBG_watchdogFire(__unused NSTimer *t) {
+    if (!gUseAudio || !gPhysBg) return;
+    if (gWatchdogBackoff > 0) {
+        if (--gWatchdogBackoff == 0) {
+            gWatchdogStrikes = 0;
+            NSLog(@"[SIOBG] watchdog: backoff ended, strike counter reset");
+        }
+        return;
+    }
+    @try {
+        if (!gPlayer || !gPlayer.isPlaying) {
+            NSLog(@"[SIOBG] watchdog: player stopped, rebuilding (strike %d)", gWatchdogStrikes + 1);
+            SIOBG_activateSession();
+            if (gPlayer) { [gPlayer play]; }
+            else { SIOBG_buildAndPlay(); }
+            if (gPlayer && gPlayer.isPlaying) {
+                if (gWatchdogStrikes > 0)
+                    NSLog(@"[SIOBG] watchdog: recovered after %d failed rebuild(s)", gWatchdogStrikes);
+                gWatchdogStrikes = 0;
+            } else if (++gWatchdogStrikes >= 3) {
+                double step = (gWatchdogStep > 0.5) ? gWatchdogStep : 3.0;
+                gWatchdogBackoff = (int)MAX(1.0, round(30.0 / step));
+                NSLog(@"[SIOBG] watchdog: 3 consecutive rebuilds failed, backing off %.0fs (%d ticks @ %.1fs)",
+                      30.0, gWatchdogBackoff, step);
+            }
+        } else {
+            gWatchdogStrikes = 0;
+        }
+    } @catch (__unused NSException *e) {}
+}
+
+static void SIOBG_onInterruption(NSNotification *note) {
+    if (!gUseAudio) return;
+    NSNumber *type = note.userInfo[AVAudioSessionInterruptionTypeKey];
+    if (type.unsignedIntegerValue != AVAudioSessionInterruptionTypeEnded) return;
+    NSNumber *opt = note.userInfo[AVAudioSessionInterruptionOptionKey];
+    if (opt.unsignedIntegerValue & AVAudioSessionInterruptionOptionShouldResume) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (gUseAudio && gPhysBg) {
+                SIOBG_activateSession();
+                if (gPlayer) { [gPlayer play]; } else { SIOBG_buildAndPlay(); }
+            }
+        });
+    }
+}
+
+// ---------- 生命周期 / 热重载 ----------
+
+static void SIOBG_onEnterBackground(NSNotification *note) {
+    gPhysBg = YES;
+    SIOBG_startAudio();
+    SIOBG_watchdogStart();
+}
+
+static void SIOBG_onEnterForeground(NSNotification *note) {
+    gPhysBg = NO;
+    SIOBG_watchdogStop();
+    // 回前台只暂停播放、保留会话（mix 模式下不与 App 音频冲突）
+    if (gPlayer.isPlaying) [gPlayer pause];
+    if (gTask != 0) {
+        [[UIApplication sharedApplication] endBackgroundTask:gTask];
+        gTask = 0;
+    }
+}
+
+static void SIOBG_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n,
+                               const void *obj, CFDictionaryRef info) {
+    (void)c; (void)o; (void)n; (void)obj; (void)info;
+    // Darwin 回调在通知线程上执行，直接改全局会与主线程上的 hook 并发读写。
+    // 统一丢主线程串行执行；_fbg_loadPref 换 gExclude 时若另线程正在遍历旧数组会野指针。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            SIOBG_loadPref();
+            NSLog(@"[SIOBG] prefs reloaded: active=%d scene=%d audio=%d override=%d physBg=%d",
+                  gActive, gUseScene, gUseAudio, gHasAppOverride, gPhysBg);
+            if (!gUseAudio && gPhysBg) { SIOBG_stopAudio(NO); SIOBG_watchdogStop(); }
+            if (gUseAudio && gPhysBg && (!gPlayer || !gPlayer.isPlaying)) {
+                SIOBG_startAudio(); SIOBG_watchdogStart();
+            }
+        } @catch (__unused NSException *e) {}
+    });
+}
+
+// ---------- 入口 ----------
+
+__attribute__((constructor))
+static void SIOBGEntry(void) {
+    @autoreleasepool {
+    // 全程 @try 包裹：保活引擎装不上也不能拖垮目标 App。
+    @try {
+        SIOBG_loadPref();
+
+        // hook 一次性安装，内部按全局开关决定行为
+        dispatch_async(dispatch_get_main_queue(), ^{
+            SIOBG_installSceneHooks();
+        });
+
+        gObs = [NSMutableArray array];
+
+        // 前后台感知必须注册到**进程内** NSNotificationCenter：Darwin 中心是系统级广播
+        // 总线，只收 notify_post() 发出的名字，这两个通知永远不会出现在上面 ——
+        // 注册错了 gPhysBg 恒为 NO，音频断言/看门狗/横幅伪装/中断恢复会全部静默失效。
+        // block 观察者的返回值必须持有，否则立即自动注销。
+        id obBg = [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationDidEnterBackgroundNotification
+                        object:nil queue:[NSOperationQueue mainQueue]
+                   usingBlock:^(__unused NSNotification *n){ SIOBG_onEnterBackground(n); }];
+        id obFg = [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationWillEnterForegroundNotification
+                        object:nil queue:[NSOperationQueue mainQueue]
+                   usingBlock:^(__unused NSNotification *n){ SIOBG_onEnterForeground(n); }];
+        if (obBg) [gObs addObject:obBg];
+        if (obFg) [gObs addObject:obFg];
+
+        id obInt = [[NSNotificationCenter defaultCenter]
+            addObserverForName:AVAudioSessionInterruptionNotification
+            object:nil queue:[NSOperationQueue mainQueue]
+            usingBlock:^(NSNotification *n){ SIOBG_onInterruption(n); }];
+        id obRoute = [[NSNotificationCenter defaultCenter]
+            addObserverForName:AVAudioSessionRouteChangeNotification
+            object:nil queue:[NSOperationQueue mainQueue]
+            usingBlock:^(__unused NSNotification *n){
+                if (gUseAudio && gPhysBg) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        // 线路变化后 player 可能已被系统释放（nil），只 play 不重建会永久失效。
+                        if (gPlayer) {
+                            if (!gPlayer.isPlaying) [gPlayer play];
+                        } else {
+                            SIOBG_buildAndPlay();
+                        }
+                    });
+                }
+            }];
+        if (obInt)   [gObs addObject:obInt];
+        if (obRoute) [gObs addObject:obRoute];
+
+        // 配置热重载是跨进程的（配置 App 用 Darwin 广播），这一条继续走 Darwin 中心。
+        CFNotificationCenterRef dc = CFNotificationCenterGetDarwinNotifyCenter();
+        CFNotificationCenterAddObserver(dc, NULL, SIOBG_onPrefReload,
+            (__bridge CFStringRef)kNotifyName, NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+
+        NSLog(@"[SIOBG] %@ loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+              SIOBG_VERSION,
+              SIOBG_bundleID().length ? SIOBG_bundleID() : @"?",
+              gActive, gUseScene, gUseAudio, gHasAudioMode,
+              (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
+    } @catch (NSException *e) {
+        NSLog(@"[SIOBG] keep-alive install failed (app unaffected): %@", e);
+    }
+    }
+}
