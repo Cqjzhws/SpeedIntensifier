@@ -1,4 +1,4 @@
-// SIOriginalBG — 真后台保活（v3.0.0-BG）
+// SIOriginalBG — 真后台保活（v3.0.1-BG）
 //
 // SIOriginal v2.4.1 精简版：按「只保留真后台，其他功能全部删除」重制。
 // 已整体删除（代码级移除，不是关闭开关）：
@@ -12,12 +12,28 @@
 //   引擎一 场景伪装 SceneFake —— 拦截 FrontBoard 下发的后台化 scene diff
 //   引擎二 音频断言 AudioKeep —— 静音白噪 + AVAudioSession 断言防挂起
 //
+// ===================== v3.0.1 通话感知避让（修忙线拒接/来电通知延迟）=====================
+// 真机反馈：装了黄白助手「忙线拒接」后，① 该功能与保活冲突；② 停留在微信页面时
+// 来电不通知、过一会才通知。根因是音频断言在前台**只 pause 不释放会话**：
+// 我们的静音 Playback 会话长期激活，微信自身要激活 PlayAndRecord 才能响铃/推送
+// VoIP 通知时会被推迟；忙线拒接检测通话/忙线状态同样被这层会话干扰。
+// 本版三处修正：
+//   [1] 会话归属跟踪 gSessionOurs：只有我们亲手激活的会话才允许 setActive:NO，
+//       绝不误关 App 自己的音频（否则会打断微信语音/视频播放）。
+//   [2] 回前台彻底释放会话（原来只 pause），前台本就不需要保活。
+//   [3] 通话感知 CallAware（默认开）：看门狗 / 线路变化 / 中断恢复三处检测
+//       AVAudioSession.category 变成 PlayAndRecord / Record（别人占用）时，
+//       立刻暂停播放并释放会话，并进入 15s 避让窗口，期间不自愈、不重抢。
+//       中断恢复（ShouldResume）也改成「仅在没人占用时才重新激活」。
+// =========================================================================================
+//
 // 配置：/var/Managed Preferences/mobile/com.local.sioriginalbg.plist
 //   Enabled      总开关（缺键 = 开）
 //   SceneFake    场景伪装（缺键 = 开）
 //   AudioKeep    音频断言（缺键 = 开）
+//   CallAware    通话感知避让（缺键 = 开；v3.0.1 新增，配合忙线拒接等插件）
 //   Blacklist    排除名单，NSArray；精确匹配，条目结尾写 * 表示前缀匹配
-//   AppOverrides App 级覆盖：{ "bundle id" = { Enabled/SceneFake/AudioKeep = 0/1; }; }
+//   AppOverrides App 级覆盖：{ "bundle id" = { Enabled/SceneFake/AudioKeep/CallAware = 0/1; }; }
 // 热重载：Darwin 通知 com.local.sioriginalbg.settingschanged
 
 #import <Foundation/Foundation.h>
@@ -32,7 +48,9 @@
 
 #define kPrefPath   @"/var/Managed Preferences/mobile/com.local.sioriginalbg.plist"
 #define kNotifyName @"com.local.sioriginalbg.settingschanged"
-#define SIOBG_VERSION @"v3.0.0-BG"
+#define SIOBG_VERSION @"v3.0.1-BG"
+// v3.0.1：检测到别人占用音频会话后的避让窗口（秒）。覆盖来电响铃 + VoIP 通知推送全程。
+#define SIOBG_YIELD_WINDOW 15.0
 
 // ---------- 全局状态 ----------
 static NSString *gSelfBundle = nil;
@@ -49,6 +67,7 @@ static BOOL gPhysBg   = NO;   // 物理上是否处于后台（由真实生命�
 
 static BOOL gHasAudioMode   = NO;   // 宿主 App 是否声明 UIBackgroundModes=audio
 static BOOL gHasAppOverride = NO;   // 是否命中 App 级覆盖（仅用于日志）
+static BOOL gCallAware      = YES;  // v3.0.1 通话感知避让（配合忙线拒接等插件）
 
 // ---------- 基础工具 ----------
 
@@ -85,6 +104,7 @@ static void SIOBG_resetDefaults(void) {
     gFUBGEnabled = YES;
     gSceneFake   = YES;
     gAudioKeep   = YES;
+    gCallAware   = YES;   // v3.0.1：缺键 = 开（兼容项，fail-safe 方向是"不打扰别人"）
     gExclude     = @[];
 }
 
@@ -119,6 +139,7 @@ static void SIOBG_loadPref(void) {
             if (d[@"Enabled"])   gFUBGEnabled = [d[@"Enabled"] boolValue];
             if (d[@"SceneFake"]) gSceneFake   = [d[@"SceneFake"] boolValue];
             if (d[@"AudioKeep"]) gAudioKeep   = [d[@"AudioKeep"] boolValue];
+            if (d[@"CallAware"]) gCallAware   = [d[@"CallAware"] boolValue];
 
             // 排除名单：兼容 NSArray / 逗号分隔字符串两种写法；
             // 清洗非字符串元素（plist 手工编辑很容易混进 NSNumber，不洗会 unrecognized selector）。
@@ -146,6 +167,7 @@ static void SIOBG_loadPref(void) {
                 if (ovr[@"Enabled"])   gFUBGEnabled = [ovr[@"Enabled"] boolValue];
                 if (ovr[@"SceneFake"]) gSceneFake   = [ovr[@"SceneFake"] boolValue];
                 if (ovr[@"AudioKeep"]) gAudioKeep   = [ovr[@"AudioKeep"] boolValue];
+                if (ovr[@"CallAware"]) gCallAware   = [ovr[@"CallAware"] boolValue];
             }
         }
     } @catch (__unused NSException *e) {}
@@ -335,6 +357,8 @@ static AVAudioPlayer *gPlayer = nil;
 static UIBackgroundTaskIdentifier gTask = 0;   // 0 = 无桥接任务
 static NSTimer *gWatchdog = nil;
 static NSMutableArray *gObs = nil;             // 强引用 block 观察者 token，释放即注销
+static BOOL gSessionOurs = NO;                 // v3.0.1：当前激活的会话是否由我们持有
+static NSTimeInterval gForeignAt = 0;          // v3.0.1：最近一次检测到别人占用会话的时刻
 
 static BOOL SIOBG_activateSession(void) {
     NSError *e = nil;
@@ -347,7 +371,39 @@ static BOOL SIOBG_activateSession(void) {
     if (![s setActive:YES error:&e]) {
         NSLog(@"[SIOBG] setActive failed: %@", e); return NO;
     }
+    gSessionOurs = YES;   // 只有走到这里，之后才允许我们 setActive:NO
     return YES;
+}
+
+// v3.0.1：只释放「我们自己持有」的会话。误关 App 自己的会话会直接打断微信语音/
+// 视频播放，这比不保活糟得多，所以必须先判归属。
+static void SIOBG_releaseSession(void) {
+    if (!gSessionOurs) return;
+    @try {
+        [[AVAudioSession sharedInstance] setActive:NO
+                                      withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+                                            error:nil];
+    } @catch (__unused NSException *e) {}
+    gSessionOurs = NO;
+}
+
+// v3.0.1：别人（微信自身通话、忙线拒接等插件）把会话改成录音/通话类时返回 YES。
+// AVAudioSession 是进程内单例，category 被改掉我们这边同样读得到。
+static BOOL SIOBG_foreignSessionActive(void) {
+    @try {
+        NSString *cat = [[AVAudioSession sharedInstance] category];
+        return [cat isEqualToString:AVAudioSessionCategoryPlayAndRecord] ||
+               [cat isEqualToString:AVAudioSessionCategoryRecord];
+    } @catch (__unused NSException *e) { return NO; }
+}
+
+// v3.0.1：让位 —— 暂停播放、释放会话、记下避让起点。
+static void SIOBG_yieldForForeignSession(void) {
+    if (!SIOBG_foreignSessionActive()) return;
+    gForeignAt = CACurrentMediaTime();
+    if (gPlayer.isPlaying) { @try { [gPlayer pause]; } @catch (__unused NSException *e) {} }
+    SIOBG_releaseSession();
+    NSLog(@"[SIOBG] yielded audio session to a foreign (call/record) session");
 }
 
 // 白噪是编译期常量，解码一次缓存复用。
@@ -398,11 +454,7 @@ static void SIOBG_stopAudio(BOOL releaseSession) {
         if (gPlayer.isPlaying) [gPlayer pause];
         // mix 模式下保持 session 激活、不主动 setActive:NO，避免与目标 App 自身音频会话
         // 打架造成的卡顿；仅彻底关闭时通知他人恢复。
-        if (releaseSession) {
-            [[AVAudioSession sharedInstance] setActive:NO
-                                          withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
-                                                error:nil];
-        }
+        if (releaseSession) SIOBG_releaseSession();
         UIApplication *app = [UIApplication sharedApplication];
         if (gTask != 0) { [app endBackgroundTask:gTask]; gTask = 0; }
     } @catch (__unused NSException *e) {}
@@ -432,6 +484,7 @@ static void SIOBG_watchdogStart(void) {
 }
 
 // 自愈轮询：仅在停摆时重建。连续 3 次失败退避约 30s（按实际周期换算），恢复时打日志。
+// v3.0.1：避让窗口内不自愈、不重抢会话（来电响铃 / VoIP 通知期间）。
 static void SIOBG_watchdogFire(__unused NSTimer *t) {
     if (!gUseAudio || !gPhysBg) return;
     if (gWatchdogBackoff > 0) {
@@ -441,6 +494,9 @@ static void SIOBG_watchdogFire(__unused NSTimer *t) {
         }
         return;
     }
+    if (gCallAware && gForeignAt > 0 && (CACurrentMediaTime() - gForeignAt) < SIOBG_YIELD_WINDOW)
+        return;   // 通话/插件正用着会话，别抢
+    if (gCallAware) SIOBG_yieldForForeignSession();
     @try {
         if (!gPlayer || !gPlayer.isPlaying) {
             NSLog(@"[SIOBG] watchdog: player stopped, rebuilding (strike %d)", gWatchdogStrikes + 1);
@@ -471,7 +527,8 @@ static void SIOBG_onInterruption(NSNotification *note) {
     if (opt.unsignedIntegerValue & AVAudioSessionInterruptionOptionShouldResume) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            if (gUseAudio && gPhysBg) {
+            // v3.0.1：别人（来电/忙线拒接）还占着会话时，绝不重新激活去抢。
+            if (gUseAudio && gPhysBg && !(gCallAware && SIOBG_foreignSessionActive())) {
                 SIOBG_activateSession();
                 if (gPlayer) { [gPlayer play]; } else { SIOBG_buildAndPlay(); }
             }
@@ -490,8 +547,12 @@ static void SIOBG_onEnterBackground(NSNotification *note) {
 static void SIOBG_onEnterForeground(NSNotification *note) {
     gPhysBg = NO;
     SIOBG_watchdogStop();
-    // 回前台只暂停播放、保留会话（mix 模式下不与 App 音频冲突）
-    if (gPlayer.isPlaying) [gPlayer pause];
+    // v3.0.1：回前台不只 pause，还要**彻底释放会话**。
+    // 旧行为让静音 Playback 会话在前台长期激活：微信要激活 PlayAndRecord 才能响铃 /
+    // 推 VoIP 通知时会被这层会话推迟 —— 真机表现就是「停在微信页面，来电过一会才通知」，
+    // 忙线拒接的通话/忙线检测也被干扰。前台不需要保活，完整让出。
+    if (gPlayer.isPlaying) { @try { [gPlayer pause]; } @catch (__unused NSException *e) {} }
+    SIOBG_releaseSession();
     if (gTask != 0) {
         [[UIApplication sharedApplication] endBackgroundTask:gTask];
         gTask = 0;
@@ -506,8 +567,8 @@ static void SIOBG_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             SIOBG_loadPref();
-            NSLog(@"[SIOBG] prefs reloaded: active=%d scene=%d audio=%d override=%d physBg=%d",
-                  gActive, gUseScene, gUseAudio, gHasAppOverride, gPhysBg);
+            NSLog(@"[SIOBG] prefs reloaded: active=%d scene=%d audio=%d callAware=%d override=%d physBg=%d",
+                  gActive, gUseScene, gUseAudio, gCallAware, gHasAppOverride, gPhysBg);
             if (!gUseAudio && gPhysBg) { SIOBG_stopAudio(NO); SIOBG_watchdogStop(); }
             if (gUseAudio && gPhysBg && (!gPlayer || !gPlayer.isPlaying)) {
                 SIOBG_startAudio(); SIOBG_watchdogStart();
@@ -555,10 +616,13 @@ static void SIOBGEntry(void) {
             addObserverForName:AVAudioSessionRouteChangeNotification
             object:nil queue:[NSOperationQueue mainQueue]
             usingBlock:^(__unused NSNotification *n){
+                // v3.0.1：线路变化先让位检测（来电/挂断会改 route 与 category）
+                if (gCallAware && gPhysBg) SIOBG_yieldForForeignSession();
                 if (gUseAudio && gPhysBg) {
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                                    dispatch_get_main_queue(), ^{
                         // 线路变化后 player 可能已被系统释放（nil），只 play 不重建会永久失效。
+                        if (gCallAware && SIOBG_foreignSessionActive()) return;
                         if (gPlayer) {
                             if (!gPlayer.isPlaying) [gPlayer play];
                         } else {
@@ -576,10 +640,10 @@ static void SIOBGEntry(void) {
             (__bridge CFStringRef)kNotifyName, NULL,
             CFNotificationSuspensionBehaviorDeliverImmediately);
 
-        NSLog(@"[SIOBG] %@ loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[SIOBG] %@ loaded in %@: active=%d scene=%d audio=%d callAware=%d audioMode=%d%@",
               SIOBG_VERSION,
               SIOBG_bundleID().length ? SIOBG_bundleID() : @"?",
-              gActive, gUseScene, gUseAudio, gHasAudioMode,
+              gActive, gUseScene, gUseAudio, gCallAware, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
     } @catch (NSException *e) {
         NSLog(@"[SIOBG] keep-alive install failed (app unaffected): %@", e);

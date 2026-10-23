@@ -1,7 +1,10 @@
-# SIOriginal-BG v3.0.0-BG — 真后台保活（源码）
+# SIOriginal-BG v3.0.1-BG — 真后台保活（源码）
 
 打包时间：2026-10-23
 来源：`WorkBuddy/2026-10-20-13-02-07/si/SIOriginal`（v2.4.1）的 FUBG 保活模块整体抽出重制
+
+> v3.0.1：新增「通话感知避让」，修掉与黄白助手「忙线拒接」的冲突，以及
+> 「停留在微信页面来电不通知、过一会才通知」的问题。详见文末「已知事项」。
 
 ## 这是什么
 
@@ -42,10 +45,11 @@ SIOriginal-BG/
 | `Enabled` | BOOL | YES | 总开关 |
 | `SceneFake` | BOOL | YES | 引擎一 场景伪装 |
 | `AudioKeep` | BOOL | YES | 引擎二 音频断言 |
+| `CallAware` | BOOL | YES | v3.0.1 通话感知避让：检测到别人占用音频会话（PlayAndRecord/Record）时让位 15s |
 | `Blacklist` | Array | 空 | 排除名单；精确匹配，条目结尾 `*` 表示前缀匹配（如 `com.tencent.*`） |
-| `AppOverrides` | Dict | 空 | App 级覆盖：`{ "bundle id" = { Enabled/SceneFake/AudioKeep = 0/1; }; }` |
+| `AppOverrides` | Dict | 空 | App 级覆盖：`{ "bundle id" = { Enabled/SceneFake/AudioKeep/CallAware = 0/1; }; }` |
 
-热重载：配置 App 保存即发 Darwin 通知 `com.local.sioriginalbg.settingschanged`，dylib 主线程串行 reload，无需注销 App。删掉整个 plist 即回出厂默认（三项全开、名单清空）。
+热重载：配置 App 保存即发 Darwin 通知 `com.local.sioriginalbg.settingschanged`，dylib 主线程串行 reload，无需注销 App。删掉整个 plist 即回出厂默认（四项全开、名单清空）。
 
 ## 构建
 
@@ -73,9 +77,22 @@ clang -arch arm64 -dynamiclib -O2 -install_name @rpath/SIOriginalBG.dylib \
 
 ## 已知事项
 
+- **v3.0.1 修的两个问题**（真机反馈，与黄白助手「忙线拒接」相关）：
+  1. **与忙线拒接冲突**：根因是音频断言在前台只 pause 不释放会话 —— 我们的静音 Playback
+     会话长期激活，会推迟微信自身激活 PlayAndRecord 响铃，也干扰插件的忙线/通话检测。
+     现在：会话归属跟踪（只关自己激活的）+ 回前台彻底释放 + 看门狗/线路变化/中断恢复
+     三处「通话感知让位」（默认开，`CallAware=NO` 可退回旧行为）。
+  2. **停留在微信页面来电不通知、过一会才通知**：同一个根因，修法同上。
+     若仍复现，按优先级试：`com.tencent.xin scene=0 audio=1`（只关场景伪装）→
+     `com.tencent.xin audio=0 scene=1`（只留场景伪装）→ 整体拉黑微信。
+     日志佐证：`[SIOBG] yielded audio session to a foreign (call/record) session`。
 - **微信「两个视频画面」**：v2.4.1 的疑似诱因是场景伪装（吞后台化 diff + 伪造 applicationState），
   本版按你的选择**保留**了该引擎。若复现且确认是它，不用改代码，App 里加一行覆盖即可关：
   `com.tencent.xin scene=0 audio=1`（只关场景伪装，保留音频断言）。
+- **「锁屏有通知、打开微信就没了」是 iOS 正常行为**：打开 App 会清掉它已送达的通知中心条目，
+  不是插件造成的；消息本身还在微信聊天列表里。
 - 内置排除 `com.apple.springboard`（桌面进程是场景宿主，配置无法打开）。
 - 音频引擎单独使用时要求宿主 App 自带 `UIBackgroundModes=audio`；配置 App 里「扫描」按钮可看哪些 App 有。
 - 看门狗只在真后台运行，回前台立即卸载；低电量周期自动放宽到 6s。
+- 构建 workflow 在**仓库根** `.github/workflows/build-sioriginalbg.yml`（GitHub 不认子目录里的 workflow），
+  本地另有一份 `SIOriginal-BG/build.py`（Windows / zig 交叉编译）可离线出包。

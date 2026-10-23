@@ -19,7 +19,7 @@ COMMON = ["-target", "aarch64-ios.14.0", "-O2",
           "-isysroot", SDK,
           "-isystem", os.path.join(SDK, "usr", "include"),
           "-F", os.path.join(SDK, "System", "Library", "Frameworks"),
-          "-miphoneos-version-min=14.0".replace("=", " "),
+          "-miphoneos-version-min=14.0",
           "-fobjc-arc", "-w"]
 
 def run(cmd):

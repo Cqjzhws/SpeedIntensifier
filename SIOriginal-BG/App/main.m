@@ -18,11 +18,11 @@
 
 static NSString *const kPrefPath = @"/var/Managed Preferences/mobile/com.local.sioriginalbg.plist";
 static NSString *const kNotify   = @"com.local.sioriginalbg.settingschanged";
-static NSString *const kVersion  = @"SIOriginal-BG v3.0.0-BG";
+static NSString *const kVersion  = @"SIOriginal-BG v3.0.1-BG";
 
 // 只有这些键会被写进 plist（新增键必须登记，否则是死配置）
 static NSArray *BGConfigKeys(void) {
-    return @[ @"Enabled", @"SceneFake", @"AudioKeep", @"Blacklist", @"AppOverrides" ];
+    return @[ @"Enabled", @"SceneFake", @"AudioKeep", @"CallAware", @"Blacklist", @"AppOverrides" ];
 }
 
 #pragma mark ==================== 注销 ====================
@@ -60,6 +60,7 @@ static NSMutableDictionary *BGReadConfig(void) {
     if (!d[@"Enabled"])      d[@"Enabled"]      = @YES;
     if (!d[@"SceneFake"])    d[@"SceneFake"]    = @YES;
     if (!d[@"AudioKeep"])    d[@"AudioKeep"]    = @YES;
+    if (!d[@"CallAware"])    d[@"CallAware"]    = @YES;   // v3.0.1 通话感知避让
     if (!d[@"Blacklist"])    d[@"Blacklist"]    = @[];
     if (!d[@"AppOverrides"]) d[@"AppOverrides"] = @{};
     return d;
@@ -195,6 +196,7 @@ static NSString *BGScanInstalledApps(void) {
     UISwitch *_enableSwitch;
     UISwitch *_sceneSwitch;
     UISwitch *_audioSwitch;
+    UISwitch *_callSwitch;
     UITextView *_blacklist;
     UITextView *_overrides;
     UITextView *_scanResult;
@@ -248,6 +250,8 @@ static NSString *BGScanInstalledApps(void) {
     _sceneSwitch.on  = cfg[@"SceneFake"] ? [cfg[@"SceneFake"] boolValue] : YES;
     _audioSwitch  = [[UISwitch alloc] init];
     _audioSwitch.on  = cfg[@"AudioKeep"] ? [cfg[@"AudioKeep"] boolValue] : YES;
+    _callSwitch   = [[UISwitch alloc] init];
+    _callSwitch.on   = cfg[@"CallAware"] ? [cfg[@"CallAware"] boolValue] : YES;
 
     UIView *row1 = [self _rowWith:[self _label:@"总开关（注入 dylib 的 App 全部生效）"
                                          color:[UIColor labelColor] size:15] ctrl:_enableSwitch];
@@ -255,6 +259,8 @@ static NSString *BGScanInstalledApps(void) {
                                          color:[UIColor labelColor] size:15] ctrl:_sceneSwitch];
     UIView *row3 = [self _rowWith:[self _label:@"音频断言兜底（无声白噪声防挂起，不打断音乐；与场景伪装双保险）"
                                          color:[UIColor secondaryLabelColor] size:13] ctrl:_audioSwitch];
+    UIView *row4 = [self _rowWith:[self _label:@"通话避让（来电/录音时让出音频会话，配合忙线拒接等插件；v3.0.1 新增）"
+                                         color:[UIColor secondaryLabelColor] size:13] ctrl:_callSwitch];
 
     UILabel *lblBl = [self _label:@"排除名单（每行一个 Bundle ID，命中不保活；结尾 * 表示前缀匹配）"
                             color:[UIColor secondaryLabelColor] size:15];
@@ -289,7 +295,7 @@ static NSString *BGScanInstalledApps(void) {
     [_scanResult.heightAnchor constraintEqualToConstant:220].active = YES;
 
     UILabel *hint = [self _label:
-        @"用法：TrollFools 把 SIOriginalBG.dylib 注入目标 App。场景伪装拦截系统下发的后台化指令，音频断言防止进程被挂起，看门狗自愈、来电中断自动恢复。配置即时生效，无需注销。控制台日志前缀 [SIOBG]。"
+        @"用法：TrollFools 把 SIOriginalBG.dylib 注入目标 App。场景伪装拦截系统下发的后台化指令，音频断言防止进程被挂起，看门狗自愈、来电中断自动恢复。v3.0.1 起默认开启「通话避让」：检测到微信自身通话/录音占用音频会话时立刻让出，修掉与忙线拒接等插件的冲突和来电通知延迟。控制台日志前缀 [SIOBG]。"
                            color:[UIColor secondaryLabelColor] size:12];
 
     UIButton *apply = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -318,7 +324,7 @@ static NSString *BGScanInstalledApps(void) {
     _status.numberOfLines = 0;
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        title, sub, row1, row2, row3,
+        title, sub, row1, row2, row3, row4,
         lblBl, _blacklist,
         lblOvr, _overrides, hintOvr,
         scanBtn, _scanResult,
@@ -350,6 +356,7 @@ static NSString *BGScanInstalledApps(void) {
     return @{ @"Enabled":      @(_enableSwitch.on),
               @"SceneFake":    @(_sceneSwitch.on),
               @"AudioKeep":    @(_audioSwitch.on),
+              @"CallAware":    @(_callSwitch.on),
               @"Blacklist":    BGParseList(_blacklist.text),
               @"AppOverrides": BGParseOverrides(_overrides.text) };
 }
@@ -373,15 +380,17 @@ static NSString *BGScanInstalledApps(void) {
 
 - (void)onReset {
     BOOL ok = BGWriteConfig(@{ @"Enabled": @YES, @"SceneFake": @YES, @"AudioKeep": @YES,
+                               @"CallAware": @YES,
                                @"Blacklist": @[], @"AppOverrides": @{} });
     if (ok) {
         NSDictionary *cfg = BGReadConfig();
         _enableSwitch.on = YES;
         _sceneSwitch.on   = YES;
         _audioSwitch.on   = YES;
+        _callSwitch.on    = YES;
         _blacklist.text   = @"";
         _overrides.text   = BGOverridesText(cfg[@"AppOverrides"]);
-        _status.text = @"已恢复出厂默认（三项全开、名单清空）。";
+        _status.text = @"已恢复出厂默认（四项全开、名单清空）。";
     } else {
         _status.text = @"恢复失败（plist 写不进去）。";
     }
