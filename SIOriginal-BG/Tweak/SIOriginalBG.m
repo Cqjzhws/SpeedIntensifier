@@ -27,13 +27,31 @@
 //       中断恢复（ShouldResume）也改成「仅在没人占用时才重新激活」。
 // =========================================================================================
 //
+// ===================== v3.0.2 后台定时刷新（修解锁后消息不刷新）=====================
+// 真机反馈：锁屏来微信消息 → 解锁进去微信没有那条消息，界面「秒开」不刷新，
+// 只有杀进程重进才有。根因：场景伪装把「后台→前台」转场整条吞了，UIKit 不再
+// 投递 UIApplicationWillEnterForegroundNotification，App 自己的同步/刷新分支
+// 永远等不到触发点；而 applicationState 又被伪装成 Active，App 更认为「我一直在
+// 前台，没有新消息需要拉」。杀进程是冷启动，走的是另一条全量同步路径，所以有消息。
+// 本版对症解法：真后台期间周期性投递 WillEnterForeground 通知（默认 30s，
+// 可在配置 App 调整 10–600s，置 0 关闭），直接触发 App 自己的刷新分支。
+// 安全性：
+//   · 只在**物理真后台**时投递。真实状态通过原始 IMP 取（gOrigAppState），
+//     不会递归进我们自己的 applicationState hook。
+//   · 复用 v3.0.1 通话避让：别人占着音频会话（来电/录音/忙线拒接）或避让窗口内
+//     一律不刷，避免打扰。
+//   · 顺手自愈音频引擎（后台却没在播 = 异常，先救活再刷）。
+// =========================================================================================
+//
 // 配置：/var/Managed Preferences/mobile/com.local.sioriginalbg.plist
 //   Enabled      总开关（缺键 = 开）
 //   SceneFake    场景伪装（缺键 = 开）
 //   AudioKeep    音频断言（缺键 = 开）
 //   CallAware    通话感知避让（缺键 = 开；v3.0.1 新增，配合忙线拒接等插件）
+//   BgRefresh    后台定时刷新（缺键 = 开；v3.0.2 新增）
+//   BgRefreshInterval  刷新周期秒数（缺键 = 30；钳制 10–600，<=0 = 关闭刷新）
 //   Blacklist    排除名单，NSArray；精确匹配，条目结尾写 * 表示前缀匹配
-//   AppOverrides App 级覆盖：{ "bundle id" = { Enabled/SceneFake/AudioKeep/CallAware = 0/1; }; }
+//   AppOverrides App 级覆盖：{ "bundle id" = { Enabled/SceneFake/AudioKeep/CallAware/BgRefresh = 0/1; BgRefreshInterval = 秒; }; }
 // 热重载：Darwin 通知 com.local.sioriginalbg.settingschanged
 
 #import <Foundation/Foundation.h>
@@ -48,9 +66,14 @@
 
 #define kPrefPath   @"/var/Managed Preferences/mobile/com.local.sioriginalbg.plist"
 #define kNotifyName @"com.local.sioriginalbg.settingschanged"
-#define SIOBG_VERSION @"v3.0.1-BG"
+#define SIOBG_VERSION @"v3.0.2-BG"
 // v3.0.1：检测到别人占用音频会话后的避让窗口（秒）。覆盖来电响铃 + VoIP 通知推送全程。
 #define SIOBG_YIELD_WINDOW 15.0
+// v3.0.2：后台定时刷新的周期钳制范围（秒）。下限 10s 防止把 App 刷到耗电异常，
+// 上限 600s 防止用户误填巨大值等于没开。
+#define SIOBG_REFRESH_MIN 10.0
+#define SIOBG_REFRESH_MAX 600.0
+#define SIOBG_REFRESH_DEF 30.0
 
 // ---------- 全局状态 ----------
 static NSString *gSelfBundle = nil;
@@ -68,6 +91,10 @@ static BOOL gPhysBg   = NO;   // 物理上是否处于后台（由真实生命�
 static BOOL gHasAudioMode   = NO;   // 宿主 App 是否声明 UIBackgroundModes=audio
 static BOOL gHasAppOverride = NO;   // 是否命中 App 级覆盖（仅用于日志）
 static BOOL gCallAware      = YES;  // v3.0.1 通话感知避让（配合忙线拒接等插件）
+
+// v3.0.2 后台定时刷新：默认开，周期 30s。
+static BOOL           gBgRefresh         = YES;
+static NSTimeInterval gBgRefreshInterval = SIOBG_REFRESH_DEF;
 
 // ---------- 基础工具 ----------
 
@@ -105,7 +132,18 @@ static void SIOBG_resetDefaults(void) {
     gSceneFake   = YES;
     gAudioKeep   = YES;
     gCallAware   = YES;   // v3.0.1：缺键 = 开（兼容项，fail-safe 方向是"不打扰别人"）
+    gBgRefresh   = YES;   // v3.0.2：缺键 = 开
+    gBgRefreshInterval = SIOBG_REFRESH_DEF;
     gExclude     = @[];
+}
+
+// v3.0.2：刷新周期钳制。<=0 = 关闭；其余夹到 [10, 600]。
+// plist 里可能是 NSNumber 也可能是字符串，doubleValue 两者都吃。
+static NSTimeInterval SIOBG_clampInterval(id raw, NSTimeInterval fallback) {
+    if (!raw) return fallback;
+    double v = [raw doubleValue];
+    if (!(v > 0)) return 0.0;   // 0/负数/非数字（NaN 比较为假）都视为关闭
+    return MIN(MAX(v, SIOBG_REFRESH_MIN), SIOBG_REFRESH_MAX);
 }
 
 static BOOL SIOBG_isExcluded(void) {
@@ -140,6 +178,8 @@ static void SIOBG_loadPref(void) {
             if (d[@"SceneFake"]) gSceneFake   = [d[@"SceneFake"] boolValue];
             if (d[@"AudioKeep"]) gAudioKeep   = [d[@"AudioKeep"] boolValue];
             if (d[@"CallAware"]) gCallAware   = [d[@"CallAware"] boolValue];
+            if (d[@"BgRefresh"]) gBgRefresh   = [d[@"BgRefresh"] boolValue];
+            gBgRefreshInterval = SIOBG_clampInterval(d[@"BgRefreshInterval"], SIOBG_REFRESH_DEF);
 
             // 排除名单：兼容 NSArray / 逗号分隔字符串两种写法；
             // 清洗非字符串元素（plist 手工编辑很容易混进 NSNumber，不洗会 unrecognized selector）。
@@ -168,6 +208,9 @@ static void SIOBG_loadPref(void) {
                 if (ovr[@"SceneFake"]) gSceneFake   = [ovr[@"SceneFake"] boolValue];
                 if (ovr[@"AudioKeep"]) gAudioKeep   = [ovr[@"AudioKeep"] boolValue];
                 if (ovr[@"CallAware"]) gCallAware   = [ovr[@"CallAware"] boolValue];
+                if (ovr[@"BgRefresh"]) gBgRefresh   = [ovr[@"BgRefresh"] boolValue];
+                if (ovr[@"BgRefreshInterval"])
+                    gBgRefreshInterval = SIOBG_clampInterval(ovr[@"BgRefreshInterval"], gBgRefreshInterval);
             }
         }
     } @catch (__unused NSException *e) {}
@@ -519,6 +562,59 @@ static void SIOBG_watchdogFire(__unused NSTimer *t) {
     } @catch (__unused NSException *e) {}
 }
 
+// ---------- v3.0.2：后台定时刷新 ----------
+// 场景伪装吞掉转场后，App 收不到 WillEnterForeground，解锁「秒开不刷新」。
+// 这里在物理真后台期间周期性补投这条通知，触发 App 自己的同步分支。
+
+static NSTimer *gRefreshTimer = nil;
+
+static void SIOBG_refreshFire(NSTimer *t);   // 前向声明：refreshStart 的 block 里引用
+
+// 真实应用状态：直接调原始 IMP。绝不能调 [UIApplication applicationState]，
+// 那会递归进我们自己的 hook，永远拿到伪造的 Active。
+static UIApplicationState SIOBG_realAppState(void) {
+    if (gOrigAppState) {
+        @try {
+            return gOrigAppState([UIApplication sharedApplication], @selector(applicationState));
+        } @catch (__unused NSException *e) {}
+    }
+    return UIApplicationStateActive;
+}
+
+static void SIOBG_refreshStop(void) {
+    if (gRefreshTimer) { [gRefreshTimer invalidate]; gRefreshTimer = nil; }
+}
+
+static void SIOBG_refreshStart(void) {
+    if (gRefreshTimer) return;                              // 已在跑
+    if (!gBgRefresh || gBgRefreshInterval <= 0) return;     // 功能关 / 周期置 0
+    if (!gPhysBg) return;                                   // 只在真后台跑
+    gRefreshTimer = [NSTimer scheduledTimerWithTimeInterval:gBgRefreshInterval
+                                                     repeats:YES
+                                                       block:^(NSTimer *t){ SIOBG_refreshFire(t); }];
+    NSLog(@"[SIOBG] background refresh armed, interval=%.0fs", gBgRefreshInterval);
+}
+
+static void SIOBG_refreshFire(__unused NSTimer *t) {
+    if (!gBgRefresh || !gPhysBg) return;
+    // 双保险：gPhysBg 之外再验一次真实状态（防生命周期通知漏调的极端情况）
+    if (SIOBG_realAppState() != UIApplicationStateBackground) return;
+    // v3.0.1 避让语义复用：通话/录音/忙线拒插插件正用会话时保持安静
+    if (gCallAware && gForeignAt > 0 && (CACurrentMediaTime() - gForeignAt) < SIOBG_YIELD_WINDOW) return;
+    if (gCallAware && SIOBG_foreignSessionActive()) return;
+    // 后台却没在播 = 音频引擎异常，先救活再刷（与看门狗同一套重建逻辑）
+    if (gUseAudio && (!gPlayer || !gPlayer.isPlaying)) {
+        @try {
+            SIOBG_activateSession();
+            if (gPlayer) { [gPlayer play]; } else { SIOBG_buildAndPlay(); }
+        } @catch (__unused NSException *e) {}
+    }
+    // 同步投递：定时器本就在主线程，App 的刷新分支立即执行
+    [[NSNotificationCenter defaultCenter]
+        postNotificationName:UIApplicationWillEnterForegroundNotification object:nil];
+    NSLog(@"[SIOBG] background refresh fired");
+}
+
 static void SIOBG_onInterruption(NSNotification *note) {
     if (!gUseAudio) return;
     NSNumber *type = note.userInfo[AVAudioSessionInterruptionTypeKey];
@@ -542,11 +638,13 @@ static void SIOBG_onEnterBackground(NSNotification *note) {
     gPhysBg = YES;
     SIOBG_startAudio();
     SIOBG_watchdogStart();
+    SIOBG_refreshStart();   // v3.0.2：后台定时刷新装弹
 }
 
 static void SIOBG_onEnterForeground(NSNotification *note) {
     gPhysBg = NO;
     SIOBG_watchdogStop();
+    SIOBG_refreshStop();    // v3.0.2：回前台即停，前台不需要补刷新
     // v3.0.1：回前台不只 pause，还要**彻底释放会话**。
     // 旧行为让静音 Playback 会话在前台长期激活：微信要激活 PlayAndRecord 才能响铃 /
     // 推 VoIP 通知时会被这层会话推迟 —— 真机表现就是「停在微信页面，来电过一会才通知」，
@@ -567,12 +665,15 @@ static void SIOBG_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             SIOBG_loadPref();
-            NSLog(@"[SIOBG] prefs reloaded: active=%d scene=%d audio=%d callAware=%d override=%d physBg=%d",
-                  gActive, gUseScene, gUseAudio, gCallAware, gHasAppOverride, gPhysBg);
+            NSLog(@"[SIOBG] prefs reloaded: active=%d scene=%d audio=%d callAware=%d refresh=%d interval=%.0f override=%d physBg=%d",
+                  gActive, gUseScene, gUseAudio, gCallAware, gBgRefresh, gBgRefreshInterval, gHasAppOverride, gPhysBg);
             if (!gUseAudio && gPhysBg) { SIOBG_stopAudio(NO); SIOBG_watchdogStop(); }
             if (gUseAudio && gPhysBg && (!gPlayer || !gPlayer.isPlaying)) {
                 SIOBG_startAudio(); SIOBG_watchdogStart();
             }
+            // v3.0.2：刷新开关/周期改了要即时重装弹（interval 变了必须重建定时器才生效）
+            SIOBG_refreshStop();
+            if (gPhysBg) SIOBG_refreshStart();
         } @catch (__unused NSException *e) {}
     });
 }
@@ -640,10 +741,10 @@ static void SIOBGEntry(void) {
             (__bridge CFStringRef)kNotifyName, NULL,
             CFNotificationSuspensionBehaviorDeliverImmediately);
 
-        NSLog(@"[SIOBG] %@ loaded in %@: active=%d scene=%d audio=%d callAware=%d audioMode=%d%@",
+        NSLog(@"[SIOBG] %@ loaded in %@: active=%d scene=%d audio=%d callAware=%d refresh=%d interval=%.0f audioMode=%d%@",
               SIOBG_VERSION,
               SIOBG_bundleID().length ? SIOBG_bundleID() : @"?",
-              gActive, gUseScene, gUseAudio, gCallAware, gHasAudioMode,
+              gActive, gUseScene, gUseAudio, gCallAware, gBgRefresh, gBgRefreshInterval, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
     } @catch (NSException *e) {
         NSLog(@"[SIOBG] keep-alive install failed (app unaffected): %@", e);

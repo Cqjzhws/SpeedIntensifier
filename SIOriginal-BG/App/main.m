@@ -1,12 +1,13 @@
-// SIOriginal-BG v3.0.0-BG — 真后台保活配置 App（TrollStore 安装用）
+// SIOriginal-BG v3.0.2-BG — 真后台保活配置 App（TrollStore 安装用）
 //
 // SIOriginal v2.4.1 精简版配套配置器：只写保活相关的键，动画加速等键已随功能整体移除。
 // 写 plist + 发 Darwin 通知（dylib 热重载）；提供已装 App audio 后台模式扫描、注销。
 //
 // 配置文件：/var/Managed Preferences/mobile/com.local.sioriginalbg.plist
-//   Enabled / SceneFake / AudioKeep   三个开关
-//   Blacklist                         排除名单（数组；条目结尾 * 表示前缀匹配）
-//   AppOverrides                      App 级覆盖 { "bundle id" = { Enabled/SceneFake/AudioKeep }; }
+//   Enabled / SceneFake / AudioKeep / CallAware   四个开关
+//   BgRefresh / BgRefreshInterval                 后台定时刷新（v3.0.2）
+//   Blacklist                                     排除名单（数组；条目结尾 * 表示前缀匹配）
+//   AppOverrides                                  App 级覆盖 { "bundle id" = { ... }; }
 
 #import <UIKit/UIKit.h>
 #import <sys/sysctl.h>
@@ -18,11 +19,12 @@
 
 static NSString *const kPrefPath = @"/var/Managed Preferences/mobile/com.local.sioriginalbg.plist";
 static NSString *const kNotify   = @"com.local.sioriginalbg.settingschanged";
-static NSString *const kVersion  = @"SIOriginal-BG v3.0.1-BG";
+static NSString *const kVersion  = @"SIOriginal-BG v3.0.2-BG";
 
 // 只有这些键会被写进 plist（新增键必须登记，否则是死配置）
 static NSArray *BGConfigKeys(void) {
-    return @[ @"Enabled", @"SceneFake", @"AudioKeep", @"CallAware", @"Blacklist", @"AppOverrides" ];
+    return @[ @"Enabled", @"SceneFake", @"AudioKeep", @"CallAware",
+              @"BgRefresh", @"BgRefreshInterval", @"Blacklist", @"AppOverrides" ];
 }
 
 #pragma mark ==================== 注销 ====================
@@ -61,6 +63,8 @@ static NSMutableDictionary *BGReadConfig(void) {
     if (!d[@"SceneFake"])    d[@"SceneFake"]    = @YES;
     if (!d[@"AudioKeep"])    d[@"AudioKeep"]    = @YES;
     if (!d[@"CallAware"])    d[@"CallAware"]    = @YES;   // v3.0.1 通话感知避让
+    if (!d[@"BgRefresh"])    d[@"BgRefresh"]    = @YES;   // v3.0.2 后台定时刷新
+    if (!d[@"BgRefreshInterval"]) d[@"BgRefreshInterval"] = @30.0;
     if (!d[@"Blacklist"])    d[@"Blacklist"]    = @[];
     if (!d[@"AppOverrides"]) d[@"AppOverrides"] = @{};
     return d;
@@ -95,8 +99,10 @@ static NSArray *BGParseList(NSString *text) {
     return arr;
 }
 
-// 每行一个 App 覆盖，格式：<bundle id> [enabled=0/1] [scene=0/1] [audio=0/1]
+// 每行一个 App 覆盖，格式：<bundle id> [enabled=0/1] [scene=0/1] [audio=0/1] [call=0/1] [bgrefresh=0/1] [interval=秒]
 // 例：com.tencent.xin scene=0 audio=1   （微信只关场景伪装，保留音频断言）
+// 例：com.tencent.xin bgrefresh=0       （微信不补刷新）
+// 例：com.tencent.xin interval=60       （微信 60s 一刷）
 static NSDictionary *BGParseOverrides(NSString *text) {
     NSMutableDictionary *out = [NSMutableDictionary dictionary];
     for (NSString *line in [text componentsSeparatedByCharactersInSet:
@@ -116,9 +122,15 @@ static NSDictionary *BGParseOverrides(NSString *text) {
             NSString *k = [kv[0] lowercaseString];
             NSString *v = [kv[1] lowercaseString];
             BOOL on = [v isEqualToString:@"1"] || [v isEqualToString:@"yes"] || [v isEqualToString:@"on"];
-            if      ([k isEqualToString:@"enabled"]) ovr[@"Enabled"]   = @(on);
-            else if ([k isEqualToString:@"scene"])   ovr[@"SceneFake"] = @(on);
-            else if ([k isEqualToString:@"audio"])   ovr[@"AudioKeep"] = @(on);
+            if      ([k isEqualToString:@"enabled"])   ovr[@"Enabled"]   = @(on);
+            else if ([k isEqualToString:@"scene"])     ovr[@"SceneFake"] = @(on);
+            else if ([k isEqualToString:@"audio"])     ovr[@"AudioKeep"] = @(on);
+            else if ([k isEqualToString:@"call"])      ovr[@"CallAware"] = @(on);
+            else if ([k isEqualToString:@"bgrefresh"]) ovr[@"BgRefresh"] = @(on);
+            else if ([k isEqualToString:@"interval"]) {
+                double sec = v.doubleValue;
+                if (sec > 0) ovr[@"BgRefreshInterval"] = @(sec);
+            }
         }
         if (ovr.count) out[bid] = ovr;
     }
@@ -135,6 +147,10 @@ static NSString *BGOverridesText(NSDictionary *ovr) {
         if (d[@"Enabled"])   [parts addObject:[NSString stringWithFormat:@"enabled=%d", [d[@"Enabled"] boolValue]]];
         if (d[@"SceneFake"]) [parts addObject:[NSString stringWithFormat:@"scene=%d",   [d[@"SceneFake"] boolValue]]];
         if (d[@"AudioKeep"]) [parts addObject:[NSString stringWithFormat:@"audio=%d",   [d[@"AudioKeep"] boolValue]]];
+        if (d[@"CallAware"]) [parts addObject:[NSString stringWithFormat:@"call=%d",    [d[@"CallAware"] boolValue]]];
+        if (d[@"BgRefresh"]) [parts addObject:[NSString stringWithFormat:@"bgrefresh=%d", [d[@"BgRefresh"] boolValue]]];
+        if (d[@"BgRefreshInterval"])
+            [parts addObject:[NSString stringWithFormat:@"interval=%@", d[@"BgRefreshInterval"]]];
         [lines addObject:[parts componentsJoinedByString:@" "]];
     }
     return [lines componentsJoinedByString:@"\n"];
@@ -197,6 +213,8 @@ static NSString *BGScanInstalledApps(void) {
     UISwitch *_sceneSwitch;
     UISwitch *_audioSwitch;
     UISwitch *_callSwitch;
+    UISwitch *_refreshSwitch;
+    UITextField *_intervalField;
     UITextView *_blacklist;
     UITextView *_overrides;
     UITextView *_scanResult;
@@ -252,6 +270,18 @@ static NSString *BGScanInstalledApps(void) {
     _audioSwitch.on  = cfg[@"AudioKeep"] ? [cfg[@"AudioKeep"] boolValue] : YES;
     _callSwitch   = [[UISwitch alloc] init];
     _callSwitch.on   = cfg[@"CallAware"] ? [cfg[@"CallAware"] boolValue] : YES;
+    _refreshSwitch = [[UISwitch alloc] init];
+    _refreshSwitch.on = cfg[@"BgRefresh"] ? [cfg[@"BgRefresh"] boolValue] : YES;
+
+    _intervalField = [[UITextField alloc] init];
+    _intervalField.keyboardType = UIKeyboardTypeNumberPad;
+    _intervalField.borderStyle = UITextBorderStyleRoundedRect;
+    _intervalField.placeholder = @"30";
+    _intervalField.textAlignment = NSTextAlignmentCenter;
+    _intervalField.font = [UIFont systemFontOfSize:15];
+    id iv = cfg[@"BgRefreshInterval"];
+    _intervalField.text = iv ? [iv stringValue] : @"30";
+    [_intervalField.widthAnchor constraintEqualToConstant:72].active = YES;
 
     UIView *row1 = [self _rowWith:[self _label:@"总开关（注入 dylib 的 App 全部生效）"
                                          color:[UIColor labelColor] size:15] ctrl:_enableSwitch];
@@ -261,6 +291,10 @@ static NSString *BGScanInstalledApps(void) {
                                          color:[UIColor secondaryLabelColor] size:13] ctrl:_audioSwitch];
     UIView *row4 = [self _rowWith:[self _label:@"通话避让（来电/录音时让出音频会话，配合忙线拒接等插件；v3.0.1 新增）"
                                          color:[UIColor secondaryLabelColor] size:13] ctrl:_callSwitch];
+    UIView *row5 = [self _rowWith:[self _label:@"后台定时刷新（真后台期间周期性触发 App 自己的同步分支；v3.0.2 新增）"
+                                         color:[UIColor secondaryLabelColor] size:13] ctrl:_refreshSwitch];
+    UIView *row6 = [self _rowWith:[self _label:@"刷新周期（秒，10–600；填 0 = 关闭刷新）"
+                                         color:[UIColor secondaryLabelColor] size:13] ctrl:_intervalField];
 
     UILabel *lblBl = [self _label:@"排除名单（每行一个 Bundle ID，命中不保活；结尾 * 表示前缀匹配）"
                             color:[UIColor secondaryLabelColor] size:15];
@@ -279,7 +313,7 @@ static NSString *BGScanInstalledApps(void) {
     _overrides.layer.cornerRadius = 8;
     [_overrides.heightAnchor constraintEqualToConstant:80].active = YES;
 
-    UILabel *hintOvr = [self _label:@"例：com.tencent.xin scene=0 audio=1（微信只关场景伪装、保留音频断言）"
+    UILabel *hintOvr = [self _label:@"例：com.tencent.xin scene=0 audio=1（微信只关场景伪装、保留音频断言）\n例：com.tencent.xin bgrefresh=0（微信不补刷新）；interval=60 单独调周期"
                               color:[UIColor tertiaryLabelColor] size:12];
 
     UIButton *scanBtn = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -295,7 +329,7 @@ static NSString *BGScanInstalledApps(void) {
     [_scanResult.heightAnchor constraintEqualToConstant:220].active = YES;
 
     UILabel *hint = [self _label:
-        @"用法：TrollFools 把 SIOriginalBG.dylib 注入目标 App。场景伪装拦截系统下发的后台化指令，音频断言防止进程被挂起，看门狗自愈、来电中断自动恢复。v3.0.1 起默认开启「通话避让」：检测到微信自身通话/录音占用音频会话时立刻让出，修掉与忙线拒接等插件的冲突和来电通知延迟。控制台日志前缀 [SIOBG]。"
+        @"用法：TrollFools 把 SIOriginalBG.dylib 注入目标 App。场景伪装拦截系统下发的后台化指令，音频断言防止进程被挂起，看门狗自愈、来电中断自动恢复。v3.0.1 起默认开启「通话避让」：检测到微信自身通话/录音占用音频会话时立刻让出，修掉与忙线拒接等插件的冲突和来电通知延迟。v3.0.2 起默认开启「后台定时刷新」：场景伪装吞掉转场后 App 收不到「回前台」通知，解锁会秒开不刷新（消息要杀进程才有）；该功能在真后台期间每 30s 补投一次刷新通知触发 App 自己的同步分支。控制台日志前缀 [SIOBG]。"
                            color:[UIColor secondaryLabelColor] size:12];
 
     UIButton *apply = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -324,7 +358,7 @@ static NSString *BGScanInstalledApps(void) {
     _status.numberOfLines = 0;
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        title, sub, row1, row2, row3, row4,
+        title, sub, row1, row2, row3, row4, row5, row6,
         lblBl, _blacklist,
         lblOvr, _overrides, hintOvr,
         scanBtn, _scanResult,
@@ -353,10 +387,15 @@ static NSString *BGScanInstalledApps(void) {
 }
 
 - (NSDictionary *)_collectConfig {
+    // 周期：非数字/空 → 0（关闭）；数字原样交给 dylib 钳制到 10–600
+    double interval = [_intervalField.text stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceCharacterSet]].doubleValue;
     return @{ @"Enabled":      @(_enableSwitch.on),
               @"SceneFake":    @(_sceneSwitch.on),
               @"AudioKeep":    @(_audioSwitch.on),
               @"CallAware":    @(_callSwitch.on),
+              @"BgRefresh":    @(_refreshSwitch.on),
+              @"BgRefreshInterval": @(interval),
               @"Blacklist":    BGParseList(_blacklist.text),
               @"AppOverrides": BGParseOverrides(_overrides.text) };
 }
@@ -380,7 +419,8 @@ static NSString *BGScanInstalledApps(void) {
 
 - (void)onReset {
     BOOL ok = BGWriteConfig(@{ @"Enabled": @YES, @"SceneFake": @YES, @"AudioKeep": @YES,
-                               @"CallAware": @YES,
+                               @"CallAware": @YES, @"BgRefresh": @YES,
+                               @"BgRefreshInterval": @30.0,
                                @"Blacklist": @[], @"AppOverrides": @{} });
     if (ok) {
         NSDictionary *cfg = BGReadConfig();
@@ -388,9 +428,11 @@ static NSString *BGScanInstalledApps(void) {
         _sceneSwitch.on   = YES;
         _audioSwitch.on   = YES;
         _callSwitch.on    = YES;
+        _refreshSwitch.on = YES;
+        _intervalField.text = @"30";
         _blacklist.text   = @"";
         _overrides.text   = BGOverridesText(cfg[@"AppOverrides"]);
-        _status.text = @"已恢复出厂默认（四项全开、名单清空）。";
+        _status.text = @"已恢复出厂默认（五项全开、周期 30s、名单清空）。";
     } else {
         _status.text = @"恢复失败（plist 写不进去）。";
     }
