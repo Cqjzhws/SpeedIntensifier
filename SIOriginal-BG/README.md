@@ -1,12 +1,13 @@
-# SIOriginal-BG v3.0.2-BG — 真后台保活（源码）
+# SIOriginal-BG v3.0.3-BG — 真后台保活（源码）
 
 打包时间：2026-10-24
 来源：`WorkBuddy/2026-10-20-13-02-07/si/SIOriginal`（v2.4.1）的 FUBG 保活模块整体抽出重制
 
-> v3.0.2：新增「后台定时刷新」，修「锁屏来消息 → 解锁进微信不刷新、秒开、
-> 要杀进程才有消息」的问题。详见文末「已知事项」。
-> v3.0.1：新增「通话感知避让」，修掉与黄白助手「忙线拒接」的冲突，以及
-> 「停留在微信页面来电不通知、过一会才通知」的问题。
+> v3.0.3：新增「场景状态伪装」—— `UIScene.activationState` 也伪造成前台，
+> 但 FTS/索引工作线程白名单（`.fts.` / `mainIndex` / `.index.` / `IndexQueue`）
+> 仍读真实 `Background`，微信据此把长连接降级成推送通道，解锁回来重连拉离线消息。
+> v3.0.2：新增「后台定时刷新」。
+> v3.0.1：新增「通话感知避让」。
 
 ## 这是什么
 
@@ -17,12 +18,13 @@ SIOriginal v2.4.1 的精简版。按「只保留真后台，其他功能全部�
 | --- | --- |
 | 引擎一 场景伪装：拦截 FrontBoard 后台化 scene diff（含快照类更新） | 动画加速：CAAnimation / CATransaction / UIView 块动画 / UISpring / UIViewPropertyAnimator / 转场 / 导航模态 Tab / LayerBoost / TransitionBoost |
 | 引擎一 配套：`applicationState` 伪装（dladdr 识别调用者，推送框架拿真话）、通知横幅强制弹出 | 手感：decelerationRate / delaysContentTouches / setZoomScale |
-| 引擎二 音频断言：静音白噪 + AVAudioSession（Playback + MixWithOthers）+ beginBackgroundTask 桥接 | HUD 快速显示：WKWebView / SVProgressHUD / MBProgressHUD / UIActivityIndicatorView |
-| 看门狗自愈（周期 3s / 低电量 6s，连续 3 次失败退避约 30s）、来电中断与线路变化恢复 | 命中统计浮层、生效 toast、分享卡片 |
-| 通话感知避让（v3.0.1）：别人占用音频会话时立刻让位 15s | 安全启动自愈、安全模式、配置快照/预设/历史、微信预览放大态探测器 |
-| 后台定时刷新（v3.0.2）：真后台期间周期性补投 WillEnterForeground，触发 App 自己的同步分支 | 排除名单（精确 + `*` 前缀）、App 级覆盖、Darwin 热重载（v3.0.2 仍在，此行仅为表格对齐） |
+| 引擎一 配套（v3.0.3）：`UIScene.activationState` 伪装 + 后台工作线程白名单（FTS/索引读真后台） | HUD 快速显示：WKWebView / SVProgressHUD / MBProgressHUD / UIActivityIndicatorView |
+| 引擎二 音频断言：静音白噪 + AVAudioSession（Playback + MixWithOthers）+ beginBackgroundTask 桥接 | 命中统计浮层、生效 toast、分享卡片 |
+| 看门狗自愈（周期 3s / 低电量 6s，连续 3 次失败退避约 30s）、来电中断与线路变化恢复 | 安全启动自愈、安全模式、配置快照/预设/历史、微信预览放大态探测器 |
+| 通话感知避让（v3.0.1）：别人占用音频会话时立刻让位 15s | — |
+| 后台定时刷新（v3.0.2）：真后台期间周期性补投 WillEnterForeground | — |
 
-源码规模：dylib 约 730 行（原 3913 行），配置 App 约 500 行（原 177KB/约 3000 行）。
+源码规模：dylib 约 800 行（原 3913 行），配置 App 约 530 行（原 177KB/约 3000 行）。
 
 ## 目录结构
 
@@ -46,15 +48,30 @@ SIOriginal-BG/
 | 键 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `Enabled` | BOOL | YES | 总开关 |
-| `SceneFake` | BOOL | YES | 引擎一 场景伪装 |
+| `SceneFake` | BOOL | YES | 引擎一 场景伪装（拦截后台化 scene diff） |
+| `SceneState` | BOOL | YES | v3.0.3 scene 层 `activationState` 伪装（配白名单，见下）；关掉退回 v3.0.2 行为 |
 | `AudioKeep` | BOOL | YES | 引擎二 音频断言 |
 | `CallAware` | BOOL | YES | v3.0.1 通话感知避让：检测到别人占用音频会话（PlayAndRecord/Record）时让位 15s |
 | `BgRefresh` | BOOL | YES | v3.0.2 后台定时刷新开关 |
 | `BgRefreshInterval` | Double | 30 | v3.0.2 刷新周期（秒）。钳制 10–600；`<=0` = 关闭刷新 |
 | `Blacklist` | Array | 空 | 排除名单；精确匹配，条目结尾 `*` 表示前缀匹配（如 `com.tencent.*`） |
-| `AppOverrides` | Dict | 空 | App 级覆盖：`{ "bundle id" = { Enabled/SceneFake/AudioKeep/CallAware/BgRefresh = 0/1; BgRefreshInterval = 秒; }; }` |
+| `AppOverrides` | Dict | 空 | App 级覆盖：`{ "bundle id" = { Enabled/SceneFake/SceneState/AudioKeep/CallAware/BgRefresh = 0/1; BgRefreshInterval = 秒; }; }` |
 
-热重载：配置 App 保存即发 Darwin 通知 `com.local.sioriginalbg.settingschanged`，dylib 主线程串行 reload，无需注销 App。删掉整个 plist 即回出厂默认（五项全开、周期 30s、名单清空）。
+热重载：配置 App 保存即发 Darwin 通知 `com.local.sioriginalbg.settingschanged`，dylib 主线程串行 reload，无需注销 App。删掉整个 plist 即回出厂默认（六项全开、周期 30s、名单清空）。
+
+### v3.0.3 白名单机制
+
+同一份「后台工作线程白名单」同时作用于两层判定（`applicationState` 与 `UIScene.activationState`）：
+
+| 调用方 | 读到的值 |
+| --- | --- |
+| FTS / 索引线程（队列 label 或线程名含 `.fts.` / `mainIndex` / `.index.` / `IndexQueue`） | 真实 `Background` |
+| dylib 自身（插件内部找前台 windowScene，按 dladdr 识别自身镜像） | 真实值 |
+| 其余（主线程 / UI / 网络） | 假 `ForegroundActive` |
+
+效果：微信在这些工作线程上读到真实后台态 → 主动把长连接降级成推送通道 →
+解锁回来重连、拉离线消息，列表才有内容。线程判定结果按 `pthread_t` 做 8 槽
+直接映射缓存，热路径零分配。
 
 ## 构建
 
@@ -76,13 +93,21 @@ clang -arch arm64 -dynamiclib -O2 -install_name @rpath/SIOriginalBG.dylib \
 1. TrollStore 安装配置 App，设好开关/名单 → 保存。
 2. TrollFools 把 `SIOriginalBG.dylib` 注入目标 App（原来注入 `SIOriginal.dylib` 的位置换成它即可；两个 dylib 不要同时注入同一个 App）。
 3. 生效观察：控制台日志前缀 `[SIOBG]`。启动一行
-   `[SIOBG] v3.0.2-BG loaded in <bundle id>: active=1 scene=1 audio=1 callAware=1 refresh=1 interval=30 audioMode=1`；
+   `[SIOBG] v3.0.3-BG loaded in <bundle id>: active=1 scene=1 sceneState=1 audio=1 callAware=1 refresh=1 interval=30 audioMode=1`；
    后台化被拦截时打 `[SIOBG] swallowed backgrounding scene diff`；
-   每次补刷新打 `[SIOBG] background refresh fired`（想验证功能就看这行，间隔 = 你设的周期）。
+   scene 层伪装生效时打 `[SIOBG] scene-state spoof armed: UI/network -> ForegroundActive, worker threads -> real Background`；
+   每次补刷新打 `[SIOBG] background refresh fired`（间隔 = 你设的周期）。
    没装 audio 后台模式又关了场景伪装时，启动行尾会带 WARNING。
 
 ## 已知事项
 
+- **v3.0.3 的 scene 层伪装**（「解锁后消息不刷新」的深层修法）：
+  v3.0.2 的后台定时刷新是补投通知触发刷新分支；v3.0.3 进一步把
+  `UIScene.activationState` 也伪造成前台，同时给 FTS/索引工作线程开白名单读真实
+  `Background` —— 微信据此把长连接降级成推送通道，解锁回来重连、拉离线消息。
+  若个别 App 的 scene 状态机被伪装搞出奇怪行为，两种退路：
+  App 级覆盖单独关 `com.tencent.xin scenestate=0`（只退这一项，保活继续），
+  或全局关「场景状态伪装」开关（整体退回 v3.0.2 行为）。
 - **v3.0.2 修的「解锁后消息不刷新」**（真机反馈：锁屏来微信消息 → 解锁进微信没有那条消息，
   界面秒开不刷新，杀进程重进才有）：
   根因是场景伪装把「后台→前台」转场整条吞了 —— UIKit 不再投递

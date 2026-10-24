@@ -43,15 +43,34 @@
 //   · 顺手自愈音频引擎（后台却没在播 = 异常，先救活再刷）。
 // =========================================================================================
 //
+// ===================== v3.0.3 scene 层伪装 + 后台工作线程白名单 =====================
+// 背景：v3.0.2 的后台定时刷新是「对症」——补投 WillEnterForeground 触发 App 自己的
+// 刷新分支。但微信的消息列表/长连接在 scene 层还有一套自己的状态机：
+// 它读 UIScene.activationState 判断「我是不是在前台」，前台态就维持长连接、
+// 不做后台降级；我们只在 App 层（applicationState）对推送框架放行真话，
+// scene 层一直是真值 —— 于是微信认为 scene 始终活跃，解锁回来不会走
+// 「重连长连接 + 拉离线消息」那条路，列表照样是旧的。
+// 本版把伪装下沉到 scene 层，并配一份调用方白名单：
+//   · 绝大多数调用方（主线程/UI/网络）读到假 ForegroundActive；
+//   · 后台工作线程（FTS/索引，队列名/线程名含 .fts. / mainIndex / .index. /
+//     IndexQueue）读到**真实** Background —— 微信据此把长连接主动降级成推送通道，
+//     解锁回来重连、拉离线消息，列表才有内容；
+//   · dylib 自身（插件内部找前台 windowScene）读到真实值，别把自己骗了。
+// 同一份白名单同时覆盖 App 层 applicationState 判定（v3.0.2 起该 hook 已存在，
+// 此前只对 UserNotifications/PushKit 放行真话）。
+// =========================================================================================
+//
 // 配置：/var/Managed Preferences/mobile/com.local.sioriginalbg.plist
 //   Enabled      总开关（缺键 = 开）
 //   SceneFake    场景伪装（缺键 = 开）
+//   SceneState   scene 层 activationState 伪装（缺键 = 开；v3.0.3 新增，
+//                关掉退回 v3.0.2 行为：只吞转场、不伪装场景状态）
 //   AudioKeep    音频断言（缺键 = 开）
 //   CallAware    通话感知避让（缺键 = 开；v3.0.1 新增，配合忙线拒接等插件）
 //   BgRefresh    后台定时刷新（缺键 = 开；v3.0.2 新增）
 //   BgRefreshInterval  刷新周期秒数（缺键 = 30；钳制 10–600，<=0 = 关闭刷新）
 //   Blacklist    排除名单，NSArray；精确匹配，条目结尾写 * 表示前缀匹配
-//   AppOverrides App 级覆盖：{ "bundle id" = { Enabled/SceneFake/AudioKeep/CallAware/BgRefresh = 0/1; BgRefreshInterval = 秒; }; }
+//   AppOverrides App 级覆盖：{ "bundle id" = { Enabled/SceneFake/SceneState/AudioKeep/CallAware/BgRefresh = 0/1; BgRefreshInterval = 秒; }; }
 // 热重载：Darwin 通知 com.local.sioriginalbg.settingschanged
 
 #import <Foundation/Foundation.h>
@@ -61,12 +80,13 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <string.h>     // strstr：_fbg_appState 热路径上的 C 字符串判定（零分配）
+#import <pthread.h>    // pthread_self / pthread_getname_np：v3.0.3 后台工作线程白名单
 #import <dlfcn.h>
 #import "FUBGNoiseData.h"
 
 #define kPrefPath   @"/var/Managed Preferences/mobile/com.local.sioriginalbg.plist"
 #define kNotifyName @"com.local.sioriginalbg.settingschanged"
-#define SIOBG_VERSION @"v3.0.2-BG"
+#define SIOBG_VERSION @"v3.0.3-BG"
 // v3.0.1：检测到别人占用音频会话后的避让窗口（秒）。覆盖来电响铃 + VoIP 通知推送全程。
 #define SIOBG_YIELD_WINDOW 15.0
 // v3.0.2：后台定时刷新的周期钳制范围（秒）。下限 10s 防止把 App 刷到耗电异常，
@@ -91,6 +111,7 @@ static BOOL gPhysBg   = NO;   // 物理上是否处于后台（由真实生命�
 static BOOL gHasAudioMode   = NO;   // 宿主 App 是否声明 UIBackgroundModes=audio
 static BOOL gHasAppOverride = NO;   // 是否命中 App 级覆盖（仅用于日志）
 static BOOL gCallAware      = YES;  // v3.0.1 通话感知避让（配合忙线拒接等插件）
+static BOOL gSceneState     = YES;  // v3.0.3 scene 层 activationState 伪装（关掉退回 v3.0.2 行为）
 
 // v3.0.2 后台定时刷新：默认开，周期 30s。
 static BOOL           gBgRefresh         = YES;
@@ -130,6 +151,7 @@ static BOOL SIOBG_builtinExcluded(void) {
 static void SIOBG_resetDefaults(void) {
     gFUBGEnabled = YES;
     gSceneFake   = YES;
+    gSceneState  = YES;   // v3.0.3：scene 层 activationState 伪装，缺键 = 开
     gAudioKeep   = YES;
     gCallAware   = YES;   // v3.0.1：缺键 = 开（兼容项，fail-safe 方向是"不打扰别人"）
     gBgRefresh   = YES;   // v3.0.2：缺键 = 开
@@ -176,6 +198,7 @@ static void SIOBG_loadPref(void) {
         } else {
             if (d[@"Enabled"])   gFUBGEnabled = [d[@"Enabled"] boolValue];
             if (d[@"SceneFake"]) gSceneFake   = [d[@"SceneFake"] boolValue];
+            if (d[@"SceneState"]) gSceneState = [d[@"SceneState"] boolValue];   // v3.0.3
             if (d[@"AudioKeep"]) gAudioKeep   = [d[@"AudioKeep"] boolValue];
             if (d[@"CallAware"]) gCallAware   = [d[@"CallAware"] boolValue];
             if (d[@"BgRefresh"]) gBgRefresh   = [d[@"BgRefresh"] boolValue];
@@ -206,6 +229,7 @@ static void SIOBG_loadPref(void) {
             if (ovr) {
                 if (ovr[@"Enabled"])   gFUBGEnabled = [ovr[@"Enabled"] boolValue];
                 if (ovr[@"SceneFake"]) gSceneFake   = [ovr[@"SceneFake"] boolValue];
+                if (ovr[@"SceneState"]) gSceneState = [ovr[@"SceneState"] boolValue];   // v3.0.3
                 if (ovr[@"AudioKeep"]) gAudioKeep   = [ovr[@"AudioKeep"] boolValue];
                 if (ovr[@"CallAware"]) gCallAware   = [ovr[@"CallAware"] boolValue];
                 if (ovr[@"BgRefresh"]) gBgRefresh   = [ovr[@"BgRefresh"] boolValue];
@@ -220,6 +244,62 @@ static void SIOBG_loadPref(void) {
     gHasAudioMode = [modes isKindOfClass:[NSArray class]] && [modes containsObject:@"audio"];
 
     SIOBG_recalc();
+}
+
+// ---------- v3.0.3：后台工作线程白名单 + 自身镜像识别 ----------
+// 微信的 FTS/索引跑在专用工作队列上（队列 label / 线程名形如
+// com.tencent.xin.fts.* / mainIndex / *.index.* / IndexQueue）。这些线程必须
+// 读到**真实** Background，微信才会把长连接降级成推送通道，解锁回来重连拉离线
+// 消息；被伪装成前台则永远不降级，列表停在旧数据。
+// 判定维度是「当前线程/队列名」，与调用方所在镜像无关，所以同一个函数被主线程和
+// 索引线程同时调用时结果不同 —— 缓存必须按线程键控，不能按调用地址键控。
+
+static BOOL SIOBG_strHasWorkerMark(const char *s) {
+    if (!s || !*s) return NO;
+    return strstr(s, ".fts.")    != NULL ||
+           strstr(s, "mainIndex") != NULL ||
+           strstr(s, ".index.")  != NULL ||
+           strstr(s, "IndexQueue") != NULL;
+}
+
+// 线程名判定结果的小缓存：UIKit 会频繁问 activationState，而绝大多数调用来自
+// 主线程（恒不在名单里）。直接映射 8 槽，键为 pthread_t，命中零分配。
+#define SIOBG_WLCACHE 8
+static struct { pthread_t th; BOOL hit; } gWLCache[SIOBG_WLCACHE];
+
+static BOOL SIOBG_isBgWorkerThread(void) {
+    pthread_t self = pthread_self();
+    unsigned idx = (unsigned)(((uintptr_t)self >> 5) & (SIOBG_WLCACHE - 1));
+    if (gWLCache[idx].th == self && gWLCache[idx].th != 0)
+        return gWLCache[idx].hit;
+
+    BOOL hit = NO;
+    // 队列 label：dispatch 队列名是最可靠的标记源（微信 FTS 用专用队列）
+    const char *label = dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL);
+    if (SIOBG_strHasWorkerMark(label)) {
+        hit = YES;
+    } else {
+        // 线程名：有些队列不设 label 但代码会 pthread_setname_np
+        char name[64];
+        memset(name, 0, sizeof(name));
+        if (pthread_getname_np(self, name, sizeof(name)) == 0)
+            hit = SIOBG_strHasWorkerMark(name);
+    }
+    gWLCache[idx].th  = self;
+    gWLCache[idx].hit = hit;
+    return hit;
+}
+
+// 本 dylib 自身镜像路径（构造时用 dladdr 自解析一次）。
+// 场景 hook 里用它识别「插件内部找前台 windowScene」的调用 —— 这类调用必须拿真值，
+// 否则我们自己的逻辑会被自己骗倒。
+static const char *gSelfImage = NULL;
+
+static BOOL SIOBG_addrIsSelf(void *addr) {
+    if (!gSelfImage || !addr) return NO;
+    Dl_info info;
+    if (!dladdr(addr, &info) || !info.dli_fname) return NO;
+    return strcmp(info.dli_fname, gSelfImage) == 0;
 }
 
 // ---------- 引擎一：场景伪装 ----------
@@ -271,7 +351,7 @@ static UIApplicationState SIOBG_appState(id self, SEL _cmd) {
         void *ret = __builtin_extract_return_addr(__builtin_return_address(0));
         BOOL bg;
         if (ret != NULL && ret == gAsLastRet) {
-            bg = gAsLastBg;
+            bg = gAsLastBg;   // 调用点缓存只覆盖「按镜像判定」那半，线程维度见下
         } else {
             bg = NO;
             Dl_info info;
@@ -284,9 +364,34 @@ static UIApplicationState SIOBG_appState(id self, SEL _cmd) {
             gAsLastRet = ret;
             gAsLastBg  = bg;
         }
+        // v3.0.3：两个线程维度的放行必须放在地址缓存**之后**算 ——
+        // 同一个调用地址可能被主线程和索引线程同时走到，缓存键只有地址会串味。
+        if (!bg && SIOBG_addrIsSelf(ret))        bg = YES;   // 自己人拿真值
+        if (!bg && SIOBG_isBgWorkerThread())     bg = YES;   // FTS/索引线程拿真值
         return bg ? UIApplicationStateBackground : UIApplicationStateActive;
     }
     return gOrigAppState ? gOrigAppState(self, _cmd) : UIApplicationStateActive;
+}
+
+// ---- v3.0.3：scene 层 activationState 伪装 ----
+// UIScene 基类实现，UIWindowScene 继承，一处 hook 全覆盖。
+// 真后台 + 伪装开启时：UI/主线程/网络 → 假 ForegroundActive；
+// FTS/索引工作线程 → 真实 Background（微信据此降级长连接、解锁后重连拉离线消息）；
+// dylib 自身（内部找前台 windowScene）→ 真实值。
+static UISceneActivationState (*gOrigSceneState)(id, SEL);
+
+static UISceneActivationState SIOBG_sceneState(id self, SEL _cmd) {
+    if (gUseScene && gSceneState && gPhysBg) {
+        void *ret = __builtin_extract_return_addr(__builtin_return_address(0));
+        if (SIOBG_addrIsSelf(ret)) {
+            return gOrigSceneState(self, _cmd);            // 自己人：真值
+        }
+        if (SIOBG_isBgWorkerThread()) {
+            return gOrigSceneState(self, _cmd);            // 索引线程：真值（Background）
+        }
+        return UISceneActivationStateForegroundActive;     // 其余：假前台
+    }
+    return gOrigSceneState ? gOrigSceneState(self, _cmd) : UISceneActivationStateForegroundActive;
 }
 
 // ---- 通知横幅伪装 ----
@@ -381,6 +486,20 @@ static void SIOBG_installSceneHooks(void) {
             gOrigAppState = (UIApplicationState (*)(id, SEL))cur;
             method_setImplementation(stateM, (IMP)SIOBG_appState);
         }
+    }
+
+    // v3.0.3：scene 层 activationState 伪装。UIScene 是基类，UIWindowScene 继承，
+    // 一处 hook 全覆盖；内部按「自身镜像 / FTS索引线程 / 其余」三路分流。
+    Method actM = class_getInstanceMethod([UIScene class], @selector(activationState));
+    if (actM) {
+        IMP cur = method_getImplementation(actM);
+        if (cur != (IMP)SIOBG_sceneState) {
+            gOrigSceneState = (UISceneActivationState (*)(id, SEL))cur;
+            method_setImplementation(actM, (IMP)SIOBG_sceneState);
+            NSLog(@"[SIOBG] scene activationState hook installed");
+        }
+    } else {
+        NSLog(@"[SIOBG] UIScene activationState not found, scene-state spoof disabled");
     }
 
     Class unClass = [UNUserNotificationCenter class];
@@ -639,6 +758,9 @@ static void SIOBG_onEnterBackground(NSNotification *note) {
     SIOBG_startAudio();
     SIOBG_watchdogStart();
     SIOBG_refreshStart();   // v3.0.2：后台定时刷新装弹
+    // v3.0.3：scene 层伪装此刻生效（自身镜像与 FTS/索引线程除外，它们拿真值）
+    if (gUseScene && gSceneState)
+        NSLog(@"[SIOBG] scene-state spoof armed: UI/network -> ForegroundActive, worker threads -> real Background");
 }
 
 static void SIOBG_onEnterForeground(NSNotification *note) {
@@ -665,8 +787,8 @@ static void SIOBG_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             SIOBG_loadPref();
-            NSLog(@"[SIOBG] prefs reloaded: active=%d scene=%d audio=%d callAware=%d refresh=%d interval=%.0f override=%d physBg=%d",
-                  gActive, gUseScene, gUseAudio, gCallAware, gBgRefresh, gBgRefreshInterval, gHasAppOverride, gPhysBg);
+            NSLog(@"[SIOBG] prefs reloaded: active=%d scene=%d sceneState=%d audio=%d callAware=%d refresh=%d interval=%.0f override=%d physBg=%d",
+                  gActive, gUseScene, gSceneState, gUseAudio, gCallAware, gBgRefresh, gBgRefreshInterval, gHasAppOverride, gPhysBg);
             if (!gUseAudio && gPhysBg) { SIOBG_stopAudio(NO); SIOBG_watchdogStop(); }
             if (gUseAudio && gPhysBg && (!gPlayer || !gPlayer.isPlaying)) {
                 SIOBG_startAudio(); SIOBG_watchdogStart();
@@ -686,6 +808,11 @@ static void SIOBGEntry(void) {
     // 全程 @try 包裹：保活引擎装不上也不能拖垮目标 App。
     @try {
         SIOBG_loadPref();
+
+        // v3.0.3：自解析本 dylib 镜像路径，供 scene/appState hook 识别「自己人」调用
+        Dl_info selfInfo;
+        if (dladdr((const void *)SIOBGEntry, &selfInfo) && selfInfo.dli_fname)
+            gSelfImage = selfInfo.dli_fname;
 
         // hook 一次性安装，内部按全局开关决定行为
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -741,10 +868,10 @@ static void SIOBGEntry(void) {
             (__bridge CFStringRef)kNotifyName, NULL,
             CFNotificationSuspensionBehaviorDeliverImmediately);
 
-        NSLog(@"[SIOBG] %@ loaded in %@: active=%d scene=%d audio=%d callAware=%d refresh=%d interval=%.0f audioMode=%d%@",
+        NSLog(@"[SIOBG] %@ loaded in %@: active=%d scene=%d sceneState=%d audio=%d callAware=%d refresh=%d interval=%.0f audioMode=%d%@",
               SIOBG_VERSION,
               SIOBG_bundleID().length ? SIOBG_bundleID() : @"?",
-              gActive, gUseScene, gUseAudio, gCallAware, gBgRefresh, gBgRefreshInterval, gHasAudioMode,
+              gActive, gUseScene, gSceneState, gUseAudio, gCallAware, gBgRefresh, gBgRefreshInterval, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
     } @catch (NSException *e) {
         NSLog(@"[SIOBG] keep-alive install failed (app unaffected): %@", e);
